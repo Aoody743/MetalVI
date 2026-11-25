@@ -22,7 +22,25 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
+
+/// Monotonic generation bumped whenever title virtual-memory mappings or
+/// protections change (`XMemVirtualAlloc`, `VirtualAlloc`, `VirtualFree`,
+/// `VirtualProtect`, or `title_memory_remapping` / `title_memory_remapped`).
+static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// Current virtual-memory remap epoch for cached page-table/VM-region tables.
+#[inline]
+pub(crate) fn remap_epoch() -> u64 {
+    REMAP_EPOCH.load(Ordering::Acquire)
+}
+
+/// Notes that title virtual-memory mappings or protections may have changed.
+#[inline]
+pub fn note_memory_changed() {
+    REMAP_EPOCH.fetch_add(1, Ordering::AcqRel);
+}
 
 /// Whether `ntdll.dll!wine_get_host_version` reports macOS (`Darwin`).
 fn on_wine_darwin() -> bool {
@@ -650,11 +668,18 @@ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 /// ([`title_memory_remapping`]).
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
 
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        note_memory_changed();
+    }
+}
+
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
+    note_memory_changed();
     Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
 }
 
@@ -684,6 +709,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    note_memory_changed();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);

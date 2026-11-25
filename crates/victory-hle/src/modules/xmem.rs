@@ -153,6 +153,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if !at.is_null() {
+        victory_gpu::note_memory_changed();
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -758,6 +761,7 @@ fn commit(base: usize, len: usize) -> bool {
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {
+        victory_gpu::note_memory_changed();
         return true;
     }
     let error = std::io::Error::last_os_error();

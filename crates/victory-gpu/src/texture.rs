@@ -63,9 +63,21 @@ pub(crate) struct Staging {
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    /// Previous bytes for untracked committed textures (avoids emulated AVX2 `blake3` on Rosetta).
+    raw: Vec<u8>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+}
+
+/// Returns `true` if `memory` differs from `last`, updating `last` to hold `memory`.
+fn take_changed(last: &mut Vec<u8>, memory: &[u8]) -> bool {
+    if last.len() == memory.len() && last[..] == *memory {
+        return false;
+    }
+    last.clear();
+    last.extend_from_slice(memory);
+    true
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -772,16 +784,24 @@ impl Staging {
             let _ = changed;
             return size;
         }
+        let fast_compare = !crate::watch::fault_tracking();
         if through_copy() {
             return with_title(self.memory, size, |tiled| {
-                let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
-                    return size;
+                if fast_compare {
+                    if !take_changed(&mut last.raw, tiled) {
+                        return size;
+                    }
+                    self.detile(&last.raw);
+                } else {
+                    let hash = blake3::hash(tiled);
+                    if last.hash == Some(hash) {
+                        return size;
+                    }
+                    last.hash = Some(hash);
+                    self.detile(tiled);
                 }
-                last.hash = Some(hash);
-                self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
                 size
@@ -790,14 +810,21 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
-            return size;
+        if fast_compare {
+            if !take_changed(&mut last.raw, tiled) {
+                return size;
+            }
+            self.detile(&last.raw);
+        } else {
+            let hash = blake3::hash(tiled);
+            if last.hash == Some(hash) {
+                return size;
+            }
+            last.hash = Some(hash);
+            self.detile(tiled);
         }
-        last.hash = Some(hash);
-        self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
@@ -1265,5 +1292,17 @@ mod title_memory_tests {
                 assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             }
         }
+    }
+
+    #[test]
+    fn untracked_memory_reads_as_changed_once_per_change() {
+        let mut last = Vec::new();
+        let mut memory = vec![1u8; 4096];
+        assert!(super::take_changed(&mut last, &memory));
+        assert!(!super::take_changed(&mut last, &memory));
+        memory[4095] = 2;
+        assert!(super::take_changed(&mut last, &memory));
+        assert_eq!(last, memory);
+        assert!(!super::take_changed(&mut last, &memory));
     }
 }

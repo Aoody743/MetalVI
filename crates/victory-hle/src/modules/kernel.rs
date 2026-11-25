@@ -285,6 +285,38 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// Passthrough `VirtualAlloc` that bumps [`victory_gpu::note_memory_changed`]
+/// when new memory is reserved or committed.
+pub extern "system" fn VirtualAlloc(
+    address: *mut c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    let out = host::virtual_alloc(address, size, kind, protect);
+    if !out.is_null() {
+        victory_gpu::note_memory_changed();
+    }
+    out
+}
+
+/// Passthrough `VirtualFree` holding `title_memory_remapping()` across the unmap.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32 {
+    let _changing = victory_gpu::title_memory_remapping();
+    host::virtual_free(address, size, kind)
+}
+
+/// Passthrough `VirtualProtect` holding `title_memory_remapping()` across protection changes.
+pub extern "system" fn VirtualProtect(
+    address: *mut c_void,
+    size: usize,
+    protect: u32,
+    old: *mut u32,
+) -> i32 {
+    let _changing = victory_gpu::title_memory_remapping();
+    host::virtual_protect(address, size, protect, old)
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -357,6 +389,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
@@ -376,6 +409,9 @@ pub(crate) fn module() -> HleModule {
             hle_export!(DisableThreadLibraryCalls),
             hle_export!(OutputDebugStringA),
             hle_export!(OutputDebugStringW),
+            hle_export!(VirtualAlloc),
+            hle_export!(VirtualFree),
+            hle_export!(VirtualProtect),
             hle_export!(exit),
             hle_export!(abort),
             hle_export!(terminate),
@@ -486,6 +522,31 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn virtual_alloc(
+        address: *mut c_void,
+        size: usize,
+        kind: u32,
+        protect: u32,
+    ) -> *mut c_void {
+        // SAFETY: forwarded from title/system caller with validated address/size/flags.
+        unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(address, size, kind, protect) }
+    }
+
+    pub(super) fn virtual_free(address: *mut c_void, size: usize, kind: u32) -> i32 {
+        // SAFETY: forwarded from title/system caller.
+        unsafe { windows_sys::Win32::System::Memory::VirtualFree(address, size, kind) }
+    }
+
+    pub(super) fn virtual_protect(
+        address: *mut c_void,
+        size: usize,
+        protect: u32,
+        old: *mut u32,
+    ) -> i32 {
+        // SAFETY: forwarded from title/system caller.
+        unsafe { windows_sys::Win32::System::Memory::VirtualProtect(address, size, protect, old) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -579,6 +640,23 @@ mod host {
 
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
+    }
+
+    pub(super) fn virtual_alloc(
+        _: *mut c_void,
+        _: usize,
+        _: u32,
+        _: u32,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
+    pub(super) fn virtual_free(_: *mut c_void, _: usize, _: u32) -> i32 {
+        0
+    }
+
+    pub(super) fn virtual_protect(_: *mut c_void, _: usize, _: u32, _: *mut u32) -> i32 {
+        0
     }
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}

@@ -98,10 +98,11 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 fn wait_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
+        let default = if crate::watch::fault_tracking() { 500 } else { 24 };
         let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
+            .unwrap_or(default);
         tracing::info!(millis, "host pipeline wait budget per frame");
         Duration::from_millis(millis)
     })

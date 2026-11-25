@@ -1662,7 +1662,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 /// a fetch that finds nothing and loses no shader write.
 fn rehash_runs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_REHASH_RUNS").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_CARD_REHASH_RUNS").as_deref() {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => !crate::watch::fault_tracking(),
+    })
 }
 
 /// Since the last frame-rate line, of our own passes over copies in the
@@ -1680,7 +1684,11 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// so eight threads take an eighth of them each.
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WIDE_MERGE").as_deref() {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => !crate::watch::fault_tracking(),
+    })
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -2754,7 +2762,11 @@ mod late_tests {
 /// only the copy that held it did.
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_JOIN_COPIES").as_deref() {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => !crate::watch::fault_tracking(),
+    })
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -5362,7 +5374,11 @@ impl HostList {
 /// they are for the title's threads.
 fn wide_refresh() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_REFRESH").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_WIDE_REFRESH").as_deref() {
+        Some(v) if v == "1" => true,
+        Some(v) if v == "0" => false,
+        _ => !crate::watch::fault_tracking(),
+    })
 }
 
 /// A submission's refreshes not done yet, merged per buffer copy into the
@@ -5581,22 +5597,47 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
 }
 
 fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
-    // Something is unmapped: page by page (64 KiB, then 4 KiB in a piece
-    // that fails), zeros for what cannot be read.
-    for_pieces(src as usize, len, 64 << 10, |at, n| {
-        let to = dst.wrapping_add(at - src as usize);
-        if !read(at as *const u8, to, n) {
-            for_pieces(at, n, 4 << 10, |at, n| {
-                let to = dst.wrapping_add(at - src as usize);
-                if !read(at as *const u8, to, n) {
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
-                    // SAFETY: inside the destination, which is mapped.
-                    unsafe { to.write_bytes(0, n) };
-                }
-            });
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+    };
+    let mut offset = 0;
+    while offset < len {
+        let at = src as usize + offset;
+        let to = dst.wrapping_add(offset);
+        let n = (64 << 10).min(len - offset);
+        if read(at as *const u8, to, n) {
+            offset += n;
+            continue;
         }
-    });
+        // Query VM region once so whole uncommitted/unreadable holes skip in O(1).
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        let qsize = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let region_n = (info.BaseAddress as usize)
+            .saturating_add(info.RegionSize)
+            .saturating_sub(at)
+            .min(len - offset);
+        if qsize == size_of_val(&info)
+            && region_n > 0
+            && (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS)
+        {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::Unmapped, region_n as u64);
+            // SAFETY: inside `dst`, which is writable mapped memory.
+            unsafe { to.write_bytes(0, region_n) };
+            offset += region_n;
+            continue;
+        }
+        for_pieces(at, n, 4 << 10, |p_at, p_n| {
+            let p_to = dst.wrapping_add(p_at - src as usize);
+            if !read(p_at as *const u8, p_to, p_n) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, p_n as u64);
+                // SAFETY: inside `dst`, which is writable mapped memory.
+                unsafe { p_to.write_bytes(0, p_n) };
+            }
+        });
+        offset += n;
+    }
 }
 
 /// Reads title memory at `src` into `dst`; false if a page of it is not

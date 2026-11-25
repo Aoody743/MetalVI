@@ -77,6 +77,22 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Cached VM region flags + per-4 KiB chunk fingerprints for zero-fault
+    /// [`diff_copy`] and fast copy-back when page-fault write tracking is off.
+    diff: Mutex<DiffState>,
+}
+
+const VM_READABLE: u8 = 1;
+const VM_WRITABLE: u8 = 2;
+
+#[derive(Default)]
+struct DiffState {
+    hashes: Vec<[u64; 2]>,
+    par_buf: Vec<[u64; 2]>,
+    vm_epoch: u64,
+    /// `[start, end, flags]` covering `[self.start, self.start + self.len)`,
+    /// refreshed only when `vm_epoch != crate::watch::remap_epoch()`.
+    vm_regions: Vec<(usize, usize, u8)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -932,16 +948,20 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         return;
     }
     let (src, dst, each) = (src as usize, dst as usize, len.div_ceil(threads));
-    std::thread::scope(|s| {
-        for i in 0..threads {
-            let at = (i * each).min(len);
-            let n = each.min(len - at);
-            s.spawn(move || {
-                // SAFETY: a part of the caller's ranges.
-                unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
-            });
+    let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+    for i in 0..threads {
+        let at = (i * each).min(len);
+        let n = each.min(len - at);
+        if n > 0 {
+            jobs.push(Box::new(move || {
+                // SAFETY: disjoint subrange within caller's non-overlapping `src`/`dst`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n);
+                }
+            }));
         }
-    });
+    }
+    wide(jobs);
 }
 
 /// Whether the snapshots of a submission's shader-written ranges, and the
@@ -988,7 +1008,13 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
+        let n = std::thread::available_parallelism().map_or(4, |n| {
+            if !crate::watch::fault_tracking() {
+                (n.get() / 2).clamp(4, 6)
+            } else {
+                (n.get() / 4).clamp(2, 6)
+            }
+        });
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 let workers = WORKERS.get().expect("made above");
@@ -1334,6 +1360,208 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
+/// Fast 128-bit non-cryptographic chunk fingerprint (`[0, 0]` reserved for uninitialized/invalidated,
+/// `[u64::MAX, u64::MAX]` reserved for uncommitted zero holes).
+/// Processes 64-byte blocks with 4 parallel lanes and 1 multiply per lane per 64 B.
+#[inline]
+fn hash_chunk_128(data: &[u8]) -> [u64; 2] {
+    const K1: u64 = 0x9e37_79b9_7f4a_7c15;
+    const K2: u64 = 0xbf58_476d_1ce4_e5b9;
+    const K3: u64 = 0x94d0_49bb_1331_11eb;
+    const K4: u64 = 0xd6e8_feb8_6659_fd93;
+    let mut a = (data.len() as u64).wrapping_mul(K1) ^ 0x243f_6a88_85a3_08d3;
+    let mut b = (data.len() as u64).wrapping_mul(K2) ^ 0x1319_8a2e_0370_7344;
+    let mut c = 0xa409_3822_299f_31d0u64;
+    let mut d = 0x082e_fa98_ec4e_6c89u64;
+    let (blocks, rest) = data.as_chunks::<64>();
+    for blk in blocks {
+        let w0 = u64::from_le_bytes(blk[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(blk[8..16].try_into().unwrap());
+        let w2 = u64::from_le_bytes(blk[16..24].try_into().unwrap());
+        let w3 = u64::from_le_bytes(blk[24..32].try_into().unwrap());
+        let w4 = u64::from_le_bytes(blk[32..40].try_into().unwrap());
+        let w5 = u64::from_le_bytes(blk[40..48].try_into().unwrap());
+        let w6 = u64::from_le_bytes(blk[48..56].try_into().unwrap());
+        let w7 = u64::from_le_bytes(blk[56..64].try_into().unwrap());
+        a = (a ^ w0).wrapping_add(w4).rotate_left(13).wrapping_mul(K1);
+        b = (b ^ w1).wrapping_add(w5).rotate_left(17).wrapping_mul(K2);
+        c = (c ^ w2).wrapping_add(w6).rotate_left(23).wrapping_mul(K3);
+        d = (d ^ w3).wrapping_add(w7).rotate_left(29).wrapping_mul(K4);
+    }
+    for chunk in rest.chunks(8) {
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        a = (a ^ u64::from_le_bytes(buf)).wrapping_mul(K1);
+        b = b.rotate_left(11) ^ a;
+    }
+    a ^= a >> 30;
+    b ^= b >> 29;
+    c ^= c >> 31;
+    d ^= d >> 27;
+    let h0 = (a ^ c).wrapping_mul(K3) | 1;
+    let mut h1 = (b ^ d).wrapping_mul(K4);
+    if h0 == u64::MAX && h1 == u64::MAX {
+        h1 = 0;
+    }
+    [h0, h1]
+}
+
+#[derive(Clone, Copy, Default)]
+struct HashJob {
+    generation: u64,
+    par_start: usize,
+    par_end: usize,
+    out_ptr: usize,
+    out_len: usize,
+    per_worker: usize,
+}
+
+struct PoolState {
+    job: HashJob,
+    pending: usize,
+}
+
+/// Persistent 3-worker pool (+ caller as 4th worker) for hashing large committed
+/// memory ranges in [`Shadow::diff_copy`] without per-frame thread creation.
+struct HashPool {
+    run_lock: Mutex<()>,
+    inner: std::sync::Arc<(Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar)>,
+}
+
+struct WorkerDoneGuard {
+    inner: std::sync::Arc<(Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar)>,
+}
+
+impl Drop for WorkerDoneGuard {
+    fn drop(&mut self) {
+        let (lock, _, done_cv) = &*self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending = st.pending.saturating_sub(1);
+        if st.pending == 0 {
+            done_cv.notify_all();
+        }
+    }
+}
+
+struct CallerWaitGuard<'a> {
+    inner: &'a (Mutex<PoolState>, std::sync::Condvar, std::sync::Condvar),
+}
+
+impl Drop for CallerWaitGuard<'_> {
+    fn drop(&mut self) {
+        let (lock, _, done_cv) = self.inner;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        while st.pending > 0 {
+            st = done_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+impl HashPool {
+    const WORKERS: usize = 3;
+
+    fn new() -> Self {
+        let inner = std::sync::Arc::new((
+            Mutex::new(PoolState {
+                job: HashJob::default(),
+                pending: 0,
+            }),
+            std::sync::Condvar::new(),
+            std::sync::Condvar::new(),
+        ));
+        for worker_id in 1..=Self::WORKERS {
+            let shared = std::sync::Arc::clone(&inner);
+            let _ = std::thread::Builder::new()
+                .name(format!("diff-copy-hash-{worker_id}"))
+                .spawn(move || {
+                    let mut seen_gen = 0u64;
+                    loop {
+                        let job = {
+                            let (lock, work_cv, _) = &*shared;
+                            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                            while st.job.generation == seen_gen {
+                                st = work_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                            }
+                            seen_gen = st.job.generation;
+                            st.job
+                        };
+                        let _done = WorkerDoneGuard {
+                            inner: std::sync::Arc::clone(&shared),
+                        };
+                        let lo_idx = worker_id * job.per_worker;
+                        let hi_idx = ((worker_id + 1) * job.per_worker).min(job.out_len);
+                        for idx in lo_idx..hi_idx {
+                            let lo = job.par_start + idx * 4096;
+                            let hi = (lo + 4096).min(job.par_end);
+                            // SAFETY: `[lo, hi)` is committed readable memory pinned by `_mapped`,
+                            // and `idx` is disjoint from every other worker's range inside `out`.
+                            unsafe {
+                                let slice = std::slice::from_raw_parts(lo as *const u8, hi - lo);
+                                *(job.out_ptr as *mut [u64; 2]).add(idx) = hash_chunk_128(slice);
+                            }
+                        }
+                    }
+                });
+        }
+        Self {
+            run_lock: Mutex::new(()),
+            inner,
+        }
+    }
+
+    /// Hashes 4 KiB chunks in `par_start..par_end` into `out` across 4 threads.
+    ///
+    /// # Safety
+    /// `[par_start, par_end)` must remain committed readable memory for the entire call.
+    unsafe fn hash_chunks(&self, par_start: usize, par_end: usize, out: &mut [[u64; 2]]) {
+        if out.is_empty() {
+            return;
+        }
+        // When `wide_refresh` runs multiple shadows concurrently on `Workers`,
+        // avoid blocking behind another thread's pool job; fall back inline.
+        let Ok(_serialize) = self.run_lock.try_lock() else {
+            for (idx, slot) in out.iter_mut().enumerate() {
+                let lo = par_start + idx * 4096;
+                let hi = (lo + 4096).min(par_end);
+                // SAFETY: caller contract guarantees `[lo, hi)` is committed and readable.
+                let slice = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
+                *slot = hash_chunk_128(slice);
+            }
+            return;
+        };
+        let per_worker = out.len().div_ceil(Self::WORKERS + 1);
+        let (lock, work_cv, _) = &*self.inner;
+        {
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            let next_gen = st.job.generation.wrapping_add(1).max(1);
+            st.job = HashJob {
+                generation: next_gen,
+                par_start,
+                par_end,
+                out_ptr: out.as_mut_ptr() as usize,
+                out_len: out.len(),
+                per_worker,
+            };
+            st.pending = Self::WORKERS;
+            work_cv.notify_all();
+        }
+        let _wait = CallerWaitGuard { inner: &self.inner };
+        let caller_hi = per_worker.min(out.len());
+        for (idx, slot) in out[..caller_hi].iter_mut().enumerate() {
+            let lo = par_start + idx * 4096;
+            let hi = (lo + 4096).min(par_end);
+            // SAFETY: caller contract guarantees `[lo, hi)` is committed and readable.
+            let slice = unsafe { std::slice::from_raw_parts(lo as *const u8, hi - lo) };
+            *slot = hash_chunk_128(slice);
+        }
+    }
+}
+
+fn hash_pool() -> &'static HashPool {
+    static POOL: std::sync::OnceLock<HashPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(HashPool::new)
+}
+
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
@@ -1448,6 +1676,180 @@ mod merge_tests {
             assert_eq!(shadow.diff_copy(src, src + size), 4096);
             assert_eq!(*ptr.cast::<u8>().add(3 * 4096 + 17), 0x99);
             assert_eq!(shadow.diff_copy(src, src + size), 0);
+
+            // Invalidation forces re-copy of only the affected chunk.
+            shadow.invalidate_hashes(3 * 4096, 3 * 4096 + 1);
+            assert_eq!(shadow.diff_copy(src, src + size), 4096);
+            assert_eq!(shadow.diff_copy(src, src + size), 0);
+
+            VirtualFree(src as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn diff_copy_parallel_pool_tracks_large_buffer() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let size = 8usize << 20; // 8 MiB -> triggers >= 4 MiB persistent HashPool path
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: valid upload buffer description.
+        let hr = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )
+        };
+        if hr.is_err() {
+            return;
+        }
+        let buffer = buffer.unwrap();
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: upload resource map.
+        if unsafe { buffer.Map(0, None, Some(&mut ptr)) }.is_err() {
+            return;
+        }
+        // SAFETY: private committed test allocation freed before returning.
+        unsafe {
+            let src = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                as usize;
+            assert_ne!(src, 0);
+            std::slice::from_raw_parts_mut(src as *mut u8, size).fill(0x3c);
+            let gpu = buffer.GetGPUVirtualAddress();
+            let shadow = super::Shadow::new(buffer, ptr.cast::<u8>(), gpu, src as u64, size as u64);
+
+            assert_eq!(shadow.diff_copy(src, src + size), size);
+            assert_eq!(shadow.diff_copy(src, src + size), 0);
+
+            // Mutate 1 byte in caller slice (chunk 1) and 1 byte in worker slice (chunk 1600).
+            ((src + 4096 + 7) as *mut u8).write(0xaa);
+            ((src + 1600 * 4096 + 9) as *mut u8).write(0xbb);
+            assert_eq!(shadow.diff_copy(src, src + size), 2 * 4096);
+            assert_eq!(*ptr.cast::<u8>().add(4096 + 7), 0xaa);
+            assert_eq!(*ptr.cast::<u8>().add(1600 * 4096 + 9), 0xbb);
+            assert_eq!(shadow.diff_copy(src, src + size), 0);
+
+            VirtualFree(src as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn vm_region_cache_and_fast_read_write_observe_remap_epoch() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let size = 2 * super::PAGE;
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: valid upload buffer description.
+        if unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )
+        }
+        .is_err()
+        {
+            return;
+        }
+        let buffer = buffer.unwrap();
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: upload resource map.
+        if unsafe { buffer.Map(0, None, Some(&mut ptr)) }.is_err() {
+            return;
+        }
+        // SAFETY: private test reservation freed before returning.
+        unsafe {
+            let src = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(src, 0);
+            assert_ne!(
+                VirtualAlloc(src as *const _, super::PAGE, MEM_COMMIT, PAGE_READWRITE),
+                std::ptr::null_mut()
+            );
+            crate::watch::note_memory_changed();
+            std::slice::from_raw_parts_mut(src as *mut u8, super::PAGE).fill(0x21);
+
+            let gpu = buffer.GetGPUVirtualAddress();
+            let shadow = super::Shadow::new(buffer, ptr.cast::<u8>(), gpu, src as u64, size as u64);
+
+            // Populate VM cache: first 64 KiB readable+writable, second 64 KiB uncommitted.
+            assert_eq!(shadow.diff_copy(src, src + size), size);
+            let mut buf = vec![0u8; 64];
+            assert!(shadow.read_title_fast(src + 128, &mut buf));
+            assert!(buf.iter().all(|&b| b == 0x21));
+            shadow.write_title_fast(src + 128, &[0x7e; 64]);
+            assert!(shadow.read_title_fast(src + 128, &mut buf));
+            assert!(buf.iter().all(|&b| b == 0x7e));
+            assert_eq!(shadow.diff_copy(src, src + size), 4096);
+
+            // Commit second page and bump remap epoch -> cached VM regions refresh cleanly.
+            assert_ne!(
+                VirtualAlloc((src + super::PAGE) as *const _, super::PAGE, MEM_COMMIT, PAGE_READWRITE),
+                std::ptr::null_mut()
+            );
+            crate::watch::note_memory_changed();
+            std::slice::from_raw_parts_mut((src + super::PAGE) as *mut u8, super::PAGE).fill(0x5c);
+            assert_eq!(shadow.diff_copy(src, src + size), super::PAGE);
+            assert!(shadow.read_title_fast(src + super::PAGE, &mut buf));
+            assert!(buf.iter().all(|&b| b == 0x5c));
+
+            // Decommit second page and hold remapping guard -> hole zeroed cleanly.
+            {
+                let _remap = crate::watch::title_memory_remapping();
+                assert_ne!(VirtualFree((src + super::PAGE) as *mut _, super::PAGE, MEM_DECOMMIT), 0);
+            }
+            assert_eq!(shadow.diff_copy(src, src + size), super::PAGE);
+            assert!(!shadow.read_title_fast(src + super::PAGE, &mut buf));
 
             VirtualFree(src as *mut _, 0, MEM_RELEASE);
         }
@@ -1795,6 +2197,7 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            diff: Mutex::default(),
         }
     }
 
@@ -2006,7 +2409,7 @@ impl Shadow {
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
                 let title = &mut title[..n];
-                if !crate::host::read_into((start + at) as *const u8, title) {
+                if !self.read_title_fast(start + at, title) {
                     continue;
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
@@ -2025,7 +2428,8 @@ impl Shadow {
                 }
                 if differs != 0 {
                     crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                    self.write_title_fast(start + at, title);
+                    self.invalidate_hashes(at, at + n);
                     written += n;
                 }
             }
@@ -2107,14 +2511,14 @@ impl Shadow {
         title.resize(n, 0);
         // Title memory not there: looked at again when the next flight
         // that declared the range lands (the snapshot stays as it is).
-        if !crate::host::read_into((start + at) as *const u8, title) {
+        if !self.read_title_fast(start + at, title) {
             return 0;
         }
         if !merge_piece(now, held, title) {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.write_title_fast(start + at, title);
         n
     }
 
@@ -2152,22 +2556,38 @@ impl Shadow {
             let at = from + (to - from) / threads * i;
             (at - (start + at) % PIECE).max(from)
         };
-        let scan = &scan;
-        std::thread::scope(|s| {
-            let parts: Vec<_> = (0..threads)
-                .map(|i| {
-                    let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
-                })
-                .collect();
-            parts
-                .into_iter()
-                .flat_map(|part| match part.join() {
-                    Ok(found) => found,
-                    Err(panic) => std::panic::resume_unwind(panic),
-                })
-                .collect()
-        })
+        let before_ptr = before.as_ptr() as usize;
+        let results: Vec<Arc<Mutex<Vec<(usize, usize)>>>> = (0..threads)
+            .map(|_| Arc::new(Mutex::new(Vec::new())))
+            .collect();
+        let mut jobs: Vec<Job> = Vec::with_capacity(threads);
+        for (i, out) in results.iter().enumerate() {
+            let (a, b) = (cut(i), cut(i + 1));
+            let out = Arc::clone(out);
+            jobs.push(Box::new(move || {
+                let mut found = Vec::new();
+                let mut at = a;
+                while at < b {
+                    let n = (PIECE - (start + at) % PIECE).min(b - at);
+                    // SAFETY: `wide` finishes before `differing` returns, so `before` and
+                    // `self.data` remain valid and disjoint across worker slices.
+                    let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
+                    let prev = unsafe {
+                        std::slice::from_raw_parts((before_ptr + (at - from)) as *const u8, n)
+                    };
+                    if host != prev {
+                        found.push((at, n));
+                    }
+                    at += n;
+                }
+                *out.lock().unwrap_or_else(|e| e.into_inner()) = found;
+            }));
+        }
+        wide(jobs);
+        results
+            .into_iter()
+            .flat_map(|r| std::mem::take(&mut *r.lock().unwrap_or_else(|e| e.into_inner())))
+            .collect()
     }
 
     /// After [`Shadow::copy_back`] of a submission's ranges: every submitted
@@ -2364,7 +2784,7 @@ impl Shadow {
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
+                if !self.read_title_fast(lo, title) {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
@@ -2381,6 +2801,7 @@ impl Shadow {
                     for (r, m) in runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
+                        self.invalidate_hashes(at + r, at + r + m);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
@@ -2398,6 +2819,7 @@ impl Shadow {
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
+                        self.invalidate_hashes(at + r, at + r + m);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
@@ -2543,25 +2965,158 @@ impl Shadow {
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
+        self.invalidate_hashes(from - start, to - start);
         to - from
     }
 
-    /// Zero-fault incremental copy of `[from, to)` when page-fault write tracking is off:
-    /// inspects VM commit/protection once per region under `title_memory_reading()` and
-    /// copies only 4 KiB chunks that differ from the existing shadow mirror (`self.data`).
-    fn diff_copy(&self, from: usize, to: usize) -> usize {
+    /// Invalidates cached 4 KiB chunk fingerprints across `[from_off, to_off)`.
+    fn invalidate_hashes(&self, from_off: usize, to_off: usize) {
+        if from_off >= to_off {
+            return;
+        }
+        let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+        let hashes = &mut state.hashes;
+        if hashes.is_empty() {
+            return;
+        }
+        let lo = from_off / 4096;
+        let hi = to_off.div_ceil(4096).min(hashes.len());
+        if lo < hi {
+            hashes[lo..hi].fill([0, 0]);
+        }
+    }
+
+    /// Populates or refreshes `diff.vm_regions` over `[self.start, self.start + self.len)`
+    /// whenever `REMAP_EPOCH` has advanced. Caller must hold `crate::watch::title_memory_reading()`.
+    fn ensure_vm_regions(&self, diff: &mut DiffState) -> bool {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
             PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
             VirtualQuery,
         };
-        const CHUNK: usize = 4096;
         const READABLE: u32 = PAGE_READONLY
             | PAGE_READWRITE
             | PAGE_WRITECOPY
             | PAGE_EXECUTE_READ
             | PAGE_EXECUTE_READWRITE
             | PAGE_EXECUTE_WRITECOPY;
+        const WRITABLE: u32 = PAGE_READWRITE | PAGE_EXECUTE_READWRITE;
+
+        let epoch = crate::watch::remap_epoch();
+        if diff.vm_epoch == epoch && !diff.vm_regions.is_empty() {
+            return true;
+        }
+        diff.vm_regions.clear();
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut at = start;
+        while at < end {
+            // SAFETY: inspects process VM region attributes into a zeroed local struct.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let qsize = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            let n = (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .saturating_sub(at)
+                .min(end - at);
+            if qsize != size_of_val(&info) || n == 0 {
+                diff.vm_regions.clear();
+                diff.vm_epoch = 0;
+                return false;
+            }
+            let r_end = at + n;
+            let committed = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0;
+            let mut flags = 0u8;
+            if committed && (info.Protect & READABLE) != 0 {
+                flags |= VM_READABLE;
+                if (info.Protect & WRITABLE) != 0 {
+                    flags |= VM_WRITABLE;
+                }
+            }
+            if let Some(last) = diff.vm_regions.last_mut()
+                && last.1 == at
+                && last.2 == flags
+            {
+                last.1 = r_end;
+            } else {
+                diff.vm_regions.push((at, r_end, flags));
+            }
+            at = r_end;
+        }
+        diff.vm_epoch = epoch;
+        true
+    }
+
+    fn check_vm_access(regions: &[(usize, usize, u8)], addr: usize, len: usize, need_flag: u8) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        let mut cur = addr;
+        for &(r_start, r_end, flags) in regions {
+            if r_end <= cur {
+                continue;
+            }
+            if r_start > cur || (flags & need_flag) == 0 {
+                return false;
+            }
+            cur = r_end.min(end);
+            if cur >= end {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reads `[addr, addr + dst.len())` directly in-process when `fault_tracking()` is off
+    /// and cached VM regions show it committed readable; falls back to `host::read_into` otherwise.
+    fn read_title_fast(&self, addr: usize, dst: &mut [u8]) -> bool {
+        if dst.is_empty() {
+            return true;
+        }
+        if !crate::watch::fault_tracking() {
+            let _mapped = crate::watch::title_memory_reading();
+            let covered = {
+                let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+                self.ensure_vm_regions(&mut state)
+                    && Self::check_vm_access(&state.vm_regions, addr, dst.len(), VM_READABLE)
+            };
+            if covered {
+                // SAFETY: `[addr, addr + dst.len())` is committed readable memory pinned by `_mapped`.
+                unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, dst.as_mut_ptr(), dst.len()) };
+                return true;
+            }
+        }
+        crate::host::read_into(addr as *const u8, dst)
+    }
+
+    /// Writes `[addr, addr + src.len())` directly in-process when `fault_tracking()` is off
+    /// and cached VM regions show it committed writable; falls back to `host::write_mapped` otherwise.
+    fn write_title_fast(&self, addr: usize, src: &[u8]) {
+        if src.is_empty() {
+            return;
+        }
+        if !crate::watch::fault_tracking() {
+            let _mapped = crate::watch::title_memory_reading();
+            let covered = {
+                let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+                self.ensure_vm_regions(&mut state)
+                    && Self::check_vm_access(&state.vm_regions, addr, src.len(), VM_WRITABLE)
+            };
+            if covered {
+                // SAFETY: `[addr, addr + src.len())` is committed writable memory pinned by `_mapped`.
+                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src.len()) };
+                return;
+            }
+        }
+        crate::host::write_mapped(addr as *mut u8, src.as_ptr(), src.len());
+    }
+
+    /// Zero-fault incremental copy of `[from, to)` when page-fault write tracking is off:
+    /// uses cached VM regions + persistent worker pool against `diff.hashes`
+    /// without reading back from Write-Combined `self.data`, then performs sequential writes
+    /// only for changed or uninitialized chunks.
+    fn diff_copy(&self, from: usize, to: usize) -> usize {
+        const CHUNK: usize = 4096;
+        const CHUNK_UNINIT: [u64; 2] = [0, 0];
+        const CHUNK_ZERO_HOLE: [u64; 2] = [u64::MAX, u64::MAX];
 
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
@@ -2571,6 +3126,31 @@ impl Shadow {
         let base = start / PAGE;
         let _mapped = crate::watch::title_memory_reading();
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.ensure_vm_regions(&mut state) {
+            drop(state);
+            drop(copied);
+            drop(_mapped);
+            self.copy(from, to);
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            for p in from / PAGE..=(to - 1) / PAGE {
+                if (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to {
+                    copied[p - base] = 1;
+                }
+            }
+            return to - from;
+        }
+        let total_chunks = (self.len as usize).div_ceil(CHUNK);
+        if state.hashes.len() != total_chunks {
+            state.hashes.resize(total_chunks, CHUNK_UNINIT);
+        }
+        let DiffState {
+            hashes,
+            par_buf,
+            vm_regions,
+            ..
+        } = &mut *state;
+
         let mut dirty_bytes = 0usize;
         let mut dirty_run: Option<(usize, usize)> = None;
         let flush = |run: &mut Option<(usize, usize)>| {
@@ -2580,57 +3160,80 @@ impl Shadow {
             }
         };
 
-        let mut at = from;
-        while at < to {
-            let remaining = to - at;
-            // SAFETY: inspects process VM region attributes into a zeroed local struct.
-            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-            let qsize = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-            let n = (info.BaseAddress as usize)
-                .saturating_add(info.RegionSize)
-                .saturating_sub(at)
-                .min(remaining);
-            if qsize != size_of_val(&info) || n == 0 {
-                flush(&mut dirty_run);
-                drop(copied);
-                drop(_mapped);
-                self.copy(at, to);
-                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for p in from / PAGE..=(to - 1) / PAGE {
-                    if (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to {
-                        copied[p - base] = 1;
-                    }
-                }
-                return dirty_bytes + (to - at);
+        for &(r_start, r_end, flags) in vm_regions.iter() {
+            if r_end <= from {
+                continue;
+            }
+            if r_start >= to {
+                break;
+            }
+            let at = r_start.max(from);
+            let region_end = r_end.min(to);
+            let readable = (flags & VM_READABLE) != 0;
+
+            // Parallel pre-hashing of full 4 KiB chunks on committed regions >= 512 KiB via persistent pool.
+            let par_start = at.next_multiple_of(CHUNK);
+            let par_end = if region_end == end {
+                region_end
+            } else {
+                region_end & !(CHUNK - 1)
+            };
+            let par_bytes = par_end.saturating_sub(par_start);
+            let use_par = readable && (start % CHUNK == 0) && par_bytes >= (512 << 10);
+            if use_par {
+                let n_chunks = par_bytes.div_ceil(CHUNK);
+                par_buf.resize(n_chunks, CHUNK_UNINIT);
+                // SAFETY: `par_start..par_end` lies in committed readable `at..region_end`
+                // pinned by `_mapped`.
+                unsafe { hash_pool().hash_chunks(par_start, par_end, par_buf) };
             }
 
-            let region_end = at + n;
-            let readable = info.State == MEM_COMMIT
-                && (info.Protect & READABLE) != 0
-                && (info.Protect & PAGE_GUARD) == 0;
             let mut c_lo = at;
+            let mut par_idx = 0usize;
             while c_lo < region_end {
                 let c_hi = ((c_lo / CHUNK + 1) * CHUNK).min(region_end);
                 let len = c_hi - c_lo;
                 let page = c_lo / PAGE;
                 let fresh = copied[page - base] == 0;
                 let off = c_lo - start;
+                let chunk_idx = off / CHUNK;
+                let is_full_chunk =
+                    (c_lo % CHUNK == 0) && (off % CHUNK == 0) && (len == CHUNK || c_hi == end);
                 // SAFETY: `off..off + len` lies inside `self.data` (`self.len`); when `readable`,
-                // `c_lo..c_lo + len` lies in a committed readable region pinned by `_mapped`.
+                // `c_lo..c_lo + len` lies in committed readable memory pinned by `_mapped`.
                 let dst = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
                 let changed = if readable {
                     let src = unsafe { std::slice::from_raw_parts(c_lo as *const u8, len) };
-                    if fresh || src != dst {
-                        dst.copy_from_slice(src);
-                        true
+                    if is_full_chunk {
+                        let h = if use_par && c_lo >= par_start && c_hi <= par_end {
+                            let v = par_buf[par_idx];
+                            par_idx += 1;
+                            v
+                        } else {
+                            hash_chunk_128(src)
+                        };
+                        if !fresh && hashes[chunk_idx] == h {
+                            false
+                        } else {
+                            dst.copy_from_slice(src);
+                            hashes[chunk_idx] = h;
+                            true
+                        }
                     } else {
-                        false
+                        dst.copy_from_slice(src);
+                        hashes[chunk_idx] = CHUNK_UNINIT;
+                        true
                     }
-                } else if fresh || dst.iter().any(|&b| b != 0) {
-                    dst.fill(0);
-                    true
-                } else {
+                } else if is_full_chunk && !fresh && hashes[chunk_idx] == CHUNK_ZERO_HOLE {
                     false
+                } else {
+                    dst.fill(0);
+                    hashes[chunk_idx] = if is_full_chunk {
+                        CHUNK_ZERO_HOLE
+                    } else {
+                        CHUNK_UNINIT
+                    };
+                    true
                 };
                 if changed {
                     dirty_bytes += len;
@@ -2646,7 +3249,6 @@ impl Shadow {
                 }
                 c_lo = c_hi;
             }
-            at = region_end;
         }
         flush(&mut dirty_run);
         for p in from / PAGE..=(to - 1) / PAGE {
@@ -2751,7 +3353,7 @@ impl Shadow {
         title.clear();
         title.resize(n, 0);
         let mut written = 0;
-        if crate::host::read_into((start + at) as *const u8, title) {
+        if self.read_title_fast(start + at, title) {
             // As in `copy_back`: the card's byte where it is not what it
             // was before the submission, else the title's.
             let mut differs = 0u8;
@@ -2764,7 +3366,7 @@ impl Shadow {
             }
             if differs != 0 {
                 crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+                self.write_title_fast(start + at, title);
                 written = n;
             }
         } else {
@@ -2774,6 +3376,7 @@ impl Shadow {
         }
         // The card's side and its "before" take the result.
         self.card_changed(at, at + n);
+        self.invalidate_hashes(at, at + n);
         written
     }
 
@@ -2827,7 +3430,7 @@ impl Shadow {
         };
         title.clear();
         title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
+        let mapped = self.read_title_fast(start + at, title);
         let mut changed = false;
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
@@ -2835,11 +3438,12 @@ impl Shadow {
             // the card wrote, as before; `title` is scratch then.
             changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
         }
+        self.invalidate_hashes(at, at + n);
         if !mapped || !changed {
             return 0;
         }
         crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
+        self.write_title_fast(start + at, title);
         n
     }
 }
