@@ -21,7 +21,46 @@
 //! (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::ffi::{CStr, c_char};
+use std::sync::{LazyLock, Mutex};
+
+/// Whether `ntdll.dll!wine_get_host_version` reports macOS (`Darwin`).
+fn on_wine_darwin() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookup in `ntdll.dll` (always loaded) with `wine_get_host_version`
+    // signature `void wine_get_host_version(const char **sysname, const char **release)`.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return false;
+        }
+        let Some(addr) = GetProcAddress(ntdll, c"wine_get_host_version".as_ptr().cast()) else {
+            return false;
+        };
+        let func: unsafe extern "C" fn(*mut *const c_char, *mut *const c_char) =
+            std::mem::transmute(addr);
+        let mut sysname: *const c_char = std::ptr::null();
+        let mut release: *const c_char = std::ptr::null();
+        func(&mut sysname, &mut release);
+        !sysname.is_null() && CStr::from_ptr(sysname).to_bytes() == b"Darwin"
+    }
+}
+
+/// Whether dirty-page tracking (`MEM_WRITE_WATCH` and `PAGE_READONLY` guards) is active.
+/// Disabled by default under Wine on Darwin/Rosetta 2 where AVX masked stores across
+/// protected page boundaries abort translation (`VICTORY_FAULT_TRACKING=1/0` overrides).
+pub fn fault_tracking() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        let enabled = match std::env::var_os("VICTORY_FAULT_TRACKING").as_deref() {
+            Some(v) if v == "1" => true,
+            Some(v) if v == "0" => false,
+            _ => !on_wine_darwin(),
+        };
+        tracing::info!(fault_tracking = enabled, "host fault tracking");
+        enabled
+    });
+    *ENABLED
+}
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
@@ -72,6 +111,9 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    if !fault_tracking() {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         .filter(|r| r.0 < r.1)
@@ -169,7 +211,7 @@ pub(crate) fn once() -> bool {
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
-    if !once() {
+    if !once() || !fault_tracking() {
         return;
     }
     ask_once_end();
@@ -301,6 +343,9 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    if !fault_tracking() {
+        return None;
+    }
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -722,6 +767,9 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
+        if !fault_tracking() {
+            return;
+        }
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
             VirtualAlloc(

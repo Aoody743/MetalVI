@@ -367,6 +367,14 @@ pub(crate) fn hash(data: &[u8]) -> [u8; 16] {
     out
 }
 
+/// The `HASH` part D3DMetal keys its compiled shader cache on: 4 zero flag
+/// bytes followed by the 16-byte container MD5 digest of the `DXIL` payload.
+pub(crate) fn shader_hash(dxil: &[u8]) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out[4..20].copy_from_slice(&hash(dxil));
+    out
+}
+
 fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
     const S: [u32; 16] = [7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21];
     let x: Vec<u32> = block

@@ -1380,6 +1380,68 @@ mod merge_tests {
         }
         assert!(changed_runs(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn diff_copy_skips_unchanged_chunks_and_tracks_edits() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let size = 2 * super::PAGE;
+        // SAFETY: reserve 2 * PAGE, commit only the first PAGE so the second exercises uncommitted zeroing.
+        let src = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(src, 0);
+        assert!(!unsafe { VirtualAlloc(src as *const _, super::PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut ptr = std::ptr::null_mut();
+        // SAFETY: valid D3D12 upload buffer covering `size` bytes.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer)
+                .unwrap();
+            let buffer = buffer.unwrap();
+            buffer.Map(0, None, Some(&mut ptr)).unwrap();
+            std::slice::from_raw_parts_mut(src as *mut u8, super::PAGE).fill(0x5a);
+            ptr.cast::<u8>().write_bytes(0xee, size);
+            let gpu = buffer.GetGPUVirtualAddress();
+            let shadow = super::Shadow::new(buffer, ptr.cast::<u8>(), gpu, src as u64, size as u64);
+
+            // First scan sees all `size` bytes as fresh (committed filled with 0x5a, uncommitted zeroed).
+            assert_eq!(shadow.diff_copy(src, src + size), size);
+            let copied_view = std::slice::from_raw_parts(ptr.cast::<u8>(), size);
+            assert!(copied_view[..super::PAGE].iter().all(|&b| b == 0x5a));
+            assert!(copied_view[super::PAGE..].iter().all(|&b| b == 0));
+
+            // Second scan with no edits copies zero bytes.
+            assert_eq!(shadow.diff_copy(src, src + size), 0);
+
+            // Mutate 1 byte in chunk 3 -> only that 4 KiB chunk is re-copied.
+            ((src + 3 * 4096 + 17) as *mut u8).write(0x99);
+            assert_eq!(shadow.diff_copy(src, src + size), 4096);
+            assert_eq!(*ptr.cast::<u8>().add(3 * 4096 + 17), 0x99);
+            assert_eq!(shadow.diff_copy(src, src + size), 0);
+
+            VirtualFree(src as *mut _, 0, MEM_RELEASE);
+        }
+    }
 }
 
 /// Host copies alive (also those only a list, a descriptor pass or a
@@ -2389,6 +2451,17 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        if !crate::watch::fault_tracking() {
+            self.watched.store(NOT_WATCHED, Ordering::Relaxed);
+            let copied = self.diff_copy(from, to);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+            }
+            return copied;
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
@@ -2461,6 +2534,117 @@ impl Shadow {
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// Zero-fault incremental copy of `[from, to)` when page-fault write tracking is off:
+    /// inspects VM commit/protection once per region under `title_memory_reading()` and
+    /// copies only 4 KiB chunks that differ from the existing shadow mirror (`self.data`).
+    fn diff_copy(&self, from: usize, to: usize) -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+            PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
+            VirtualQuery,
+        };
+        const CHUNK: usize = 4096;
+        const READABLE: u32 = PAGE_READONLY
+            | PAGE_READWRITE
+            | PAGE_WRITECOPY
+            | PAGE_EXECUTE_READ
+            | PAGE_EXECUTE_READWRITE
+            | PAGE_EXECUTE_WRITECOPY;
+
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return 0;
+        }
+        let base = start / PAGE;
+        let _mapped = crate::watch::title_memory_reading();
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut dirty_bytes = 0usize;
+        let mut dirty_run: Option<(usize, usize)> = None;
+        let flush = |run: &mut Option<(usize, usize)>| {
+            if let Some((lo, hi)) = run.take() {
+                self.changed(lo, hi);
+                self.card_changed(lo, hi);
+            }
+        };
+
+        let mut at = from;
+        while at < to {
+            let remaining = to - at;
+            // SAFETY: inspects process VM region attributes into a zeroed local struct.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let qsize = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            let n = (info.BaseAddress as usize)
+                .saturating_add(info.RegionSize)
+                .saturating_sub(at)
+                .min(remaining);
+            if qsize != size_of_val(&info) || n == 0 {
+                flush(&mut dirty_run);
+                drop(copied);
+                drop(_mapped);
+                self.copy(at, to);
+                let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                for p in from / PAGE..=(to - 1) / PAGE {
+                    if (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to {
+                        copied[p - base] = 1;
+                    }
+                }
+                return dirty_bytes + (to - at);
+            }
+
+            let region_end = at + n;
+            let readable = info.State == MEM_COMMIT
+                && (info.Protect & READABLE) != 0
+                && (info.Protect & PAGE_GUARD) == 0;
+            let mut c_lo = at;
+            while c_lo < region_end {
+                let c_hi = ((c_lo / CHUNK + 1) * CHUNK).min(region_end);
+                let len = c_hi - c_lo;
+                let page = c_lo / PAGE;
+                let fresh = copied[page - base] == 0;
+                let off = c_lo - start;
+                // SAFETY: `off..off + len` lies inside `self.data` (`self.len`); when `readable`,
+                // `c_lo..c_lo + len` lies in a committed readable region pinned by `_mapped`.
+                let dst = unsafe { std::slice::from_raw_parts_mut(self.data.add(off), len) };
+                let changed = if readable {
+                    let src = unsafe { std::slice::from_raw_parts(c_lo as *const u8, len) };
+                    if fresh || src != dst {
+                        dst.copy_from_slice(src);
+                        true
+                    } else {
+                        false
+                    }
+                } else if fresh || dst.iter().any(|&b| b != 0) {
+                    dst.fill(0);
+                    true
+                } else {
+                    false
+                };
+                if changed {
+                    dirty_bytes += len;
+                    match &mut dirty_run {
+                        Some((_, hi)) if *hi == off => *hi = off + len,
+                        _ => {
+                            flush(&mut dirty_run);
+                            dirty_run = Some((off, off + len));
+                        }
+                    }
+                } else {
+                    flush(&mut dirty_run);
+                }
+                c_lo = c_hi;
+            }
+            at = region_end;
+        }
+        flush(&mut dirty_run);
+        for p in from / PAGE..=(to - 1) / PAGE {
+            if (p * PAGE).max(start) >= from && ((p + 1) * PAGE).min(end) <= to {
+                copied[p - base] = 1;
+            }
+        }
+        dirty_bytes
     }
 
     /// Whether shaders read and write this copy in the card's own memory

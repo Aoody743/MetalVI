@@ -132,7 +132,7 @@ pub extern "system" fn XMemVirtualAlloc(
         // The GPU side copies only the pages the title wrote since its last
         // copy (`victory_gpu`, decision 0007); placeholders cannot be
         // watched (their physical-page views are copied whole).
-        if kind & MEM_RESERVE_PLACEHOLDER == 0 {
+        if kind & MEM_RESERVE_PLACEHOLDER == 0 && victory_gpu::fault_tracking() {
             kind |= MEM_WRITE_WATCH;
         }
     }
@@ -318,6 +318,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let _changing = victory_gpu::title_memory_remapping();
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -1012,7 +1013,9 @@ mod tests {
                 &mut granularity,
             )
         };
-        assert_eq!(watched, 0);
+        if victory_gpu::fault_tracking() {
+            assert_eq!(watched, 0);
+        }
         // SAFETY: our own reservation.
         assert_ne!(unsafe { VirtualFree(p, 0, MEM_RELEASE) }, 0);
         assert_eq!(query(p).flags, 0);
