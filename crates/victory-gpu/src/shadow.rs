@@ -2986,9 +2986,10 @@ impl Shadow {
         }
     }
 
-    /// Populates or refreshes `diff.vm_regions` over `[self.start, self.start + self.len)`
-    /// whenever `REMAP_EPOCH` has advanced. Caller must hold `crate::watch::title_memory_reading()`.
-    fn ensure_vm_regions(&self, diff: &mut DiffState) -> bool {
+    /// Scans `[self.start, self.start + self.len)` with `VirtualQuery` WITHOUT holding
+    /// `MAPPING.read()` (`title_memory_reading`) or `self.diff`, so Wine's `_virtual_mutex`
+    /// never nests inside `MAPPING`. Returns `None` if `REMAP_EPOCH` changed mid-scan.
+    fn scan_vm_regions(&self) -> Option<(u64, Vec<(usize, usize, u8)>)> {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
             PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
@@ -3002,12 +3003,13 @@ impl Shadow {
             | PAGE_EXECUTE_WRITECOPY;
         const WRITABLE: u32 = PAGE_READWRITE | PAGE_EXECUTE_READWRITE;
 
-        let epoch = crate::watch::remap_epoch();
-        if diff.vm_epoch == epoch && !diff.vm_regions.is_empty() {
-            return true;
+        let seq = crate::watch::remap_active_seq();
+        if seq & 1 != 0 {
+            return None;
         }
-        diff.vm_regions.clear();
+        let epoch = crate::watch::range_epoch(self.start as usize, self.len as usize);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut regions: Vec<(usize, usize, u8)> = Vec::new();
         let mut at = start;
         while at < end {
             // SAFETY: inspects process VM region attributes into a zeroed local struct.
@@ -3018,9 +3020,7 @@ impl Shadow {
                 .saturating_sub(at)
                 .min(end - at);
             if qsize != size_of_val(&info) || n == 0 {
-                diff.vm_regions.clear();
-                diff.vm_epoch = 0;
-                return false;
+                return None;
             }
             let r_end = at + n;
             let committed = info.State == MEM_COMMIT && (info.Protect & PAGE_GUARD) == 0;
@@ -3031,18 +3031,80 @@ impl Shadow {
                     flags |= VM_WRITABLE;
                 }
             }
-            if let Some(last) = diff.vm_regions.last_mut()
+            if let Some(last) = regions.last_mut()
                 && last.1 == at
                 && last.2 == flags
             {
                 last.1 = r_end;
             } else {
-                diff.vm_regions.push((at, r_end, flags));
+                regions.push((at, r_end, flags));
             }
             at = r_end;
         }
-        diff.vm_epoch = epoch;
-        true
+        if crate::watch::remap_active_seq() != seq
+            || crate::watch::range_epoch(self.start as usize, self.len as usize) != epoch
+            || regions.is_empty()
+        {
+            return None;
+        }
+        Some((epoch, regions))
+    }
+
+    /// Acquires `title_memory_reading()` together with up-to-date `vm_regions` matching
+    /// `range_epoch`, releasing `MAPPING.read()` before calling `VirtualQuery`.
+    fn pin_with_vm_regions(&self) -> Option<(crate::watch::Reading, Vec<(usize, usize, u8)>)> {
+        for _ in 0..4 {
+            let mapped = crate::watch::title_memory_reading();
+            let epoch = crate::watch::range_epoch(self.start as usize, self.len as usize);
+            {
+                let state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+                if state.vm_epoch == epoch && !state.vm_regions.is_empty() {
+                    return Some((mapped, state.vm_regions.clone()));
+                }
+            }
+            drop(mapped);
+            let Some((scanned_epoch, regions)) = self.scan_vm_regions() else {
+                continue;
+            };
+            let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+            if state.vm_epoch != scanned_epoch || state.vm_regions.is_empty() {
+                state.vm_regions = regions;
+                state.vm_epoch = scanned_epoch;
+            }
+        }
+        None
+    }
+
+    /// Ensures `diff.vm_regions` matches the current `epoch` under `title_memory_reading()`,
+    /// dropping locks and `_mapped` first if a `VirtualQuery` rescan is needed.
+    fn lock_diff_copy(
+        &self,
+    ) -> Option<(
+        crate::watch::Reading,
+        std::sync::MutexGuard<'_, Vec<u64>>,
+        std::sync::MutexGuard<'_, DiffState>,
+    )> {
+        for _ in 0..4 {
+            let mapped = crate::watch::title_memory_reading();
+            let epoch = crate::watch::range_epoch(self.start as usize, self.len as usize);
+            let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            let state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+            if state.vm_epoch == epoch && !state.vm_regions.is_empty() {
+                return Some((mapped, copied, state));
+            }
+            drop(state);
+            drop(copied);
+            drop(mapped);
+            let Some((scanned_epoch, regions)) = self.scan_vm_regions() else {
+                continue;
+            };
+            let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
+            if state.vm_epoch != scanned_epoch || state.vm_regions.is_empty() {
+                state.vm_regions = regions;
+                state.vm_epoch = scanned_epoch;
+            }
+        }
+        None
     }
 
     fn check_vm_access(regions: &[(usize, usize, u8)], addr: usize, len: usize, need_flag: u8) -> bool {
@@ -3071,18 +3133,13 @@ impl Shadow {
         if dst.is_empty() {
             return true;
         }
-        if !crate::watch::fault_tracking() {
-            let _mapped = crate::watch::title_memory_reading();
-            let covered = {
-                let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
-                self.ensure_vm_regions(&mut state)
-                    && Self::check_vm_access(&state.vm_regions, addr, dst.len(), VM_READABLE)
-            };
-            if covered {
-                // SAFETY: `[addr, addr + dst.len())` is committed readable memory pinned by `_mapped`.
-                unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, dst.as_mut_ptr(), dst.len()) };
-                return true;
-            }
+        if !crate::watch::fault_tracking()
+            && let Some((_mapped, regions)) = self.pin_with_vm_regions()
+            && Self::check_vm_access(&regions, addr, dst.len(), VM_READABLE)
+        {
+            // SAFETY: `[addr, addr + dst.len())` is committed readable memory pinned by `_mapped`.
+            unsafe { std::ptr::copy_nonoverlapping(addr as *const u8, dst.as_mut_ptr(), dst.len()) };
+            return true;
         }
         crate::host::read_into(addr as *const u8, dst)
     }
@@ -3093,18 +3150,13 @@ impl Shadow {
         if src.is_empty() {
             return;
         }
-        if !crate::watch::fault_tracking() {
-            let _mapped = crate::watch::title_memory_reading();
-            let covered = {
-                let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
-                self.ensure_vm_regions(&mut state)
-                    && Self::check_vm_access(&state.vm_regions, addr, src.len(), VM_WRITABLE)
-            };
-            if covered {
-                // SAFETY: `[addr, addr + src.len())` is committed writable memory pinned by `_mapped`.
-                unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src.len()) };
-                return;
-            }
+        if !crate::watch::fault_tracking()
+            && let Some((_mapped, regions)) = self.pin_with_vm_regions()
+            && Self::check_vm_access(&regions, addr, src.len(), VM_WRITABLE)
+        {
+            // SAFETY: `[addr, addr + src.len())` is committed writable memory pinned by `_mapped`.
+            unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), addr as *mut u8, src.len()) };
+            return;
         }
         crate::host::write_mapped(addr as *mut u8, src.as_ptr(), src.len());
     }
@@ -3124,13 +3176,7 @@ impl Shadow {
             return 0;
         }
         let base = start / PAGE;
-        let _mapped = crate::watch::title_memory_reading();
-        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let mut state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
-        if !self.ensure_vm_regions(&mut state) {
-            drop(state);
-            drop(copied);
-            drop(_mapped);
+        let Some((_mapped, mut copied, mut state)) = self.lock_diff_copy() else {
             self.copy(from, to);
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             for p in from / PAGE..=(to - 1) / PAGE {
@@ -3139,7 +3185,7 @@ impl Shadow {
                 }
             }
             return to - from;
-        }
+        };
         let total_chunks = (self.len as usize).div_ceil(CHUNK);
         if state.hashes.len() != total_chunks {
             state.hashes.resize(total_chunks, CHUNK_UNINIT);

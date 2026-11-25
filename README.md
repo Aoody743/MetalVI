@@ -1,270 +1,126 @@
-# MetalVI (macOS / Apple Silicon Port)
+# MetalVI
 
-**MetalVI** is a macOS (Apple Silicon) adaptation fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (itself a fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)), running the compatibility layer on macOS via **Rosetta 2 (AVX2)**, **Wine-Proton**, and **Apple GPTK (`D3DMetal`)**.
+**MetalVI** is an independent macOS (Apple Silicon) compatibility runtime built for **Rosetta 2 (AVX2)**, **Wine-Proton**, and **Apple Game Porting Toolkit (`D3DMetal`)**, derived under `GPL-3.0-or-later` from upstream Xbox Series compatibility research.
 
-**This repository contains no game files, code, assets, or proprietary Windows/Apple DLLs.** You must supply your own copy of the title and your local Wine / Apple GPTK runtime. It is not affiliated with or endorsed by any game developer or publisher.
-
-## macOS Status (Apple M1 Max, macOS 15.7)
-
-- **Tested stack**: Apple M1 Max (64 GB unified RAM), GameHub `Wine-Proton 11.0`, Apple `GPTK 3.0-3` (`D3DMetal`), `ROSETTA_ADVERTISE_AVX=1`.
-- **Workspace test suite**: **498 / 499 executed tests pass (99.8%)**, 8 ignored, 1 host-`CARGO` test filtered:
-  - `victory_core` (11/11), `victory_pe` (7/7), `victory_formats` (24/24, 4 ignored), `victory_pipeline` (4/4), `victory_game` (3/3), `victory_loader` (24/24, including Rosetta 2 VEH instruction emulation and TLS patching), `victory_hle` (96/96), `victory_gpu` (112/112, 1 ignored), integration tests (4/4).
-  - `victory_shader` (213/214, 3 ignored): the single failure (`emit::tests::stub_pipeline_is_created`) is a benign host difference where D3DMetal accepts a zeroed DXBC MD5 digest (`[00; 16]`) rather than rejecting it.
-- **Title runtime status**: Platform, loader, HLE, GPU, and shader translation test suites are verified on D3DMetal; live title `census` / `translate` / gameplay execution is the next step (and upstream `victory-fork` itself is still early WIP).
-
-### What MetalVI adds on top of `fxceless/victory-fork`
-
-- **Apple Silicon `fp64` shader fallback** (`crates/victory-shader`, `crates/victory-gpu`): queries `D3D12_FEATURE_D3D12_OPTIONS::DoublePrecisionFloatShaderOps` on the host device and, when unavailable (as on Metal GPUs), automatically lowers `active_f64_sum` via `waveActiveOp.f32` plus pure-integer bit-level `f64 <-> f32` conversion.
-- **Metal `sin(-0.0)` sign preservation** (`crates/victory-shader/src/emit/lower.rs`): preserves `-0.0` in `trig_turns` where Metal's native `sin(-0.0)` returns `+0.0`.
-- **D3DMetal / Wine D3D12 compatibility** (`crates/victory-gpu`):
-  - Passes `(NULL, 0)` to `ID3D12Device1::CreatePipelineLibrary` for empty blobs instead of Rust's non-null empty slice pointer.
-  - Serializes root signatures explicitly via `D3D12SerializeRootSignature` rather than relying on inline `[RootSignature(...)]` shader blobs.
-- **Wine `ws2_32.dll` HLE fallbacks** (`crates/victory-hle/src/modules/net.rs`): runtime-probed fallbacks for `WSAConnectByList` and `GetAddrInfoExA`, which are absent from Wine's `ws2_32.dll`.
-- **SDK-free macOS cross-build & launcher** (`scripts/run-mac.sh`): compiles with `cargo-zigbuild` + `zig` targeting `x86_64-pc-windows-gnullvm` and keeps `VICTORY_INPLACE` disabled (since D3DMetal does not implement `OpenExistingHeapFromAddress`).
-
-### Building and Testing on macOS
-
-1. Install prerequisites on Apple Silicon macOS:
-   ```bash
-   brew install zig llvm@21 lld@21
-   rustup target add x86_64-pc-windows-gnullvm
-   cargo install cargo-zigbuild
-   ```
-2. Cross-compile release binary and workspace tests:
-   ```bash
-   export PATH="/opt/homebrew/opt/llvm@21/bin:/opt/homebrew/opt/lld@21/bin:$PATH"
-   cargo zigbuild --release -p victory --target x86_64-pc-windows-gnullvm --locked
-   cargo zigbuild --tests --workspace --target x86_64-pc-windows-gnullvm --locked
-   ```
-3. Run under Wine-Proton + Apple GPTK D3DMetal (using a local Wine prefix/cache outside the repo):
-   ```bash
-   chmod +x scripts/run-mac.sh
-   ./scripts/run-mac.sh target/x86_64-pc-windows-gnullvm/release/victory.exe config
-   ```
-
-## Credits
-
-- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — original compatibility layer, loader, HLE, D3D12 backend, and DXIL shader recompiler (`GPL-3.0-or-later`).
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — upstream rendering, speed, and shader optimization base (`GPL-3.0-or-later`).
-- **[ivall/xcl](https://github.com/ivall/xcl)** — behavioral reference noted by upstream (`GPL-2.0-only`).
-- **[pragyaangaur/VIctory-macOS](https://github.com/pragyaangaur/VIctory-macOS)** — parallel CrossOver-based macOS port of upstream `Marvisak/VIctory`.
+> **Legal Notice:** This repository contains **zero** game binaries, assets, encryption keys, or proprietary Microsoft/Apple/developer DLLs. Bring your own legally obtained game dump and local macOS Wine + GPTK runtime, and store all runtime data, caches, and `victory.toml` **outside** this repository.
 
 ---
 
-# VIctory fork (work in progress)
+## Why MetalVI Exists
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+Upstream Windows/Linux branches assume native `MEM_WRITE_WATCH` hardware fault tracking, bare-metal AMD/NVIDIA Vulkan/D3D12 features (`f64` shader ops, 1M+ descriptor heaps, `OpenExistingHeapFromAddress`), and Windows CRT behavior that break or stall on Apple Silicon under Rosetta 2 + Wine + D3DMetal. MetalVI bridges those gaps so Apple Silicon Macs can compile, test, pre-warm, and execute into 3D world rendering.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's
-developer or publisher.
+### Key macOS & Apple Silicon Engineering Work
 
-## Credits
+1. **Rosetta 2 / Wine Memory Tracking (`crates/victory-gpu/src/watch.rs`, `shadow.rs`, `crates/victory-hle/src/modules/{dstorage,files,xmem}.rs`)**
+   - Automatically detects Darwin Wine via `ntdll!wine_get_host_version` and disables `MEM_WRITE_WATCH` / VEH alias page guards (`fault_tracking()` and `view_guard()` default `false` on macOS).
+   - Replaces fault-driven dirty tracking with a zero-fault incremental **`diff_copy`** engine backed by a 4-thread persistent **`HashPool`** (128-bit chunk fingerprints) and lock-safe cached VM region tables.
+   - Uses **4 MiB address-bucketed `RANGE_EPOCHS`** so texture view remapping (`XMemMapPhysicalPages`) never invalidates unrelated buffer VM caches across Wine's `wineserver`, while guaranteeing `VirtualQuery` never runs while `MAPPING.read()` is held (preventing Wine `_virtual_mutex` deadlocks).
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+2. **D3DMetal (GPTK) Translation & Runtime Stability (`crates/victory-gpu`, `crates/victory-shader`)**
+   - **Dynamic descriptor heap clamping (`descriptor/host.rs`)**: `probe_view_limit()` clamps view indices cleanly within host limits (`PORTABLE_VIEWS` / `UNCAPPED_VIEWS`).
+   - **6 GiB placed-texture budget cap (`resource.rs`)**: D3DMetal's `QueryVideoMemoryInfo` reports an inflated local budget on unified memory; capping placed index textures at `6144 MiB` by default on macOS (overridable via `VICTORY_TEXTURE_BUDGET_MB`) eliminates `MTLCommandBuffer` `OutOfMemory` failures.
+   - **Shader & pipeline compatibility (`crates/victory-shader`, `pipeline/make.rs`, `indirect.rs`)**:
+     - Pure-integer `f64 <-> f32` `active_f64_sum` fallback when host `DoublePrecisionFloatShaderOps` is absent.
+     - Sign-bit preservation for `sin(-0.0)` inside `trig_turns`.
+     - Explicit `D3D12SerializeRootSignature` serialization (no inline `[RootSignature(...)]` DXIL assumptions), host `depth_bounds()` gating, `(NULL, 0)` empty pipeline-library blob handling, and default skip of `CS_ScreenProbes_ActivateRays` (`VICTORY_ACTIVATE_RAYS=1` to force) to avoid multi-minute Metal compiler stalls.
+     - Offline shader & compute pipeline pre-warming via `victory warm` (`apps/victory`).
 
-## Status of this fork (2026-11-25)
-
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
-Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
-32 GB RAM. The Series X profile is used throughout.
-
-| Stage | State in this fork |
-|-------|--------------------|
-| Boot, menus, start screen | works, 30 fps (as upstream) |
-| Opening cutscene | plays from start to finish, in order, lit: title cards, credits cards, night and dusk shots |
-| Saves | the game autosaves a checkpoint and loads it again |
-| First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
-| Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
-| Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
-
-### What this fork changed (summary)
-
-Rendering:
-- Meshlet culling read its scene buffers as the wrong kind of view, so the world drew almost nothing; fixed.
-- Per-draw descriptor tables could run out, after which draws used slots never made for them and the card hung; fixed.
-- Light packed by the game's compute shaders was read back through empty copies (sky, probes, fog); fixed for every mip level and layer.
-- The fog reconstruction, shadow-mask, hair, blend-shape skinning, fire and several material programs did not translate; fixed.
-- Gathers at a named mip level (with and without an offset) read level 0; fixed.
-- Implicit-level samples outside pixel shaders produced invalid DXIL in 730 compute programs; fixed.
-- Rectangle lists, depth and stencil twins for depth textures written by compute, texture read-backs.
-- Ray tracing, in progress and off by default: the game's own structure-builder programs translate, title memory can be read by raw address from shaders, the hardware ray/box and ray/triangle test is emulated in DXIL (checked against a reference on the GPU), and 59 of the 64 trace programs translate. Nothing is lit by it yet. See [docs/fork-ray-tracing.md](docs/fork-ray-tracing.md).
-
-Speed and memory:
-- Waits for memory values, write-watch queries and page queries no longer walk page tables per call.
-- Large title buffers get a copy in card memory, with shader writes found by hashing on the card.
-- Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
-- Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
-- The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
-
-- Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
-
-Most of the newer speed changes sit behind environment switches that are off
-by default (`VICTORY_LATE_WAIT`, `VICTORY_RELAY`, `VICTORY_WIDE_BACK`,
-`VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_INPLACE`, `VICTORY_BVH_BUILDER`, ...).
-Each is described in a comment where it is read.
-
-### Known problems
-
-- Everything in shadow is black (see above).
-- The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
-- A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
-- Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
-
-Everything below this line is upstream VIctory's own README, unchanged; its
-status section describes upstream, not this fork.
+3. **Wine `ws2_32.dll` & Generic Mac Launcher (`crates/victory-hle/src/modules/net.rs`, `scripts/run-mac.sh`)**
+   - Runtime-probed fallbacks for `WSAConnectByList` and `GetAddrInfoExA`.
+   - `scripts/run-mac.sh` auto-discovers GameHub / custom `Wine-Proton` and `GPTK` `libd3dshared.dylib`, seeds `d3dcompiler_47.dll`, sets `ROSETTA_ADVERTISE_AVX=1`, and disables `VICTORY_INPLACE`.
 
 ---
 
-# VIctory
+## Verified Status (Apple M1 Max, 64 GB Unified Memory, macOS 15.7.9)
 
-Runs the title (Xbox Series X|S) natively on Windows, from files
-the user supplies.
+- **Host Stack**: GameHub `Wine-Proton 11.0`, Apple `GPTK 3.0-3` (`D3DMetal`), `ROSETTA_ADVERTISE_AVX=1`.
+- **Shader Pre-Warming (`victory warm --jobs 6`)**: **25,660** shaders translated (98 refused), **1,722** compute pipelines compiled (0 refused) in 854 s (`~1.4 GiB` cache).
+- **Unit & Policy Tests (`--test-threads=1` under Wine-Proton)**:
+  - `victory_gpu`: **130 passed, 0 failed, 1 ignored**
+  - `victory_hle`: **99 passed, 0 failed, 0 ignored**
+  - `cargo xtask policy`: **170 files ok** (0 violations)
+- **Runtime Progression**:
+  - Startup, legal screens, and loading carousel run smoothly at **20–30 fps** with `0` `dstorage` failures.
+  - Enters 3D world rendering (**2,326 draws/frame**, `0` `OutOfMemory` errors with the 6 GiB texture cap).
+  - Optimized 3D frame breakdown improves from **13,576 ms/frame** baseline to **9,093.8 ms/frame** (`copies` reduced **4.4×** from `10,512 ms` to `2,374.9 ms`; `textures` reduced **3.4×** from `936 ms` to `278.4 ms`).
+  - *Known macOS caveat*: 3D gameplay remains CPU/synchronization-bound (~0.1 fps in full 3D), and an intermittent multi-threaded Rosetta streaming race (`+0x4dac5bf`) can occur during heavy asset streaming.
 
-The title's x86-64 code runs unchanged inside our process; VIctory supplies
-the platform underneath it and converts the title's data, ahead of time where
-it can and on first use where it must (shaders). See
-[docs/architecture.md](docs/architecture.md).
+---
 
-## Status (2026-11-23)
+## Building & Running on macOS
 
-**Not playable yet.** The title boots, runs its menus at its own 30 fps and
-loads the world, where rendering fails.
+### Prerequisites
 
-| Stage | State |
-|-------|-------|
-| Boot, first-boot screens (accessibility, language, settings, legal) | works, 30 fps |
-| Intro video with sound | works |
-| Start screen, profile and saves | works |
-| Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
-
-Tested on one machine: Windows 11, AMD RX 6700 XT.
-
-> **Warning.** Entering the world on a real GPU can currently hang it, and
-> Windows then resets the display driver (every monitor goes black for a
-> moment). To look further, use a diagnostics build with
-> `VICTORY_D3D12_WARP=1`, which renders on the software adapter.
-
-What each part does today and what it still needs:
-
-| Subsystem | Today | Needs |
-|-----------|-------|-------|
-| Loader | Runs the title's executable and its DLLs in our process; crash reports name the faulting code and are kept in `crashes.log` | – |
-| Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
-| Network | Offline by design: the title cannot reach the network | – |
-| Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
-| Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
-| GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
-| GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | 64-bit image atomics, merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
-| Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
-| Series S mode | Runs through the menus to the loading screen | The world, as above |
-
-## Getting started
-
-Requirements: Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with
-shader model 6.6 (and mesh shaders for the world), Rust (pinned in
-`rust-toolchain.toml`).
-
-The title also needs several GiB of available Windows commit at startup.
-Check **Committed** under **Task Manager → Performance → Memory**. If
-`crashes.log` reports Windows error 1455, close other applications or increase
-the Windows paging file size, then retry.
-
-```powershell
-cargo xtask install-hooks                # asset-policy check on every commit
-copy victory.example.toml victory.toml   # then set your paths (outside the repo)
-cargo test --workspace                   # needs no game data
-cargo run -p victory -- config           # check your paths
+```bash
+brew install zig llvm@21 lld@21
+rustup target add x86_64-pc-windows-gnullvm
+cargo install cargo-zigbuild
 ```
 
-Run the title:
+### Build
 
-```powershell
-cargo build --release -p victory
-target\release\victory.exe run <game dir>\<the title's exe> --execute
+```bash
+export PATH="/opt/homebrew/opt/llvm@21/bin:/opt/homebrew/opt/lld@21/bin:$PATH"
+cargo zigbuild --release -p victory --target x86_64-pc-windows-gnullvm --locked
+cargo zigbuild --tests --workspace --target x86_64-pc-windows-gnullvm --locked
 ```
 
-The window caption shows the framerate. Saves, settings and `crashes.log`
-are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived
-data under the cache folder.
+### Configure & Pre-Warm (Outside Repo)
 
-Input: XInput pads. With none connected the keyboard is a pad while the
-title's window has focus:
+Create a runtime directory outside this clone (for example `~/metalvi-runtime`) containing `victory.toml`:
 
-| Keys | Pad |
-|------|-----|
-| W A S D / I J K L | left / right stick |
-| arrows | D-pad |
-| Enter, Backspace, X, Y | A, B, X, Y |
-| Q / E, Z / C | shoulders, triggers |
-| F / H | stick clicks |
-| Esc, Tab | Menu, View |
-
-## Commands
-
-```
-victory inspect <exe|dll> [--imports] [--exports]
-victory census [paths...] [--missing] [--strict]
-victory lib-exports <import.lib> [--list]
-victory shader-info [paths...] [--verbose] [--disasm]
-victory translate [paths...] [--validate] [--pipelines] [--list] [--jobs N]
-victory run <exe> [--execute] [--unimplemented trap|zero] [--strict]
-            [--console series-x|series-s] [-- <title arguments>]
-victory config
+```toml
+[paths]
+game_dir = 'Z:\Users\<you>\path\to\game_dump'
+cache_dir = 'Z:\Users\<you>\metalvi-runtime\cache'
+data_dir = 'Z:\Users\<you>\metalvi-runtime\data'
+test_titles = []
 ```
 
-Logging: `VICTORY_LOG=victory_loader=trace,info` (a release build logs
-info and above).
+Pre-warm shaders and compute pipelines once from the runtime directory:
 
-## Debugging
-
-A release build has no debugging aids. Build them in with
-
-```powershell
-cargo build --profile diag -p victory --features diagnostics   # target\diag\victory.exe
+```bash
+chmod +x scripts/run-mac.sh
+cd ~/metalvi-runtime
+/path/to/MetalVI/scripts/run-mac.sh \
+  /path/to/MetalVI/target/x86_64-pc-windows-gnullvm/release/victory.exe \
+  warm --jobs 6 2>&1 | tee warm.log
 ```
 
-| Variable | Effect |
-|----------|--------|
-| `VICTORY_LOG=<target>=debug,...` | debug and trace output |
-| `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
-| `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
-| `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
-| `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
-| `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
-| `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
-| `VICTORY_D3D12_DEBUG=1` | host debug layer |
-| `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
-| `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
-| `VICTORY_PIPELINE_WAIT_MS=24` | reduce the per-frame wait for background pipeline creation from the default of 500 ms. A draw can be omitted until its pipeline is ready |
-| `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
-| `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
-| `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
-| `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
-| `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+### Launch
 
-Every build appends crashes and host GPU failures to `crashes.log` in the
-title's data folder.
+> **macOS Wine logging tip:** Redirecting Wine directly with `> run.log` drops Windows console output; always pipe through `2>&1 | tee run.log`.
 
-## License
+```bash
+cd ~/metalvi-runtime
+/path/to/MetalVI/scripts/run-mac.sh \
+  /path/to/MetalVI/target/x86_64-pc-windows-gnullvm/release/victory.exe \
+  run --execute 'Z:\Users\<you>\path\to\game_dump\title.exe' 2>&1 | tee run.log
+```
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+### Keyboard Controls (Built-in GameInput Mapping)
+
+| Input | Action |
+| :--- | :--- |
+| `Enter` / `Space` | Confirm (`A`) |
+| `Backspace` | Back (`B`) |
+| `W` / `A` / `S` / `D` | Left Stick |
+| `I` / `J` / `K` / `L` | Right Stick (Camera) |
+| `Arrow Keys` | D-Pad |
+| `Q` / `E` | `LB` / `RB` |
+| `Left Shift` / `Right Shift` | `LT` / `RT` |
+| `Esc` | Menu |
+
+---
+
+## Credits & License
+
+Licensed under **`GPL-3.0-or-later`** (see [LICENSE](LICENSE)).
+
+MetalVI integrates and builds upon the work of:
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — original loader, HLE, D3D12 translator, and DXIL-to-DXBC pipeline.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — shader optimization, descriptor management, and relay copy-back architecture.
+- **[JoshuuDev/victory-amd](https://github.com/JoshuuDev/victory-amd)** (`myokex/victory-amd`) — partial-mip texture handling, `VICTORY_TEXTURE_SWEEP`, `victory warm`, `dstorage`/`xmem` fixes, and split indirect dispatches.
+- **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** — parallel GPU/CPU pipeline tuning references.
+- **[pragyaangaur/VIctory-macOS](https://github.com/pragyaangaur/VIctory-macOS)** & **[ivall/xcl](https://github.com/ivall/xcl)** — community cross-platform references.
