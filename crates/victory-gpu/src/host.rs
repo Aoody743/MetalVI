@@ -631,6 +631,14 @@ fn create() -> windows::core::Result<Host> {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
         }
+        let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+        if device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, (&raw mut o0).cast(), size_of_val(&o0) as u32)
+            .is_ok()
+        {
+            tracing::info!(f64_ops = o0.DoublePrecisionFloatShaderOps.as_bool(), "host f64 shader ops");
+            victory_shader::emit::set_host_f64(o0.DoublePrecisionFloatShaderOps.as_bool());
+        }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -875,21 +883,103 @@ float4 corner(uint i : SV_VertexID) : SV_Position {
 }
 "#;
 const PLANE_STEPS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<uint> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return float(twin.Load(int4(int2(p.xy), 0, 0))) * asfloat(0x37800080);
 }
 "#;
 const PLANE_FLOATS: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2DArray<float> twin : register(t0);
-[RootSignature(RS)]
 float plane(float4 p : SV_Position) : SV_Depth {
     return twin.Load(int4(int2(p.xy), 0, 0));
 }
 "#;
+
+/// Root parameter helper: `num_values` 32-bit root constants at `b<shader_register>`.
+pub(crate) fn root_constants(shader_register: u32, num_values: u32) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: shader_register,
+                RegisterSpace: 0,
+                Num32BitValues: num_values,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// Root parameter helper: root SRV at `t<shader_register>`.
+pub(crate) fn root_srv(shader_register: u32) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: shader_register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// Root parameter helper: root UAV at `u<shader_register>`.
+pub(crate) fn root_uav(shader_register: u32) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR {
+                ShaderRegister: shader_register,
+                RegisterSpace: 0,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    }
+}
+
+/// Serializes `params` via `D3D12SerializeRootSignature` and creates a root signature on `device`.
+pub(crate) fn serialize_root_signature(
+    device: &ID3D12Device,
+    params: &[D3D12_ROOT_PARAMETER],
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: if params.is_empty() {
+            std::ptr::null()
+        } else {
+            params.as_ptr()
+        },
+        NumStaticSamplers: 0,
+        pStaticSamplers: std::ptr::null(),
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    // SAFETY: `params` stays live across serialization; `blob` is read before release.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let mut error: Option<ID3DBlob> = None;
+        if let Err(e) = D3D12SerializeRootSignature(
+            &desc,
+            D3D_ROOT_SIGNATURE_VERSION_1_0,
+            &mut blob,
+            Some(&mut error),
+        ) {
+            if let Some(error) = error {
+                let text = std::slice::from_raw_parts(
+                    error.GetBufferPointer().cast::<u8>(),
+                    error.GetBufferSize(),
+                );
+                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
 
 /// Views of twins the pass reads, in a heap of ours used as a ring.
 /// shortcut: a view must last until its list has run; with one or two
@@ -1028,10 +1118,27 @@ impl PlanePass {
             pShaderBytecode: bytes.as_ptr().cast(),
             BytecodeLength: bytes.len(),
         };
-        // SAFETY: the root signature is inside the pixel shader; the
-        // description points at live data and never releases its pointer.
+        // SAFETY: root signature is serialized explicitly for Wine d3dcompiler compatibility;
+        // the description points at live data and never releases its pointer.
         unsafe {
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                BaseShaderRegister: 0,
+                RegisterSpace: 0,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+            };
+            let param = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let root = serialize_root_signature(device, &[param])?;
             let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 VS: code(&vs[..]),
@@ -1502,7 +1609,6 @@ static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 /// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
 /// byte just outside the range costs a fetch that finds nothing.
 pub(crate) const CARD_COMPARE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
     uint first;    // the first piece
     uint skew;     // where the copy starts in its piece 0
@@ -1516,7 +1622,6 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= pieces) return;
@@ -2984,11 +3089,18 @@ impl Host {
         const RESULTS: u64 = 1 << 20;
         let (differs, data) = self.shared_buffer(RESULTS).ok_or_else(windows::core::Error::empty)?;
         name(&differs, || "card compare results".into());
-        // SAFETY: the blob's own bytes; the root signature is inside the
-        // shader.
+        // SAFETY: the blob's own bytes; root signature serialized explicitly for Wine d3dcompiler compatibility.
         unsafe {
             let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let root = serialize_root_signature(
+                &self.device,
+                &[
+                    root_constants(0, 6),
+                    root_srv(0),
+                    root_uav(0),
+                    root_uav(1),
+                ],
+            )?;
             let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {

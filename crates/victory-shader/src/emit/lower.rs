@@ -942,6 +942,19 @@ pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the host GPU supports native 64-bit float (`double`) shader operations.
+static HOST_F64: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Configures whether `active_f64_sum` may emit native DXIL `f64` wave operations or must
+/// fall back to `f32` wave reduction + bit-level `f32 -> f64` widening.
+pub fn set_host_f64(supported: bool) {
+    HOST_F64.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn host_has_f64() -> bool {
+    HOST_F64.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1990,6 +2003,34 @@ impl<'a> Lower<'a> {
         let z = self.s.m.i32(0);
         let lo = self.s.m.select(c, on, lo, z);
         let hi = self.s.m.select(c, on, hi, z);
+        if !host_has_f64() {
+            let fbits = self.f64_to_f32_bits(lo, hi);
+            let fval = self.s.m.cast(c, Cast::Bitcast, fbits, self.s.t.f32);
+            self.s.flags |= flags::WAVE_OPS;
+            let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
+            let mut sum = self.s.op(
+                c,
+                "waveActiveOp.f32",
+                Attr::NoUnwind,
+                self.s.t.f32,
+                119,
+                &[fval, k0, k0b],
+            );
+            if self.exchange.is_some() {
+                if !self.all_lanes(self.cur_ir) {
+                    need(self.cur_ir);
+                    return Err("a wave reduction where not every lane runs");
+                }
+                let sum_bits = self.s.m.cast(c, Cast::Bitcast, sum, self.s.t.i32);
+                let (b0, b1) = self.exchange_halves(self.cur, sum_bits);
+                let c = self.cur;
+                let f0 = self.s.m.cast(c, Cast::Bitcast, b0, self.s.t.f32);
+                let f1 = self.s.m.cast(c, Cast::Bitcast, b1, self.s.t.f32);
+                sum = self.s.m.bin(c, Bin::Add, f0, f1);
+            }
+            let (r_lo, r_hi) = self.f32_to_f64_bits(sum);
+            return Ok(if high { r_hi } else { r_lo });
+        }
         self.s.flags |= flags::WAVE_OPS | flags::DOUBLES;
         let f64t = self.s.m.double();
         let i32t = self.s.t.i32;
@@ -3435,6 +3476,11 @@ impl<'a> Lower<'a> {
         let k = self.s.m.f32(TWO_PI.to_bits());
         let angle = self.s.m.bin(c, Bin::Mul, part, k);
         let r = self.unary(if cosine { 12 } else { 13 }, angle);
+        let r = if !cosine {
+            self.s.m.select(c, is_zero, x, r)
+        } else {
+            r
+        };
         let at = if cosine { 0.25f32 } else { 0.5 };
         let at = self.s.m.f32(at.to_bits());
         let size = self.unary(6, part);
@@ -7657,6 +7703,72 @@ impl<'a> Lower<'a> {
         let r = self.s.m.select(c, is_over, over_res, norm_res);
         let r = self.s.m.select(c, is_sub, sub_res, r);
         self.s.m.select(c, is_under, under_res, r)
+    }
+
+    /// Converts IEEE-754 binary32 `val` (`f32`) to `(lo, hi)` binary64 words using pure
+    /// integer bit operations, so non-`DOUBLES` hosts do not require native `f64` support.
+    fn f32_to_f64_bits(&mut self, val: V) -> (V, V) {
+        let c = self.cur;
+        let bits = self.s.m.cast(c, Cast::Bitcast, val, self.s.t.i32);
+        let k0 = self.s.m.i32(0);
+        let k3 = self.s.m.i32(3);
+        let k20 = self.s.m.i32(20);
+        let k23 = self.s.m.i32(23);
+        let k29 = self.s.m.i32(29);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let abs_mask = self.s.m.i32(0x7FFF_FFFF);
+        let mant_mask = self.s.m.i32(0x007F_FFFF);
+        let kff = self.s.m.i32(0xFF);
+        let k896 = self.s.m.i32(896);
+        let k7ff = self.s.m.i32(0x7FF);
+
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let abs_bits = self.s.m.bin(c, Bin::And, bits, abs_mask);
+        let exp32 = self.s.m.bin(c, Bin::LShr, abs_bits, k23);
+        let exp32 = self.s.m.bin(c, Bin::And, exp32, kff);
+        let mant32 = self.s.m.bin(c, Bin::And, bits, mant_mask);
+
+        // Normal path: e64 = exp32 + 896, mant64 = mant32 << 29.
+        let e64_norm = self.s.m.bin(c, Bin::Add, exp32, k896);
+        let e64_norm_sh = self.s.m.bin(c, Bin::Shl, e64_norm, k20);
+        let m_hi_norm = self.s.m.bin(c, Bin::LShr, mant32, k3);
+        let hi_norm = self.s.m.bin(c, Bin::Or, e64_norm_sh, m_hi_norm);
+        let lo_norm = self.s.m.bin(c, Bin::Shl, mant32, k29);
+
+        // Subnormal path: scale |val| by 2^24 (`0x4B80_0000`) to normalize it, then bias by 872.
+        let abs_f = self.s.m.cast(c, Cast::Bitcast, abs_bits, self.s.t.f32);
+        let scale24 = self.s.m.f32(0x4B80_0000);
+        let scaled = self.s.m.bin(c, Bin::Mul, abs_f, scale24);
+        let sc_bits = self.s.m.cast(c, Cast::Bitcast, scaled, self.s.t.i32);
+        let sc_exp = self.s.m.bin(c, Bin::LShr, sc_bits, k23);
+        let sc_exp = self.s.m.bin(c, Bin::And, sc_exp, kff);
+        let sc_mant = self.s.m.bin(c, Bin::And, sc_bits, mant_mask);
+        let k872 = self.s.m.i32(872);
+        let e64_sub = self.s.m.bin(c, Bin::Add, sc_exp, k872);
+        let e64_sub_sh = self.s.m.bin(c, Bin::Shl, e64_sub, k20);
+        let m_hi_sub = self.s.m.bin(c, Bin::LShr, sc_mant, k3);
+        let hi_sub = self.s.m.bin(c, Bin::Or, e64_sub_sh, m_hi_sub);
+        let lo_sub = self.s.m.bin(c, Bin::Shl, sc_mant, k29);
+
+        // Inf / NaN path: e64 = 0x7FF, force quiet NaN bit when mant32 != 0.
+        let e64_inf_sh = self.s.m.bin(c, Bin::Shl, k7ff, k20);
+        let mant_nz = self.s.m.cmp(c, pred::NE, mant32, k0);
+        let qbit = self.s.m.i32(0x0008_0000);
+        let qmask = self.s.m.select(c, mant_nz, qbit, k0);
+        let hi_spec = self.s.m.bin(c, Bin::Or, e64_inf_sh, m_hi_norm);
+        let hi_spec = self.s.m.bin(c, Bin::Or, hi_spec, qmask);
+
+        let is_zero = self.s.m.cmp(c, pred::EQ, abs_bits, k0);
+        let is_exp0 = self.s.m.cmp(c, pred::EQ, exp32, k0);
+        let is_inf_nan = self.s.m.cmp(c, pred::EQ, exp32, kff);
+
+        let body_hi = self.s.m.select(c, is_exp0, hi_sub, hi_norm);
+        let body_lo = self.s.m.select(c, is_exp0, lo_sub, lo_norm);
+        let body_hi = self.s.m.select(c, is_inf_nan, hi_spec, body_hi);
+        let body_lo = self.s.m.select(c, is_inf_nan, lo_norm, body_lo);
+        let body_hi = self.s.m.select(c, is_zero, k0, body_hi);
+        let body_lo = self.s.m.select(c, is_zero, k0, body_lo);
+        (body_lo, self.s.m.bin(c, Bin::Or, sign, body_hi))
     }
 
     fn join64(&mut self, lo: V, hi: V) -> V {

@@ -28,7 +28,6 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
     uint kind;
     uint stride;
@@ -49,7 +48,6 @@ RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint eff_count = records;
@@ -194,11 +192,20 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    // SAFETY: the blob's own bytes; root signature serialized explicitly for Wine d3dcompiler compatibility.
     unsafe {
         let bytes =
             std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let root = crate::host::serialize_root_signature(
+            device,
+            &[
+                crate::host::root_constants(0, 6),
+                crate::host::root_srv(0),
+                crate::host::root_srv(1),
+                crate::host::root_uav(0),
+                crate::host::root_uav(1),
+            ],
+        )?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -431,9 +438,7 @@ mod tests {
     use windows::core::Interface;
 
     const WORKER_CS: &str = r#"
-#define RS "UAV(u0)"
 RWByteAddressBuffer hits : register(u0);
-[RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void main() {
     uint prev;
@@ -482,7 +487,8 @@ void main() {
                 let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
                 let event = CreateEventW(None, false, false, None).ok()?;
                 let clamp = make_for(&device).expect("clamp shader must compile on WARP");
-                let worker = compile_cs(&device, WORKER_CS).expect("worker shader must compile");
+                let worker = compile_cs(&device, WORKER_CS, &[crate::host::root_uav(0)])
+                    .expect("worker shader must compile");
                 Some(Self {
                     device,
                     queue,
@@ -616,7 +622,11 @@ void main() {
         }
     }
 
-    fn compile_cs(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    fn compile_cs(
+        device: &ID3D12Device,
+        source: &str,
+        params: &[D3D12_ROOT_PARAMETER],
+    ) -> windows::core::Result<Clamp> {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: source and entry names outlive `D3DCompile`.
         unsafe {
@@ -638,7 +648,7 @@ void main() {
                 code.GetBufferPointer().cast::<u8>(),
                 code.GetBufferSize(),
             );
-            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+            let root = crate::host::serialize_root_signature(device, params)?;
             let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
@@ -664,7 +674,17 @@ void main() {
         let Some(mut warp) = WarpHarness::new() else {
             return;
         };
-        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let compare = compile_cs(
+            &warp.device,
+            crate::host::CARD_COMPARE,
+            &[
+                crate::host::root_constants(0, 6),
+                crate::host::root_srv(0),
+                crate::host::root_uav(0),
+                crate::host::root_uav(1),
+            ],
+        )
+        .expect("the card compare must compile on WARP");
         const PIECE: usize = 64 << 10;
         const PIECES: u32 = 3;
         let size = PIECE * PIECES as usize;

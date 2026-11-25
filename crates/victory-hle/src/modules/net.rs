@@ -320,7 +320,22 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
+    let Some(func) = crate::host::function("ws2_32.dll", "WSAConnectByList") else {
+        wsa_error(10045);
+        return 0;
+    };
+    // SAFETY: `WSAConnectByList` has the same signature on Windows hosts that export it.
+    let func: extern "system" fn(
+        Socket,
+        *const u8,
+        *mut u32,
+        *mut c_void,
+        *mut u32,
+        *mut c_void,
+        *const c_void,
+        *mut c_void,
+    ) -> i32 = unsafe { std::mem::transmute(func) };
+    func(
         s, list, local_len, local, remote_len, remote, timeout, reserved,
     )
 }
@@ -580,7 +595,24 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
+    let Some(func) = crate::host::function("ws2_32.dll", "GetAddrInfoExA") else {
+        wsa_error(WSAHOST_NOT_FOUND);
+        return WSAHOST_NOT_FOUND;
+    };
+    // SAFETY: `GetAddrInfoExA` has the same signature on Windows hosts that export it.
+    let func: extern "system" fn(
+        *const c_char,
+        *const c_char,
+        u32,
+        *const c_void,
+        *const c_void,
+        *mut *mut c_void,
+        *const c_void,
+        *mut c_void,
+        *const c_void,
+        *mut Handle,
+    ) -> i32 = unsafe { std::mem::transmute(func) };
+    func(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
@@ -1053,6 +1085,8 @@ mod tests {
         // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
         // them only when the host really lacks them.
         const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        const WINE_ABSENT: &[&str] = &["WSAConnectByList", "GetAddrInfoExA"];
+        let on_wine = crate::modules::xmem::on_wine();
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
@@ -1060,7 +1094,10 @@ mod tests {
                 "ws2_32.dll"
             };
             let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
+            if !present
+                && (NEWER_WINDOWS_ONLY.contains(&e.name)
+                    || (on_wine && WINE_ABSENT.contains(&e.name)))
+            {
                 continue;
             }
             assert!(present, "{dll} lacks {}", e.name);

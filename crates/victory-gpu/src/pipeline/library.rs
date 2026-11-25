@@ -456,9 +456,26 @@ fn library() -> Option<&'static Library> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // SAFETY: `bytes` outlives the library when non-empty; MSDN requires a NULL pointer
+        // whenever `BlobLength` is 0 (a Rust empty slice `&[]` has a non-null dangling pointer).
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            if bytes.is_empty() {
+                let mut out = std::ptr::null_mut();
+                (windows::core::Interface::vtable(device).CreatePipelineLibrary)(
+                    windows::core::Interface::as_raw(device),
+                    std::ptr::null(),
+                    0,
+                    &ID3D12PipelineLibrary::IID,
+                    &mut out,
+                )
+                .ok()?;
+                let lib: ID3D12PipelineLibrary = windows::core::Type::from_abi(out)?;
+                lib.cast()
+            } else {
+                device
+                    .CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?
+                    .cast()
+            }
         }
     };
     if !blob.bytes().is_empty() {

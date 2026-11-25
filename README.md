@@ -1,3 +1,56 @@
+# MetalVI (macOS / Apple Silicon Port)
+
+**MetalVI** is a macOS (Apple Silicon) adaptation fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (itself a fork of [Marvisak/VIctory](https://github.com/Marvisak/VIctory)), running the compatibility layer on macOS via **Rosetta 2 (AVX2)**, **Wine-Proton**, and **Apple GPTK (`D3DMetal`)**.
+
+**This repository contains no game files, code, assets, or proprietary Windows/Apple DLLs.** You must supply your own copy of the title and your local Wine / Apple GPTK runtime. It is not affiliated with or endorsed by any game developer or publisher.
+
+## macOS Status (Apple M1 Max, macOS 15.7)
+
+- **Tested stack**: Apple M1 Max (64 GB unified RAM), GameHub `Wine-Proton 11.0`, Apple `GPTK 3.0-3` (`D3DMetal`), `ROSETTA_ADVERTISE_AVX=1`.
+- **Workspace test suite**: **498 / 499 executed tests pass (99.8%)**, 8 ignored, 1 host-`CARGO` test filtered:
+  - `victory_core` (11/11), `victory_pe` (7/7), `victory_formats` (24/24, 4 ignored), `victory_pipeline` (4/4), `victory_game` (3/3), `victory_loader` (24/24, including Rosetta 2 VEH instruction emulation and TLS patching), `victory_hle` (96/96), `victory_gpu` (112/112, 1 ignored), integration tests (4/4).
+  - `victory_shader` (213/214, 3 ignored): the single failure (`emit::tests::stub_pipeline_is_created`) is a benign host difference where D3DMetal accepts a zeroed DXBC MD5 digest (`[00; 16]`) rather than rejecting it.
+- **Title runtime status**: Platform, loader, HLE, GPU, and shader translation test suites are verified on D3DMetal; live title `census` / `translate` / gameplay execution is the next step (and upstream `victory-fork` itself is still early WIP).
+
+### What MetalVI adds on top of `fxceless/victory-fork`
+
+- **Apple Silicon `fp64` shader fallback** (`crates/victory-shader`, `crates/victory-gpu`): queries `D3D12_FEATURE_D3D12_OPTIONS::DoublePrecisionFloatShaderOps` on the host device and, when unavailable (as on Metal GPUs), automatically lowers `active_f64_sum` via `waveActiveOp.f32` plus pure-integer bit-level `f64 <-> f32` conversion.
+- **Metal `sin(-0.0)` sign preservation** (`crates/victory-shader/src/emit/lower.rs`): preserves `-0.0` in `trig_turns` where Metal's native `sin(-0.0)` returns `+0.0`.
+- **D3DMetal / Wine D3D12 compatibility** (`crates/victory-gpu`):
+  - Passes `(NULL, 0)` to `ID3D12Device1::CreatePipelineLibrary` for empty blobs instead of Rust's non-null empty slice pointer.
+  - Serializes root signatures explicitly via `D3D12SerializeRootSignature` rather than relying on inline `[RootSignature(...)]` shader blobs.
+- **Wine `ws2_32.dll` HLE fallbacks** (`crates/victory-hle/src/modules/net.rs`): runtime-probed fallbacks for `WSAConnectByList` and `GetAddrInfoExA`, which are absent from Wine's `ws2_32.dll`.
+- **SDK-free macOS cross-build & launcher** (`scripts/run-mac.sh`): compiles with `cargo-zigbuild` + `zig` targeting `x86_64-pc-windows-gnullvm` and keeps `VICTORY_INPLACE` disabled (since D3DMetal does not implement `OpenExistingHeapFromAddress`).
+
+### Building and Testing on macOS
+
+1. Install prerequisites on Apple Silicon macOS:
+   ```bash
+   brew install zig llvm@21 lld@21
+   rustup target add x86_64-pc-windows-gnullvm
+   cargo install cargo-zigbuild
+   ```
+2. Cross-compile release binary and workspace tests:
+   ```bash
+   export PATH="/opt/homebrew/opt/llvm@21/bin:/opt/homebrew/opt/lld@21/bin:$PATH"
+   cargo zigbuild --release -p victory --target x86_64-pc-windows-gnullvm --locked
+   cargo zigbuild --tests --workspace --target x86_64-pc-windows-gnullvm --locked
+   ```
+3. Run under Wine-Proton + Apple GPTK D3DMetal (using a local Wine prefix/cache outside the repo):
+   ```bash
+   chmod +x scripts/run-mac.sh
+   ./scripts/run-mac.sh target/x86_64-pc-windows-gnullvm/release/victory.exe config
+   ```
+
+## Credits
+
+- **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)** — original compatibility layer, loader, HLE, D3D12 backend, and DXIL shader recompiler (`GPL-3.0-or-later`).
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** — upstream rendering, speed, and shader optimization base (`GPL-3.0-or-later`).
+- **[ivall/xcl](https://github.com/ivall/xcl)** — behavioral reference noted by upstream (`GPL-2.0-only`).
+- **[pragyaangaur/VIctory-macOS](https://github.com/pragyaangaur/VIctory-macOS)** — parallel CrossOver-based macOS port of upstream `Marvisak/VIctory`.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a

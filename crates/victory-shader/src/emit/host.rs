@@ -119,6 +119,17 @@ impl Host {
                     sm.HighestShaderModel.0
                 ));
             }
+            let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+            if device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS,
+                    (&raw mut o0).cast(),
+                    size_of_val(&o0) as u32,
+                )
+                .is_ok()
+            {
+                super::set_host_f64(o0.DoublePrecisionFloatShaderOps.as_bool());
+            }
             Ok(Host { device })
         }
     }
