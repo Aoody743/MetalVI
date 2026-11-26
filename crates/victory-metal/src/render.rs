@@ -87,6 +87,24 @@ pub enum Render<'a> {
         instance_count: u32,
         base_instance: u32,
     },
+    /// Metal reads a 16-byte MTLDrawPrimitivesIndirectArguments at `offset`.
+    DrawIndirect { primitive_type: sys::WMTPrimitiveType, arguments: &'a Buffer, offset: u64 },
+    /// Metal reads a 20-byte MTLDrawIndexedPrimitivesIndirectArguments at `offset`.
+    DrawIndexedIndirect {
+        primitive_type: sys::WMTPrimitiveType,
+        index_type: u8,
+        index_buffer: &'a Buffer,
+        index_offset: u64,
+        arguments: &'a Buffer,
+        offset: u64,
+    },
+    /// Metal reads three u32 threadgroup counts at `offset`.
+    DrawMeshIndirect {
+        arguments: &'a Buffer,
+        offset: u64,
+        object_threads: [u64; 3],
+        mesh_threads: [u64; 3],
+    },
 }
 
 /// One winemetal render command: every one starts like [`sys::wmtcmd_base`].
@@ -119,7 +137,10 @@ render_link!(
     sys::wmtcmd_render_setdsso,
     sys::wmtcmd_render_setblendcolor,
     sys::wmtcmd_render_draw_indexed,
-    sys::wmtcmd_render_draw_meshthreadgroups
+    sys::wmtcmd_render_draw_meshthreadgroups,
+    sys::wmtcmd_render_draw_indirect,
+    sys::wmtcmd_render_draw_indexed_indirect,
+    sys::wmtcmd_render_draw_meshthreadgroups_indirect
 );
 
 /// A Metal depth-stencil state (+1 reference released on drop).
@@ -698,6 +719,39 @@ impl CommandBuffer {
                         vertex_count,
                         instance_count,
                         base_instance,
+                    })
+                }
+                Render::DrawIndirect { primitive_type, arguments, offset } => Box::new(sys::wmtcmd_render_draw_indirect {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandDrawIndirect,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    primitive_type,
+                    indirect_args_buffer: arguments.handle(),
+                    indirect_args_offset: offset,
+                }),
+                Render::DrawIndexedIndirect { primitive_type, index_type, index_buffer, index_offset, arguments, offset } => {
+                    Box::new(sys::wmtcmd_render_draw_indexed_indirect {
+                        type_: sys::WMTRenderCommandType::WMTRenderCommandDrawIndexedIndirect,
+                        reserved: [0; 3],
+                        next: null_next(),
+                        primitive_type,
+                        index_type: sys::WMTIndexType(index_type),
+                        index_buffer: index_buffer.handle(),
+                        index_buffer_offset: index_offset,
+                        indirect_args_buffer: arguments.handle(),
+                        indirect_args_offset: offset,
+                    })
+                }
+                Render::DrawMeshIndirect { arguments, offset, object_threads, mesh_threads } => {
+                    let size = |v: [u64; 3]| sys::WMTSize { width: v[0], height: v[1], depth: v[2] };
+                    Box::new(sys::wmtcmd_render_draw_meshthreadgroups_indirect {
+                        type_: sys::WMTRenderCommandType::WMTRenderCommandDrawMeshThreadgroupsIndirect,
+                        reserved: [0; 3],
+                        next: null_next(),
+                        indirect_args_buffer: arguments.handle(),
+                        indirect_args_offset: offset,
+                        object_threadgroup_size: size(object_threads),
+                        mesh_threadgroup_size: size(mesh_threads),
                     })
                 }
             });

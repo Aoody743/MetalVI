@@ -16,6 +16,7 @@ pub mod blit;
 pub mod chunks;
 pub mod msc;
 pub mod events;
+pub mod indirect;
 pub mod ir;
 pub mod sampler;
 pub mod sys;
@@ -204,6 +205,20 @@ impl Device {
         Ok(Buffer { object: buffer, gpu_address: info.gpu_address, len })
     }
 
+    /// Allocates a Metal-owned buffer in private storage.
+    pub fn private_buffer(&self, len: u64) -> Result<Buffer> {
+        let mut info = sys::WMTBufferInfo {
+            length: len,
+            options: sys::WMTResourceOptions::WMTResourceStorageModePrivate,
+            memory: sys::WMTMemoryPointer { ptr: core::ptr::null_mut() },
+            gpu_address: 0,
+        };
+        // SAFETY: a live device; null memory requests a Metal-owned allocation.
+        let object = Object::adopt(unsafe { sys::MTLDevice_newBuffer(self.handle(), &mut info) })
+            .ok_or_else(|| Error(format!("newBufferWithLength({len:#x}) refused")))?;
+        Ok(Buffer { object, gpu_address: info.gpu_address, len })
+    }
+
     /// Creates a Metal-owned shared buffer initialized with a copy of `bytes`.
     pub fn shared_buffer(&self, bytes: &[u8]) -> Result<Buffer> {
         let len = bytes.len() as u64;
@@ -352,6 +367,8 @@ pub enum Compute<'a> {
     Pipeline { pipeline: &'a ComputePipeline, threads_per_group: [u64; 3] },
     Buffer { buffer: &'a Buffer, offset: u64, index: u8 },
     Dispatch { groups: [u64; 3] },
+    /// Runs the current pipeline with three GPU-supplied u32 group counts.
+    DispatchIndirect { arguments: &'a Buffer, offset: u64 },
     /// Bytes copied into the command (Metal's `setBytes`, at most 4 KiB):
     /// the top-level argument buffer goes this way.
     Bytes { bytes: &'a [u8], index: u8 },
@@ -415,6 +432,13 @@ impl CommandBuffer {
                     next: null_next(),
                     size: sys::WMTSize { width: w, height: h, depth: d },
                 }),
+                Compute::DispatchIndirect { arguments, offset } => Box::new(sys::wmtcmd_compute_dispatch_indirect {
+                    type_: sys::WMTComputeCommandType::WMTComputeCommandDispatchIndirect,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    indirect_args_buffer: arguments.handle(),
+                    indirect_args_offset: offset,
+                }),
             });
         }
         for i in 1..chain.len() {
@@ -475,6 +499,6 @@ macro_rules! chain_link {
         }
     )*};
 }
-chain_link!(sys::wmtcmd_compute_setpso, sys::wmtcmd_compute_setbuffer, sys::wmtcmd_compute_dispatch, sys::wmtcmd_compute_setbytes, sys::wmtcmd_compute_memory_barrier);
+chain_link!(sys::wmtcmd_compute_setpso, sys::wmtcmd_compute_setbuffer, sys::wmtcmd_compute_dispatch, sys::wmtcmd_compute_dispatch_indirect, sys::wmtcmd_compute_setbytes, sys::wmtcmd_compute_memory_barrier);
 pub mod render;
 pub mod present;

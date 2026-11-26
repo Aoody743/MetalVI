@@ -695,6 +695,10 @@ fn create() -> windows::core::Result<Host> {
         if crate::backend::metal::mode() == crate::backend::metal::Mode::Compute {
             tracing::info!("Metal backend: shaders translated for waves of 32");
             victory_shader::emit::set_host_max_wave(32);
+            // Apple7 has no 64-bit image atomics in fragment functions:
+            // pixel-stage ones become rasterizer-ordered loads and stores
+            // (F38; the pipelines Metal refused as "float atomic").
+            victory_shader::emit::set_host_image_atomic64(false);
         }
         let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
         if device

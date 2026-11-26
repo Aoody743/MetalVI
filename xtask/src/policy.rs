@@ -17,7 +17,7 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
     // The Metal unixlib (native/victorymetal) and macOS helpers: our C and
     // Objective-C sources and dxmt's/Wine's LGPL ones, and build scripts.
-    "c", "h", "m", "py",
+    "c", "h", "m", "metal", "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",

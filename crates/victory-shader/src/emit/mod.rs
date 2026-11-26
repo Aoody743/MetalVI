@@ -114,7 +114,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_max_wave, set_host_f64, set_host_max_wave};
+pub use lower::{host_has_image_atomic64, host_max_wave, set_host_f64, set_host_image_atomic64, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -1538,6 +1538,185 @@ mod atomic_tests {
                 v.validate(&mut shader.dxil.clone()).unwrap();
             }
         }
+    }
+
+    fn dxil_has_symbol(shader: &HostShader, op: &str) -> bool {
+        let c = Container::parse(&shader.dxil).unwrap();
+        let part = c.part(FourCC::DXIL).unwrap();
+        let bits: Vec<_> = part
+            .data
+            .iter()
+            .flat_map(|&b| (0..8).map(move |k| (b >> k) & 1))
+            .collect();
+        let name: Vec<_> = op
+            .bytes()
+            .flat_map(|b| {
+                let word = u16::from(b & 31) | 32 | (u16::from(b >> 5) << 6);
+                (0..12).map(move |k| ((word >> k) & 1) as u8)
+            })
+            .collect();
+        bits.windows(name.len()).any(|s| s == name)
+    }
+
+    fn sfi0(shader: &HostShader) -> u64 {
+        let c = Container::parse(&shader.dxil).unwrap();
+        u64::from_le_bytes(
+            c.part(FourCC::SFI0)
+                .unwrap()
+                .data
+                .try_into()
+                .unwrap(),
+        )
+    }
+
+    struct HostImageAtomic64Guard(Option<bool>);
+    impl HostImageAtomic64Guard {
+        fn set(v: bool) -> Self {
+            let prev = super::lower::TEST_HOST_IMAGE_ATOMIC64.replace(Some(v));
+            Self(prev)
+        }
+    }
+    impl Drop for HostImageAtomic64Guard {
+        fn drop(&mut self) {
+            super::lower::TEST_HOST_IMAGE_ATOMIC64.set(self.0);
+        }
+    }
+
+    fn synthetic_atomic64_program(stage: HwStage, opcode: u32, mask: u32, glc: bool) -> NativeProgram {
+        let mimg0 = 0xF000_0008 | (opcode << 18) | (u32::from(glc) << 13) | (mask << 8);
+        let words = [
+            0xBE81_0380, // s_mov_b32 s1, 0 (table address high)
+            0xF40C_0200,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[0:1], 0
+            0x7E00_0280,
+            0x7E02_0280, // v0, v1 = coordinates
+            0x7E04_0281,
+            0x7E06_0282,
+            0x7E08_0283,
+            0x7E0A_0284, // v2..v5 = 1..4
+            mimg0,
+            0x0002_0200, // vdata=v2, vaddr=v0, srsrc=s[8:15], dim=2d
+            // Keep glc return registers live (export mrt0 for Ps, second atomic for Cs).
+            if stage == HwStage::Ps { 0xF800_180F } else { 0xF044_0008 | (3 << 8) },
+            if stage == HwStage::Ps { 0x0302_0302 } else { 0x0002_0200 },
+            0xBF81_0000, // s_endpgm
+        ];
+        NativeProgram {
+            stage,
+            wave64: false,
+            vgprs: 6,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![],
+            io: match stage {
+                HwStage::Ps => StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                HwStage::Cs => StageIo::Cs(ComputeIo {
+                    rsrc2: 2,
+                    threads: [32, 1, 1],
+                }),
+                _ => unreachable!(),
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    fn emit_synthetic(native: &NativeProgram) -> HostShader {
+        let p = ir::build(&native.code, false, native.vgprs).unwrap();
+        let bytes = if native.stage == HwStage::Ps {
+            let target = container::SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[target], false);
+            crate::dxbc::build(&[(FourCC::OSG1, &osg1)])
+        } else {
+            crate::dxbc::build(&[])
+        };
+        emit(
+            &Container::parse(&bytes).unwrap(),
+            native,
+            &p,
+            &structure::structure(&p).unwrap(),
+            &io::raise(&p, native).unwrap(),
+            &resource::track(&p, &native.layout, native.stage, None).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pixel_image_atomic64_rov_fallback() {
+        const SFI0_TYPED_UAV_LOADS: u64 = 0x800;
+        const SFI0_INT64: u64 = 0x8000;
+        const SFI0_ATOMIC_TYPED64: u64 = 0x40_0000;
+        const SFI0_RESOURCE_HEAP: u64 = 0x200_0000;
+        const SFI0_ATOMIC_HEAP64: u64 = 0x1000_0000;
+
+        for (opcode, mask, glc, expected_dxil_op) in [
+            (0x17u32, 3, false, "dx.op.atomicBinOp.i64"), // image_atomic_umax (no glc)
+            (0x17, 3, true, "dx.op.atomicBinOp.i64"),     // image_atomic_umax (glc)
+            (0x11, 3, true, "dx.op.atomicBinOp.i64"),     // image_atomic_add (glc)
+            (0x12, 3, true, "dx.op.atomicBinOp.i64"),     // image_atomic_sub (glc)
+            (0x10, 15, true, "dx.op.atomicCompareExchange.i64"), // image_atomic_cmpswap
+        ] {
+            let native = synthetic_atomic64_program(HwStage::Ps, opcode, mask, glc);
+            {
+                let _g = HostImageAtomic64Guard::set(false);
+                let shader = emit_synthetic(&native);
+                let features = sfi0(&shader);
+                assert_eq!(features & (SFI0_ATOMIC_TYPED64 | SFI0_ATOMIC_HEAP64), 0);
+                assert_ne!(features & SFI0_TYPED_UAV_LOADS, 0);
+                assert_ne!(features & SFI0_INT64, 0);
+                assert_ne!(features & SFI0_RESOURCE_HEAP, 0);
+                assert!(dxil_has_symbol(&shader, "dx.op.textureLoad.i32"));
+                assert!(dxil_has_symbol(&shader, "dx.op.textureStore.i32"));
+                assert!(!dxil_has_symbol(&shader, expected_dxil_op));
+                #[cfg(windows)]
+                if let Ok(mut v) =
+                    validator::Validator::load(validator::Validator::default_path().as_deref())
+                {
+                    v.validate(&mut shader.dxil.clone()).unwrap();
+                }
+            }
+            {
+                let _g = HostImageAtomic64Guard::set(true);
+                let shader = emit_synthetic(&native);
+                let features = sfi0(&shader);
+                assert_ne!(features & SFI0_ATOMIC_TYPED64, 0);
+                assert_ne!(features & SFI0_ATOMIC_HEAP64, 0);
+                assert!(dxil_has_symbol(&shader, expected_dxil_op));
+            }
+        }
+    }
+
+    #[test]
+    fn compute_image_atomic64_keeps_native_atomic_when_pixel_fallback_enabled() {
+        let _g = HostImageAtomic64Guard::set(false);
+        let native = synthetic_atomic64_program(HwStage::Cs, 0x17, 3, true);
+        let shader = emit_synthetic(&native);
+        let features = sfi0(&shader);
+        assert_ne!(features & 0x40_0000, 0);
+        assert_ne!(features & 0x1000_0000, 0);
+        assert!(dxil_has_symbol(&shader, "dx.op.atomicBinOp.i64"));
+        assert!(!dxil_has_symbol(&shader, "dx.op.textureLoad.i32"));
     }
 }
 

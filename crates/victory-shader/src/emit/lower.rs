@@ -980,6 +980,24 @@ pub(crate) fn host_has_f64() -> bool {
     HOST_F64.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the host GPU supports native 64-bit integer image atomics.
+static HOST_IMAGE_ATOMIC64: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Configures whether pixel-stage 64-bit integer `image_atomic_*` instructions emit native
+/// DXIL `atomic*.i64` (`true`, default) or lower through Rasterizer Ordered Views (`false`).
+pub fn set_host_image_atomic64(supported: bool) {
+    HOST_IMAGE_ATOMIC64.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn host_has_image_atomic64() -> bool {
+    #[cfg(test)]
+    if let Some(supported) = TEST_HOST_IMAGE_ATOMIC64.get() {
+        return supported;
+    }
+    HOST_IMAGE_ATOMIC64.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1067,6 +1085,8 @@ pub fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's host 64-bit image atomic support, for its thread only.
+    pub(super) static TEST_HOST_IMAGE_ATOMIC64: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -9827,6 +9847,76 @@ impl<'a> Lower<'a> {
             };
             let width = if wide { 2 } else { 1 };
             let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
+            if wide && self.s.pixel && !host_has_image_atomic64() {
+                self.s.flags |= flags::INT64 | flags::TYPED_UAV_LOADS;
+                let original = self.join64(vals[0], vals[1]);
+                let comparand = compare.then(|| self.join64(vals[2], vals[3]));
+                // Lower pixel 64-bit image atomics through an RG32Uint ROV view so overlapping
+                // pixel fragments serialize on Apple7 Metal without 64-bit integer image atomics.
+                let h = self.handle(site, src, false, (kind | 0x3000, 0x205))?;
+                let at = self.begin_guarded(guard);
+                let cur = self.cur;
+                let i32t = self.s.t.i32;
+                let res_i32 = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                let mut load_args = vec![h, iu];
+                load_args.extend(&cs);
+                load_args.extend([iu, iu, iu]);
+                let loaded = self.s.op(
+                    cur,
+                    "textureLoad.i32",
+                    Attr::ReadOnly,
+                    res_i32,
+                    66,
+                    &load_args,
+                );
+                let old_lo = self.s.m.extract(cur, loaded, 0);
+                let old_hi = self.s.m.extract(cur, loaded, 1);
+                let old = self.join64(old_lo, old_hi);
+                let (new_val, cond) = match op {
+                    "add" => (self.s.m.bin(cur, Bin::Add, old, original), None),
+                    "sub" => (self.s.m.bin(cur, Bin::Sub, old, original), None),
+                    "and" => (self.s.m.bin(cur, Bin::And, old, original), None),
+                    "or" => (self.s.m.bin(cur, Bin::Or, old, original), None),
+                    "xor" => (self.s.m.bin(cur, Bin::Xor, old, original), None),
+                    "swap" => (original, None),
+                    "umax" => (original, Some(self.s.m.cmp(cur, pred::IUGT, original, old))),
+                    "umin" => (original, Some(self.s.m.cmp(cur, pred::IULT, original, old))),
+                    "smax" => (original, Some(self.s.m.cmp(cur, pred::SGT, original, old))),
+                    "smin" => (original, Some(self.s.m.cmp(cur, pred::SLT, original, old))),
+                    "cmpswap" => (
+                        original,
+                        Some(self.s.m.cmp(cur, pred::EQ, old, comparand.unwrap())),
+                    ),
+                    _ => return Err(name),
+                };
+                let emit_rov_store = |l: &mut Self, val: V| {
+                    let (new_lo, new_hi) = l.split64(val);
+                    let mut args = vec![h];
+                    args.extend(&cs);
+                    args.extend([new_lo, new_hi, new_lo, new_hi, l.s.m.i8(0xF)]);
+                    let void = l.s.t.void;
+                    l.s.op(l.cur, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
+                };
+                if let Some(cond) = cond {
+                    let (store_blk, done_blk) = (self.s.m.new_block(), self.s.m.new_block());
+                    self.s.m.terminate(cur, Term::CondBr(cond, store_blk, done_blk));
+                    self.cur = store_blk;
+                    emit_rov_store(self, new_val);
+                    self.s.m.terminate(self.cur, Term::Br(done_blk));
+                    self.cur = done_blk;
+                } else {
+                    emit_rov_store(self, new_val);
+                }
+                if cache.glc {
+                    let old = self.end_guarded(at, &[(old, original)])[0];
+                    let (lo, hi) = self.split64(old);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.end_guarded(at, &[]);
+                }
+                return Ok(());
+            }
             let (ty, component) = if wide {
                 self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
                 (self.s.m.int(64), 0x107) // one uint64_t in an R32G32_UINT view
