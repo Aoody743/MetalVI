@@ -2028,10 +2028,27 @@ impl State {
     /// A draw on Metal too (`VICTORY_METAL_DRAW=1`): recorded into the
     /// list as [`crate::backend::metal::MetalOp::Draw`], counted.
     #[cfg(windows)]
+    /// Notes, for the captures, a draw at the bound colour targets
+    /// (`kind`: an index into `metal_draw::WRITE_NAMES`).
+    #[cfg(windows)]
+    fn note_asked(&self, kind: usize) {
+        if crate::backend::metal_draw::capture_every() > 0 {
+            for &h in &self.target_handles {
+                if let Some(r) = crate::descriptor::rtv_record(h) {
+                    crate::backend::metal_draw::note_write(r.resource as usize, kind);
+                }
+            }
+        }
+    }
+
     fn metal_draw(&mut self, kind: crate::backend::metal_draw::DrawKindIn) {
         use crate::backend::metal_draw::{DrawDrop, DrawKind, DrawKindIn, MetalDraw, StageBind, count_draw};
         let Some(m) = crate::backend::metal::backend() else { return };
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        self.note_asked(6);
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            self.note_asked(7);
+            return;
+        };
         let rects = self.topology == RECTANGLES && !p.mesh && !matches!(kind, DrawKindIn::Mesh { .. });
         let Some(g) = m.graphics_pipeline(self.pipeline, p, rects) else {
             count_draw(DrawDrop::NoPipeline);
@@ -2955,6 +2972,10 @@ impl State {
             && expansion.is_none_or(|kind| {
                 i32::try_from(first).is_ok_and(|base| self.host_console_list(list, kind, vertices, instances, base, first_instance, None))
             });
+        #[cfg(windows)]
+        if !ran && crate::backend::metal_draw::draws_on() {
+            self.note_asked(8);
+        }
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -3109,6 +3130,10 @@ impl State {
         let ran = !lost
             && self.prepare(list, expansion.is_none())
             && expansion.is_none_or(|kind| self.host_console_list(list, kind, indices, instances, base, first_instance, Some(first)));
+        #[cfg(windows)]
+        if !ran && crate::backend::metal_draw::draws_on() {
+            self.note_asked(8);
+        }
         if ran {
             #[cfg(windows)]
             if crate::backend::metal_draw::draws_on() {

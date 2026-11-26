@@ -900,7 +900,7 @@ extern "system" fn present(
         m.capture(resource, &format!("frame{frame:06}"));
         // What wrote the presented texture since the last capture.
         let writes = std::mem::take(&mut *crate::backend::metal_draw::WRITES.lock().unwrap_or_else(|e| e.into_inner()));
-        let mine = writes.iter().find(|(r, _)| *r == resource as usize).map_or([0; 6], |(_, n)| *n);
+        let mine = writes.iter().find(|(r, _)| *r == resource as usize).map_or([0; 9], |(_, n)| *n);
         let names = crate::backend::metal_draw::WRITE_NAMES;
         tracing::info!(
             frame,
