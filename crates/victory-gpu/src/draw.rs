@@ -2059,9 +2059,6 @@ impl State {
                 Some(t) => t.primitive_type as u64 as u8,
                 None => {
                     crate::backend::metal_draw::note_once(format!("topology unmapped: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
-                    crate::backend::metal_draw::note_once(format!("geometry draw refused: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
-                    crate::backend::metal_draw::note_once(format!("geometry indexed draw refused: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
-                    crate::backend::metal_draw::note_once(format!("mesh draw with a geometry pipeline: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
                     count_draw(DrawDrop::Topology);
                     return;
                 }

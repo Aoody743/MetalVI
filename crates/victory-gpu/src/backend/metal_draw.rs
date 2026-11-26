@@ -808,6 +808,17 @@ mod console_topology_tests {
     use super::*;
 
     #[test]
+    fn d3d_topology_numbers_are_the_real_ones() {
+        use crate::backend::metal_map::{MtlPrimitiveType, map_topology};
+        // d3dcommon.h: 1 point, 2 line list, 3 line strip, 4 triangle list,
+        // 5 triangle strip, 10-13 adjacency (no Metal type).
+        assert_eq!(map_topology(4).map(|t| t.primitive_type), Some(MtlPrimitiveType::Triangle));
+        assert_eq!(map_topology(5).map(|t| t.primitive_type), Some(MtlPrimitiveType::TriangleStrip));
+        assert_eq!(map_topology(3).map(|t| t.primitive_type), Some(MtlPrimitiveType::LineStrip));
+        assert!(map_topology(12).is_none());
+    }
+
+    #[test]
     fn console_topologies_become_lists() {
         let v: Vec<u32> = (0..8).collect();
         assert_eq!(console_indices(ConsoleTopology::Quads, &v[..8]), [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);

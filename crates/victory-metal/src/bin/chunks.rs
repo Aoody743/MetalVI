@@ -196,7 +196,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         // SAFETY: mapped (pages around the boundary are pages 15/16 region).
         unsafe { *((words_at + k as usize * 4) as *mut u32) = 0xA000 + k };
     }
+    // SAFETY: the previous probe is complete and its pool drained. Retire
+    // both chunks before making a span over any of the same pages.
+    unsafe { chunks.invalidate_quiesced(words_at as u64, 16) };
     let w = chunks.window(words_at as u64, 16);
+    if w == 0 {
+        return Err("no cross-chunk window".into());
+    }
     let raw = device.compute_pipeline_msl(
         "#include <metal_stdlib>\nusing namespace metal;\n\
          kernel void r(device const ulong *args [[buffer(0)]], device uint *out [[buffer(1)]], uint i [[thread_position_in_grid]]) {\n\

@@ -115,9 +115,8 @@ impl MetalBackend {
         // shader writes (its depth views are left out instead).
         let pixel = if d.flags & DEPTH != 0 && d.flags & UNORDERED == 0 { depth_pixel(d.format).unwrap_or(pixel) } else { pixel };
         let mips = u32::from(d.mip_levels.max(1));
+        // Metal Shader Converter lowers DXIL 1D textures to height-one 2D.
         let (type_, depth, slices) = match d.dimension {
-            TEXTURE_1D if d.depth_or_array_size > 1 => (WMTTextureType::WMTTextureType1DArray, 1, u32::from(d.depth_or_array_size)),
-            TEXTURE_1D => (WMTTextureType::WMTTextureType1D, 1, 1),
             TEXTURE_3D => (WMTTextureType::WMTTextureType3D, u32::from(d.depth_or_array_size.max(1)), 1),
             _ if d.sample_count > 1 => (WMTTextureType::WMTTextureType2DMultisample, 1, 1),
             _ if d.depth_or_array_size > 1 => (WMTTextureType::WMTTextureType2DArray, 1, u32::from(d.depth_or_array_size)),
@@ -138,7 +137,7 @@ impl MetalBackend {
         let desc = TextureDescriptor {
             pixel_format: pixel,
             width,
-            height: d.height.max(1),
+            height: if d.dimension == TEXTURE_1D { 1 } else { d.height.max(1) },
             depth,
             array_length: slices,
             type_,
@@ -190,7 +189,7 @@ impl MetalBackend {
         // SAFETY: committed, read only.
         let tiled = unsafe { std::slice::from_raw_parts(memory, tiled_size as usize) };
         let w = u64::from(t.desc.width as u32);
-        let h = u64::from(t.desc.height.max(1));
+        let h = if t.desc.dimension == TEXTURE_1D { 1 } else { u64::from(t.desc.height.max(1)) };
         let d3 = if t.desc.dimension == TEXTURE_3D { u64::from(t.desc.depth_or_array_size.max(1)) } else { 1 };
         // Rows of every subresource, one after the other, in a staging buffer.
         let mut plan = Vec::new();
@@ -298,88 +297,96 @@ impl MetalBackend {
             return Some(*e);
         }
         let t = self.texture_for(r)?;
-        let (format, type_, levels, slices, swizzle, min_lod) = match words {
-            None => (t.pixel, None, (0, t.mips), (0, t.slices), identity(), 0.0),
-            Some(w) => {
-                let Some(v) = (if unordered { uav_view(w, &t) } else { srv_view(w, &t) }) else {
-                    fail(if unordered { "UAV description" } else { "SRV description" }, Some(&t.desc), Some(w));
-                    return None;
-                };
-                let format = view_format(&t, w[0]);
-                (format, v.type_, v.levels, v.slices, v.swizzle, v.min_lod)
-            }
-        };
-        let type_ = type_.unwrap_or(match t.desc.dimension {
-            TEXTURE_1D if t.slices > 1 => WMTTextureType::WMTTextureType1DArray,
-            TEXTURE_1D => WMTTextureType::WMTTextureType1D,
-            TEXTURE_3D => WMTTextureType::WMTTextureType3D,
-            _ if t.slices > 1 => WMTTextureType::WMTTextureType2DArray,
-            _ => WMTTextureType::WMTTextureType2D,
-        });
-        let levels = (levels.0.min(t.mips - 1), levels.1.min(t.mips - levels.0.min(t.mips - 1)).max(1));
-        let slices = (slices.0.min(t.slices - 1), slices.1.min(t.slices - slices.0.min(t.slices - 1)).max(1));
-        let type_ = view_type(&t, type_, slices.1);
-        // No swizzle on depth formats (not something to risk an assertion on).
-        let swizzle = if is_depth_pixel(format.0) { identity() } else { swizzle };
-        let mut id = 0u64;
-        let _pool = victory_metal::Pool::new();
-        // SAFETY: a live texture; the view is kept below.
-        let view = unsafe {
-            sys::MTLTexture_newTextureView(
-                t.texture.handle(),
-                format,
-                type_,
-                levels.0 as u16,
-                levels.1 as u16,
-                slices.0 as u16,
-                slices.1 as u16,
-                swizzle,
-                &mut id,
-            )
-        };
-        let Some(view) = victory_metal::Object::adopt(view) else {
-            fail("newTextureView failed", Some(&t.desc), words);
-            return None;
-        };
-        if id == 0 {
-            id = view.gpu_resource_id();
-        }
-        if id == 0 {
-            fail("no gpuResourceID", Some(&t.desc), words);
-            return None;
-        }
-        let entry = DescriptorEntry::texture(id, min_lod, 0);
+        let (view, entry) = self.make_entry_or_sink(&t, words, unordered)?;
         self.views.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (view, entry));
         Some(entry)
     }
+
+    fn make_entry_or_sink(&self, t: &MetalTexture, words: Option<&[u32]>, unordered: bool) -> Option<(victory_metal::Object, DescriptorEntry)> {
+        if let Some(w) = words.filter(|w| unordered && partial_3d_uav(w, t)) {
+            fail("partial 3D UAV W range", Some(&t.desc), Some(w));
+            // An invalid resource ID may fault. Do not share the writeable
+            // sink with unrelated resources or valid null texture entries.
+            return self.allocate_null_texture(Some(w), WMTTextureType::WMTTextureType3D, 1, view_format(t, w[0]));
+        }
+        make_texture_entry(t, words, unordered)
+    }
 }
+
+fn make_texture_entry(t: &MetalTexture, words: Option<&[u32]>, unordered: bool) -> Option<(victory_metal::Object, DescriptorEntry)> {
+    let (format, type_, levels, slices, swizzle, min_lod) = match words {
+        None => (t.pixel, None, (0, t.mips), (0, t.slices), identity(), 0.0),
+        Some(w) => {
+            let Some(v) = (if unordered { uav_view(w, t) } else { srv_view(w, t) }) else {
+                fail(if unordered { "UAV description" } else { "SRV description" }, Some(&t.desc), Some(w));
+                return None;
+            };
+            let format = view_format(t, w[0]);
+            (format, v.type_, v.levels, v.slices, v.swizzle, v.min_lod)
+        }
+    };
+    let type_ = type_.unwrap_or_else(|| base_type(t));
+    let levels = (levels.0.min(t.mips - 1), levels.1.min(t.mips - levels.0.min(t.mips - 1)).max(1));
+    let slices = (slices.0.min(t.slices - 1), slices.1.min(t.slices - slices.0.min(t.slices - 1)).max(1));
+    let type_ = view_type(t, type_, slices.1);
+    // No swizzle on depth formats (not something to risk an assertion on).
+    let swizzle = if is_depth_pixel(format.0) { identity() } else { swizzle };
+    let mut id = 0u64;
+    let _pool = victory_metal::Pool::new();
+    // SAFETY: a live texture; the view is kept below.
+    let view = unsafe {
+        sys::MTLTexture_newTextureView(
+            t.texture.handle(),
+            format,
+            type_,
+            levels.0 as u16,
+            levels.1 as u16,
+            slices.0 as u16,
+            slices.1 as u16,
+            swizzle,
+            &mut id,
+        )
+    };
+    let Some(view) = victory_metal::Object::adopt(view) else {
+        fail("newTextureView failed", Some(&t.desc), words);
+        return None;
+    };
+    if id == 0 {
+        id = view.gpu_resource_id();
+    }
+    if id == 0 {
+        fail("no gpuResourceID", Some(&t.desc), words);
+        return None;
+    }
+    let entry = DescriptorEntry::texture(id, min_lod, 0);
+    Some((view, entry))
+}
+
+#[cfg(test)]
+mod descriptor_coverage;
 
 impl MetalBackend {
     /// A null view (D3D12 reads zeros, drops writes): a zeroed 1x1 texture
     /// of the view's type and format, one per (type, format), shared.
     /// Metal has no null texture in an argument buffer that is safe to read.
     fn null_texture(&self, words: Option<&[u32]>, unordered: bool) -> Option<DescriptorEntry> {
-        use WMTTextureType as T;
-        let dim = words.and_then(|w| w.get(1).copied()).unwrap_or(4);
-        let (type_, slices) = match dim {
-            2 => (T::WMTTextureType1D, 1),
-            3 => (T::WMTTextureType1DArray, 1),
-            5 => (T::WMTTextureType2DArray, 1),
-            8 => (T::WMTTextureType3D, 1),
-            9 if !unordered => (T::WMTTextureTypeCube, 6),
-            10 if !unordered => (T::WMTTextureTypeCubeArray, 6),
-            _ => (T::WMTTextureType2D, 1),
-        };
-        let format = words
-            .and_then(|w| w.first().copied())
-            .filter(|&f| f != 0)
-            .filter(|&f| format_props(crate::resource::pc_format(f) as i32).is_some_and(|p| !p.depth_stencil && p.block_width <= 1))
-            .and_then(pixel_format)
-            .unwrap_or(WMTPixelFormat::WMTPixelFormatRGBA8Unorm);
+        let (type_, slices, format) = null_texture_shape(words, unordered);
         let key = (0usize, [type_.0 as u32, format.0, u32::MAX, 0, 0, 0, 0, 0, 0, 0], unordered);
         if let Some((_, e)) = self.views.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Some(*e);
         }
+        let (view, entry) = self.allocate_null_texture(words, type_, slices, format)?;
+        self.views.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (view, entry));
+        Some(entry)
+    }
+
+    fn allocate_null_texture(
+        &self,
+        words: Option<&[u32]>,
+        type_: WMTTextureType,
+        slices: u32,
+        format: WMTPixelFormat,
+    ) -> Option<(victory_metal::Object, DescriptorEntry)> {
         let desc = TextureDescriptor {
             pixel_format: format,
             width: 1,
@@ -400,41 +407,45 @@ impl MetalBackend {
                 return None;
             }
         };
-        {
-            let chunks = self.chunks();
-            chunks.residency().add(&[texture.handle()]);
-            chunks.residency().commit();
+        let buffer = self.device.shared_buffer(&[0; 256]).ok()?;
+        let cb = self.queue.command_buffer().ok()?;
+        let mut blit = cb.blit_encoder().ok()?;
+        for slice in 0..slices {
+            blit.copy_from_buffer_to_texture(&buffer, 0, 256, 256, [1, 1, 1], &texture, slice, 0, [0, 0, 0]);
         }
-        // zeros from a fresh (zeroed) allocation, into every face
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        const SIZE: usize = 64 << 10;
-        // SAFETY: a fresh allocation, released after the GPU is done.
-        let staging = unsafe { VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-        if !staging.is_null() {
-            // SAFETY: lives until the blit is waited for.
-            if let Ok(buffer) = unsafe { self.device.wrap(staging, SIZE as u64) }
-                && let Ok(cb) = self.queue.command_buffer()
-                && let Ok(mut blit) = cb.blit_encoder()
-            {
-                for slice in 0..slices {
-                    blit.copy_from_buffer_to_texture(&buffer, 0, 256, 256, [1, 1, 1], &texture, slice, 0, [0, 0, 0]);
-                }
-                blit.finish();
-                cb.commit();
-                let _ = cb.wait();
-            }
-            // SAFETY: ours, the GPU is done.
-            unsafe { VirtualFree(staging, 0, MEM_RELEASE) };
-        }
+        blit.finish();
+        cb.commit();
+        cb.wait().ok()?;
         let id = texture.gpu_resource_id();
         if id == 0 {
             fail("null texture id", None, words);
             return None;
         }
+        let chunks = self.chunks();
+        chunks.residency().add(&[texture.handle()]);
+        chunks.residency().commit();
         let entry = DescriptorEntry::texture(id, 0.0, 0);
-        self.views.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (texture.into_object(), entry));
-        Some(entry)
+        Some((texture.into_object(), entry))
     }
+}
+
+fn null_texture_shape(words: Option<&[u32]>, unordered: bool) -> (WMTTextureType, u32, WMTPixelFormat) {
+    use WMTTextureType as T;
+    let dim = words.and_then(|w| w.get(1).copied()).unwrap_or(4);
+    let (type_, slices) = match dim {
+        3 | 5 => (T::WMTTextureType2DArray, 1),
+        8 => (T::WMTTextureType3D, 1),
+        9 if !unordered => (T::WMTTextureTypeCube, 6),
+        10 if !unordered => (T::WMTTextureTypeCubeArray, 6),
+        _ => (T::WMTTextureType2D, 1),
+    };
+    let format = words
+        .and_then(|w| w.first().copied())
+        .filter(|&f| f != 0)
+        .filter(|&f| format_props(crate::resource::pc_format(f) as i32).is_some_and(|p| !p.depth_stencil && p.block_width <= 1))
+        .and_then(pixel_format)
+        .unwrap_or(WMTPixelFormat::WMTPixelFormatRGBA8Unorm);
+    (type_, slices, format)
 }
 
 /// The pixel format of a view in DXGI format `wanted` of texture `t`, as
@@ -476,18 +487,10 @@ pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
 /// is an assertion, like a format), else the texture's own type.
 fn view_type(t: &MetalTexture, wanted: WMTTextureType, slices: u32) -> WMTTextureType {
     use WMTTextureType as T;
-    let base = match t.desc.dimension {
-        TEXTURE_1D if t.slices > 1 => T::WMTTextureType1DArray,
-        TEXTURE_1D => T::WMTTextureType1D,
-        TEXTURE_3D => T::WMTTextureType3D,
-        _ if t.desc.sample_count > 1 => T::WMTTextureType2DMultisample,
-        _ if t.slices > 1 => T::WMTTextureType2DArray,
-        _ => T::WMTTextureType2D,
-    };
+    let base = base_type(t);
     let square = u64::from(t.desc.height) == t.desc.width;
     let ok = match (base, wanted) {
         (b, w) if b == w => true,
-        (T::WMTTextureType1D | T::WMTTextureType1DArray, T::WMTTextureType1D | T::WMTTextureType1DArray) => true,
         (T::WMTTextureType2D | T::WMTTextureType2DArray, T::WMTTextureType2D | T::WMTTextureType2DArray) => true,
         (T::WMTTextureType2DArray, T::WMTTextureTypeCube) => square && slices == 6,
         (T::WMTTextureType2DArray, T::WMTTextureTypeCubeArray) => square && slices % 6 == 0 && slices > 0,
@@ -541,8 +544,8 @@ fn srv_view(w: &[u32], t: &MetalTexture) -> Option<ViewShape> {
     }
     let all = |n: u32, max: u32| if n == u32::MAX || n == 0 { max } else { n };
     let (type_, levels, slices, min_lod) = match w[1] {
-        2 => (WMTTextureType::WMTTextureType1D, (w[4], all(w[5], t.mips)), (0, 1), f32::from_bits(w[6])),
-        3 => (WMTTextureType::WMTTextureType1DArray, (w[4], all(w[5], t.mips)), (w[6], w[7]), f32::from_bits(w[8])),
+        2 => (WMTTextureType::WMTTextureType2D, (w[4], all(w[5], t.mips)), (0, 1), f32::from_bits(w[6])),
+        3 => (WMTTextureType::WMTTextureType2DArray, (w[4], all(w[5], t.mips)), (w[6], w[7]), f32::from_bits(w[8])),
         4 => (WMTTextureType::WMTTextureType2D, (w[4], all(w[5], t.mips)), (0, 1), f32::from_bits(w[7])),
         5 => (WMTTextureType::WMTTextureType2DArray, (w[4], all(w[5], t.mips)), (w[6], w[7]), f32::from_bits(w[9])),
         6 => (WMTTextureType::WMTTextureType2DMultisample, (0, 1), (0, 1), 0.0),
@@ -556,27 +559,34 @@ fn srv_view(w: &[u32], t: &MetalTexture) -> Option<ViewShape> {
 
 /// `D3D12_UNORDERED_ACCESS_VIEW_DESC` words: format, dimension, then (word
 /// 2) the dimension's fields; one mip.
-fn uav_view(w: &[u32], _t: &MetalTexture) -> Option<ViewShape> {
+fn uav_view(w: &[u32], t: &MetalTexture) -> Option<ViewShape> {
     if w.len() < 6 {
         return None;
     }
     let (type_, mip, slices) = match w[1] {
-        2 => (WMTTextureType::WMTTextureType1D, w[2], (0, 1)),
-        3 => (WMTTextureType::WMTTextureType1DArray, w[2], (w[3], w[4])),
+        2 => (WMTTextureType::WMTTextureType2D, w[2], (0, 1)),
+        3 => (WMTTextureType::WMTTextureType2DArray, w[2], (w[3], w[4])),
         4 => (WMTTextureType::WMTTextureType2D, w[2], (0, 1)),
         5 => (WMTTextureType::WMTTextureType2DArray, w[2], (w[3], w[4])),
-        8 => (WMTTextureType::WMTTextureType3D, w[2], (0, 1)),
+        8 if !partial_3d_uav(w, t) => (WMTTextureType::WMTTextureType3D, w[2], (0, 1)),
         _ => return None,
     };
     Some(ViewShape { type_: Some(type_), levels: (mip, 1), slices, swizzle: identity(), min_lod: 0.0 })
+}
+
+// Metal 3D texture views can select mip levels, not a range of depth planes.
+fn partial_3d_uav(w: &[u32], t: &MetalTexture) -> bool {
+    if w.len() < 5 || w[1] != 8 || t.desc.dimension != TEXTURE_3D {
+        return false;
+    }
+    let depth = u32::from(t.desc.depth_or_array_size).checked_shr(w[2]).unwrap_or(0).max(1);
+    w[3] != 0 || (w[4] != depth && w[4] != u32::MAX)
 }
 
 /// The type of texture `t` itself (what an all-levels, all-slices view of
 /// it has).
 pub(crate) fn base_type(t: &MetalTexture) -> WMTTextureType {
     match t.desc.dimension {
-        TEXTURE_1D if t.slices > 1 => WMTTextureType::WMTTextureType1DArray,
-        TEXTURE_1D => WMTTextureType::WMTTextureType1D,
         TEXTURE_3D => WMTTextureType::WMTTextureType3D,
         _ if t.desc.sample_count > 1 => WMTTextureType::WMTTextureType2DMultisample,
         _ if t.slices > 1 => WMTTextureType::WMTTextureType2DArray,

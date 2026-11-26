@@ -323,6 +323,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _pool = Pool::new();
     let device = Device::first()?;
     println!("device: {}", device.name());
+    if std::env::args().any(|arg| arg == "--offscreen") {
+        let queue = device.new_queue(4)?;
+        texture_copy_probe(&device, &queue)?;
+        return Ok(());
+    }
 
     let u32 = win32::load()?;
     let class_name = win32::wide("F18PresentWindow");

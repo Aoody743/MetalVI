@@ -18,6 +18,194 @@
 //! direct, indexed and indirect draws alike. This expansion is what is
 //! left for a pipeline that could not get that stage.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListExpansion {
+    Fan,
+    Loop,
+    Quads,
+    QuadStrip,
+}
+
+impl ListExpansion {
+    pub(crate) fn from_topology(topology: u32) -> Option<Self> {
+        Some(match topology {
+            6 => Self::Fan,
+            18 => Self::Loop,
+            19 => Self::Quads,
+            20 => Self::QuadStrip,
+            _ => return None,
+        })
+    }
+
+    pub(crate) fn host_topology(self) -> u32 {
+        if self == Self::Loop { 2 } else { 4 } // line list / triangle list
+    }
+
+    pub(crate) fn index_count(self, count: u32) -> Option<u32> {
+        let indices = match self {
+            Self::Fan => count.saturating_sub(2).checked_mul(3)?,
+            Self::Loop if count >= 2 => count.checked_mul(2)?,
+            Self::Loop => 0,
+            Self::Quads => (count / 4).checked_mul(6)?,
+            Self::QuadStrip => (count / 2).saturating_sub(1).checked_mul(6)?,
+        };
+        // A D3D12 index view's byte size is a UINT.
+        indices.checked_mul(4)?;
+        Some(indices)
+    }
+
+    fn emit(self, count: u32, mut index: impl FnMut(u32) -> u32, mut push: impl FnMut(u32)) {
+        let mut primitive = |slots: &[u32]| {
+            for &i in slots {
+                push(index(i));
+            }
+        };
+        match self {
+            Self::Fan => {
+                for i in 1..count.saturating_sub(1) {
+                    primitive(&[0, i, i + 1]);
+                }
+            }
+            Self::Loop if count >= 2 => {
+                for i in 0..count - 1 {
+                    primitive(&[i, i + 1]);
+                }
+                primitive(&[count - 1, 0]);
+            }
+            Self::Loop => {}
+            Self::Quads => {
+                for i in (0..count / 4).map(|i| i * 4) {
+                    primitive(&[i, i + 1, i + 2, i, i + 2, i + 3]);
+                }
+            }
+            Self::QuadStrip => {
+                for i in (0..(count / 2).saturating_sub(1)).map(|i| i * 2) {
+                    primitive(&[i, i + 1, i + 3, i, i + 3, i + 2]);
+                }
+            }
+        }
+    }
+}
+
+/// The part of the title index view consumed by a draw, in bytes.
+fn index_range(format: u32, size: u32, first: u32, count: u32) -> Option<(u64, u64, usize)> {
+    let width = match format {
+        57 => 2, // R16_UINT
+        42 => 4, // R32_UINT
+        _ => return None,
+    };
+    let (offset, len) = (u64::from(first) * width, u64::from(count) * width);
+    (offset + len <= u64::from(size)).then_some((offset, len, width as usize))
+}
+
+fn read_index(src: &[u8], width: usize, i: u32) -> u32 {
+    let at = i as usize * width;
+    if width == 2 {
+        u32::from(u16::from_le_bytes(src[at..at + 2].try_into().unwrap()))
+    } else {
+        u32::from_le_bytes(src[at..at + 4].try_into().unwrap())
+    }
+}
+
+#[cfg(windows)]
+mod host_lists {
+    use super::{ListExpansion, index_range, read_index};
+    use crate::host::HostList;
+    use windows::Win32::Graphics::{
+        Direct3D12::D3D12_INDEX_BUFFER_VIEW, Dxgi::Common::DXGI_FORMAT_R32_UINT,
+    };
+
+    fn scratch(list: &HostList, count: u32) -> Option<(D3D12_INDEX_BUFFER_VIEW, usize)> {
+        let bytes = count.checked_mul(4)?;
+        let (gpu, cpu) = list.scratch(u64::from(bytes))?;
+        let view = D3D12_INDEX_BUFFER_VIEW {
+            BufferLocation: gpu,
+            SizeInBytes: bytes,
+            Format: DXGI_FORMAT_R32_UINT,
+        };
+        Some((view, cpu as usize))
+    }
+
+    impl ListExpansion {
+        /// Non-indexed draws use relative indices, so `first` stays in BaseVertexLocation.
+        pub(crate) fn generated_view(
+            self,
+            list: &HostList,
+            count: u32,
+        ) -> Option<D3D12_INDEX_BUFFER_VIEW> {
+            let indices = self.index_count(count)?.max(1);
+            let (view, dst) = scratch(list, indices)?;
+            let mut out = dst as *mut u32;
+            self.emit(
+                count,
+                |i| i,
+                |index| {
+                    // SAFETY: emit writes exactly index_count words into list-owned scratch.
+                    unsafe {
+                        out.write(index);
+                        out = out.add(1);
+                    }
+                },
+            );
+            Some(view)
+        }
+
+        /// Expand CPU-visible indices at submission, after deferred title copies.
+        /// This cannot see indices produced only in the GPU's separate host copy.
+        pub(crate) fn title_view(
+            self,
+            list: &HostList,
+            address: u64,
+            size: u32,
+            format: u32,
+            first: u32,
+            count: u32,
+        ) -> Option<D3D12_INDEX_BUFFER_VIEW> {
+            let indices = self.index_count(count)?;
+            let (offset, len, width) = index_range(format, size, first, count)?;
+            if address == 0 || !address.is_multiple_of(width as u64) {
+                return None;
+            }
+            let src = usize::try_from(address.checked_add(offset)?).ok()?;
+            let len = usize::try_from(len).ok()?;
+            src.checked_add(len)?;
+            let (view, dst) = scratch(list, indices.max(1))?;
+            if indices != 0 {
+                list.defer_host(move || {
+                    let mut out = dst as *mut u32;
+                    let mut bytes = Vec::new();
+                    let read = bytes.try_reserve_exact(len).is_ok() && {
+                        bytes.resize(len, 0);
+                        let _mapping = crate::watch::title_memory_reading_range(src, len);
+                        crate::host::read_into(src as *const u8, &mut bytes)
+                    };
+                    if !read {
+                        // SAFETY: this is the list's own scratch. Zero indices make
+                        // only degenerate primitives if the title unmapped the view.
+                        unsafe { out.write_bytes(0, indices as usize) };
+                        return;
+                    }
+                    self.emit(
+                        count,
+                        |i| read_index(&bytes, width, i),
+                        |index| {
+                            // SAFETY: exactly indices words in the list's scratch.
+                            unsafe {
+                                out.write(index);
+                                out = out.add(1);
+                            }
+                        },
+                    );
+                });
+            }
+            Some(view)
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod d3d12_test;
+
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
 /// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
 /// triangles turn the same way. `elements` are (byte offset, format).
@@ -156,6 +344,48 @@ fn f32_to_half(v: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_expand_with_consistent_winding_and_drop_partial_primitives() {
+        for (topology, n, expected) in [
+            (6, 5, &[0, 1, 2, 0, 2, 3, 0, 3, 4][..]),
+            (18, 3, &[0, 1, 1, 2, 2, 0]),
+            (19, 9, &[0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]),
+            (20, 7, &[0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]),
+        ] {
+            let expand = ListExpansion::from_topology(topology).unwrap();
+            assert_eq!(expand.host_topology(), if topology == 18 { 2 } else { 4 });
+            let mut actual = Vec::new();
+            expand.emit(n, |i| i, |i| actual.push(i));
+            assert_eq!(actual, expected);
+            assert_eq!(expand.index_count(n), Some(expected.len() as u32));
+            assert_eq!(expand.index_count(u32::MAX), None);
+            assert_eq!(expand.index_count(1), Some(0));
+        }
+        assert_eq!(ListExpansion::from_topology(17), None);
+    }
+
+    #[test]
+    fn indexed_lists_preserve_title_values_and_validate_view_ranges() {
+        for format in [57, 42] {
+            let indices = [0, 9, 8, 65535, 6, 5];
+            let width = if format == 57 { 2 } else { 4 };
+            let bytes: Vec<u8> = indices
+                .iter()
+                .flat_map(|x: &u32| x.to_le_bytes()[..width].to_vec())
+                .collect();
+            let size = bytes.len() as u32;
+            let (offset, len, width) = index_range(format, size, 1, 4).unwrap();
+            let src = &bytes[offset as usize..(offset + len) as usize];
+            let mut out = Vec::new();
+            ListExpansion::Quads.emit(4, |i| read_index(src, width, i), |i| out.push(i));
+            assert_eq!(out, [9, 8, 65535, 9, 65535, 6]);
+            assert!(index_range(format, size, 3, 4).is_none());
+            assert!(index_range(format, size, u32::MAX, 1).is_none());
+        }
+        assert!(index_range(0, 1024, 0, 4).is_none());
+        assert_eq!(read_index(&0xfedc_ba98u32.to_le_bytes(), 4, 0), 0xfedc_ba98);
+    }
 
     /// A rectangle of float2 positions and RGBA8 colors, given as top
     /// left, bottom left, bottom right: the fourth corner completes the

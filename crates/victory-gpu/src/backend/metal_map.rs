@@ -545,12 +545,12 @@ pub mod d3d_primitive_topology {
     pub const POINT_LIST: i32 = 1;
     pub const LINE_LIST: i32 = 2;
     pub const LINE_STRIP: i32 = 3;
-    pub const LINE_LIST_ADJ: i32 = 4;
-    pub const LINE_STRIP_ADJ: i32 = 5;
-    pub const TRIANGLE_LIST: i32 = 6;
-    pub const TRIANGLE_STRIP: i32 = 7;
-    pub const TRIANGLE_LIST_ADJ: i32 = 8;
-    pub const TRIANGLE_STRIP_ADJ: i32 = 9;
+    pub const TRIANGLE_LIST: i32 = 4;
+    pub const TRIANGLE_STRIP: i32 = 5;
+    pub const LINE_LIST_ADJ: i32 = 10;
+    pub const LINE_STRIP_ADJ: i32 = 11;
+    pub const TRIANGLE_LIST_ADJ: i32 = 12;
+    pub const TRIANGLE_STRIP_ADJ: i32 = 13;
 }
 
 /// D3D12_PRIMITIVE_TOPOLOGY_TYPE — Direct3D12 bindings (PSO-level class).

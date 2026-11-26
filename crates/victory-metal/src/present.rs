@@ -15,6 +15,9 @@ use crate::texture::Texture;
 use crate::{CommandBuffer, Device, Error, Object, Pool, Result, error_text, sys};
 use sys::obj_handle_t;
 
+mod convert;
+pub use convert::{PresentConverter, PresentOptions};
+
 /// A MetalView over a Win32 window, exposing its `CAMetalLayer`.
 ///
 /// The layer handle is borrowed from the view; do not use it after this value
