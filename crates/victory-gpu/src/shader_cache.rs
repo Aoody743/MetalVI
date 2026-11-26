@@ -101,7 +101,26 @@ fn build() -> &'static [u8; 32] {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    // A translator panic refuses this shader only: unguarded, it took the
+    // pipeline worker thread with it, and once they were all gone no
+    // pipeline was made again (runs metal81-d3d90: "forward reference
+    // outside a phi").
+    let translate = |c: &[u8]| match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| victory_shader::emit::translate(c))) {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(p) => {
+            let what = p
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "?".to_string());
+            let hash = blake3::hash(c);
+            // Kept for an offline repro: <temp>/victory-panic-<hash>.bin.
+            let path = std::env::temp_dir().join(format!("victory-panic-{}.bin", &hash.to_hex()[..16]));
+            let _ = std::fs::write(&path, c);
+            tracing::warn!(container = %&hash.to_hex()[..16], bytes = c.len(), panic = %what, saved = %path.display(), "the shader translator panicked: this shader is refused");
+            Err(format!("translator panic: {what}"))
+        }
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
