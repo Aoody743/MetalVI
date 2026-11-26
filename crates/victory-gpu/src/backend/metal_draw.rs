@@ -446,6 +446,9 @@ pub(crate) enum DrawKindIn {
     Vertices { count: u32, instances: u32, first: u32, first_instance: u32 },
     Indexed { count: u32, instances: u32, first: u32, base: i32, first_instance: u32 },
     Mesh { groups: u32 },
+    /// ExecuteIndirect draws: `max` records `stride` bytes apart at title
+    /// address `records`, the count at `count` if given (F42).
+    Indirect { indexed: bool, records: u64, stride: u32, max: u32, count: Option<u64> },
 }
 
 pub(crate) enum DrawKind {
@@ -457,6 +460,17 @@ pub(crate) enum DrawKind {
     /// drawn from 32-bit indices made at record time (relative to `base`,
     /// as a non-indexed draw's vertex ids are relative to its first vertex).
     Generated { indices: Vec<u32>, instances: u32, base: i32, first_instance: u32 },
+    /// ExecuteIndirect: records translated on the GPU at replay (F42), one
+    /// Metal indirect draw per record; `index`: the index buffer window,
+    /// its type (0 16-bit, 1 32-bit) and capacity in indices.
+    Indirect {
+        records: Buffer,
+        records_offset: u64,
+        stride: u32,
+        max: u32,
+        count: Option<(Buffer, u64)>,
+        index: Option<(Buffer, u64, u8, u32)>,
+    },
 }
 
 /// One draw as recorded into a title list.
@@ -589,7 +603,7 @@ pub(crate) fn draw_params(kind: &DrawKind) -> ([u32; 5], u16) {
             // The direct Metal IR helper uses the buffer byte offset, not the D3D index number.
             ([count, instances, offset, base as u32, first_instance], u16::from(index_type) + 1)
         }
-        DrawKind::Mesh { .. } | DrawKind::Geometry { .. } => ([0; 5], 0),
+        DrawKind::Mesh { .. } | DrawKind::Geometry { .. } | DrawKind::Indirect { .. } => ([0; 5], 0),
         // the index offset is the ring's, filled in by `run`
         DrawKind::Generated { ref indices, instances, base, first_instance } => {
             ([indices.len() as u32, instances, 0, base as u32, first_instance], 2)

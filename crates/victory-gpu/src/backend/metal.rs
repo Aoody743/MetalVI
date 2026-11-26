@@ -526,6 +526,47 @@ impl MetalBackend {
                 }
                 MetalOp::Draw(first) => {
                     let t = first.targets.clone();
+                    // Indirect records of this run of draws, translated on
+                    // the GPU before its render pass opens (F42).
+                    static TRANSLATOR: OnceLock<Option<victory_metal::indirect::IndirectTranslator>> = OnceLock::new();
+                    let mut batches: Vec<Option<victory_metal::indirect::IndirectBatch>> = Vec::new();
+                    {
+                        let mut j = i;
+                        while let Some(MetalOp::Draw(d)) = ops.get(j).map(|o| &**o) {
+                            if !d.targets.same(&t) {
+                                break;
+                            }
+                            let mut batch = None;
+                            if let DrawKind::Indirect { records, records_offset, stride, max, count, index } = &d.kind
+                                && let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok())
+                            {
+                                use victory_metal::indirect::{IndirectKind, IndirectSource};
+                                let kind = match index {
+                                    Some((_, _, ty, cap)) => IndirectKind::DrawIndexed { index_capacity: *cap, index_type: *ty },
+                                    None => IndirectKind::Draw,
+                                };
+                                let source = IndirectSource {
+                                    kind,
+                                    records: (records, *records_offset),
+                                    stride: *stride,
+                                    max_count: *max,
+                                    count: count.as_ref().map(|(b, o)| (b, *o)),
+                                };
+                                match tr.encode(&self.device, &cb, &source) {
+                                    Ok(b) => batch = b,
+                                    Err(e) => {
+                                        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                            tracing::info!(error = %e, "Metal: indirect records left out");
+                                        }
+                                    }
+                                }
+                            }
+                            batches.push(batch);
+                            j += 1;
+                        }
+                    }
+                    let group_first = i;
                     let mut pass = RenderPass { width: t.width, height: t.height, samples: t.samples, ..Default::default() };
                     for (out, a) in pass.colors.iter_mut().zip(&t.colors) {
                         *out = a.as_ref().map(|a| PassColor { texture: &a.texture, level: a.level, slice: a.slice, load, store, clear: [0.0; 4] });
@@ -607,6 +648,31 @@ impl MetalBackend {
                                 base_instance: *first_instance,
                             },
                             DrawKind::Mesh { groups } => Render::DrawMesh { groups: *groups, object_threads: [1, 1, 1], mesh_threads: g.mesh_threads },
+                            DrawKind::Indirect { index, .. } => {
+                                // One Metal indirect draw per record, with
+                                // its MSC draw arguments.
+                                if let Some(batch) = batches.get(i - group_first).and_then(Option::as_ref) {
+                                    for r in 0..batch.record_count() {
+                                        let Some(rec) = batch.record(r) else { continue };
+                                        if let Some(bind) = rec.msc_vertex_bindings() {
+                                            steps.extend(bind);
+                                        }
+                                        steps.push(match index {
+                                            Some((ib, io, ty, _)) => Render::DrawIndexedIndirect {
+                                                primitive_type: primitive,
+                                                index_type: *ty,
+                                                index_buffer: ib,
+                                                index_offset: *io,
+                                                arguments: rec.buffer,
+                                                offset: rec.offset,
+                                            },
+                                            None => Render::DrawIndirect { primitive_type: primitive, arguments: rec.buffer, offset: rec.offset },
+                                        });
+                                    }
+                                }
+                                i += 1;
+                                continue;
+                            }
                             DrawKind::Generated { indices, instances, base, first_instance } => Render::DrawIndexed {
                                 primitive_type: primitive,
                                 index_type: 1,

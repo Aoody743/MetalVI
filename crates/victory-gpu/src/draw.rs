@@ -2170,7 +2170,7 @@ impl State {
                     };
                     DrawKind::Geometry { draw, _index: Some(buffer) }
                 }
-                DrawKindIn::Mesh { .. } => {
+                DrawKindIn::Mesh { .. } | DrawKindIn::Indirect { .. } => {
                     count_draw(DrawDrop::Topology);
                     return;
                 }
@@ -2204,6 +2204,46 @@ impl State {
                     DrawKind::Indexed { count, instances, base, first_instance, buffer, offset, index_type }
                 }
                 DrawKindIn::Mesh { groups } => DrawKind::Mesh { groups: [u64::from(groups), 1, 1] },
+                DrawKindIn::Indirect { indexed, records, stride, max, count } => {
+                    // The records and count read in place by the GPU (zero
+                    // copy), translated at replay (F42).
+                    let words: u64 = if indexed { 5 } else { 4 };
+                    let bytes = u64::from(max.saturating_sub(1)) * u64::from(stride) + words * 4;
+                    let mut chunks = m.chunks();
+                    let Some((rb, ro)) = chunks.window_buffer(records, bytes) else {
+                        count_draw(DrawDrop::IndexBuffer);
+                        return;
+                    };
+                    let count = match count {
+                        Some(at) => match chunks.window_buffer(at, 4) {
+                            Some(c) => Some(c),
+                            None => {
+                                count_draw(DrawDrop::IndexBuffer);
+                                return;
+                            }
+                        },
+                        None => None,
+                    };
+                    let index = if indexed {
+                        let v = self.index;
+                        let (ty, width) = match v.format {
+                            57 => (0u8, 2u32),
+                            42 => (1, 4),
+                            _ => {
+                                count_draw(DrawDrop::IndexBuffer);
+                                return;
+                            }
+                        };
+                        let Some((ib, io)) = (v.address != 0 && v.size != 0).then(|| chunks.window_buffer(v.address, u64::from(v.size))).flatten() else {
+                            count_draw(DrawDrop::IndexBuffer);
+                            return;
+                        };
+                        Some((ib, io, ty, v.size / width))
+                    } else {
+                        None
+                    };
+                    DrawKind::Indirect { records: rb, records_offset: ro, stride, max, count, index }
+                }
             }
         };
         let full = victory_metal::sys::WMTViewport {
@@ -2278,7 +2318,7 @@ impl State {
                 };
                 Some(DrawKind::Generated { indices: console_indices(c, &src), instances, base, first_instance })
             }
-            DrawKindIn::Mesh { .. } => None,
+            DrawKindIn::Mesh { .. } | DrawKindIn::Indirect { .. } => None,
         }
     }
 
@@ -3160,6 +3200,11 @@ impl State {
                 p.compute, p.mesh, self.topology
             ));
             return false;
+        }
+        // On Metal too (F42): plain and indexed indirect draws.
+        #[cfg(windows)]
+        if crate::backend::metal_draw::draws_on() && (kind == DRAW || kind == INDEXED) && !made_rects {
+            self.metal_draw(crate::backend::metal_draw::DrawKindIn::Indirect { indexed: kind == INDEXED, records: arguments, stride, max, count });
         }
         let len = u64::from(stride) * u64::from(max);
         let Some(args) = crate::shadow::find_any(arguments, len) else {
