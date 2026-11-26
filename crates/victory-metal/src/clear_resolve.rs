@@ -21,7 +21,7 @@ use crate::sys::{
     self, WMTPixelFormat, WMTScissorRect, WMTTextureSwizzle, WMTTextureSwizzleChannels,
     WMTTextureType, WMTViewport,
 };
-use crate::texture::Texture;
+use crate::texture::{Texture, TextureDescriptor};
 use crate::{CommandBuffer, Compute, ComputePipeline, Device, Error, Object, Pool, Result};
 
 /// A D3D12-style pixel rectangle (`[left, right) x [top, bottom)`).
@@ -31,6 +31,14 @@ pub struct ClearRect {
     pub top: i32,
     pub right: i32,
     pub bottom: i32,
+}
+
+/// Resolve a rectangle at `src_origin` into the destination mip at `dst_origin`.
+#[derive(Clone, Copy, Debug)]
+pub struct ResolveRegion {
+    pub src_origin: [u32; 2],
+    pub dst_origin: [u32; 2],
+    pub size: [u32; 2],
 }
 
 /// Target subresource for [`ClearResolve::clear_rects`].
@@ -145,6 +153,18 @@ pub fn supports_hw_color_resolve(format: WMTPixelFormat) -> bool {
     )
 }
 
+fn resolve_color_bytes(format: WMTPixelFormat) -> Option<u8> {
+    // Uncompressed MSAA colour formats, grouped by Metal view width.
+    match format.0 {
+        1 | 10..=14 => Some(1),
+        20 | 22..=25 | 30..=34 | 40..=43 => Some(2),
+        53..=55 | 60 | 62..=65 | 70..=74 | 80..=81 | 90..=94 => Some(4),
+        103..=105 | 110 | 112..=115 => Some(8),
+        123..=125 => Some(16),
+        _ => None,
+    }
+}
+
 /// Clamps `rects` to `[0, width) x [0, height)` and drops empty rectangles.
 pub fn clamp_clear_rects(rects: &[ClearRect], width: u32, height: u32) -> Vec<WMTScissorRect> {
     let w = width as i32;
@@ -228,6 +248,7 @@ fragment int4 clear_fs_sint(constant int4 &color [[buffer(0)]]) {
 kernel void resolve_avg_float(
     texture2d_ms<float, access::read> src [[texture(0)]],
     texture2d<float, access::write> dst [[texture(1)]],
+    constant uint2 &origin [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
@@ -236,7 +257,7 @@ kernel void resolve_avg_float(
     uint n = src.get_num_samples();
     float4 sum = float4(0.0);
     for (uint s = 0; s < n; s++) {
-        sum += src.read(gid, s);
+        sum += src.read(origin + gid, s);
     }
     dst.write(sum / float(n), gid);
 }
@@ -244,34 +265,37 @@ kernel void resolve_avg_float(
 kernel void resolve_sample0_float(
     texture2d_ms<float, access::read> src [[texture(0)]],
     texture2d<float, access::write> dst [[texture(1)]],
+    constant uint2 &origin [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
         return;
     }
-    dst.write(src.read(gid, 0), gid);
+    dst.write(src.read(origin + gid, 0), gid);
 }
 
 kernel void resolve_sample0_uint(
     texture2d_ms<uint, access::read> src [[texture(0)]],
     texture2d<uint, access::write> dst [[texture(1)]],
+    constant uint2 &origin [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
         return;
     }
-    dst.write(src.read(gid, 0), gid);
+    dst.write(src.read(origin + gid, 0), gid);
 }
 
 kernel void resolve_sample0_sint(
     texture2d_ms<int, access::read> src [[texture(0)]],
     texture2d<int, access::write> dst [[texture(1)]],
+    constant uint2 &origin [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= dst.get_width() || gid.y >= dst.get_height()) {
         return;
     }
-    dst.write(src.read(gid, 0), gid);
+    dst.write(src.read(origin + gid, 0), gid);
 }
 
 struct DepthResolveOut {
@@ -280,10 +304,17 @@ struct DepthResolveOut {
 
 fragment DepthResolveOut resolve_depth_fs(
     float4 pos [[position]],
-    depth2d_ms<float, access::read> src [[texture(0)]])
+    depth2d_ms<float, access::read> src [[texture(0)]],
+    constant uint *params [[buffer(0)]])
 {
     DepthResolveOut out;
-    out.depth = src.read(uint2(pos.xy), 0);
+    uint2 xy = uint2(pos.xy) - uint2(params[2], params[3]) + uint2(params[0], params[1]);
+    uint n = params[4] ? src.get_num_samples() : 1;
+    float sum = 0.0;
+    for (uint s = 0; s < n; s++) {
+        sum += src.read(xy, s);
+    }
+    out.depth = sum / float(n);
     return out;
 }
 "#;
@@ -612,6 +643,104 @@ impl ClearResolve {
         cb.render_pass_with(&pass, &steps)
     }
 
+    /// Resolves an MSAA subresource or a rectangle within it. `None`
+    /// requires equal source/destination mip dimensions. The source must be a
+    /// shader-readable/renderable 2D MSAA texture and the destination a
+    /// single-sample 2D texture or array. A format override requires compatible
+    /// backing colour formats created with pixel-format-view usage. Depth
+    /// resolves require matching depth formats and a renderable destination;
+    /// they preserve destination stencil.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resolve_region(
+        &self,
+        cb: &CommandBuffer,
+        src: &Texture,
+        src_slice: u16,
+        dst: &Texture,
+        dst_level: u16,
+        dst_slice: u16,
+        format: WMTPixelFormat,
+        region: Option<ResolveRegion>,
+    ) -> Result<()> {
+        let _pool = Pool::new();
+        if u64::from(src_slice) >= src.array_length()
+            || u64::from(dst_slice) >= dst.array_length()
+            || u64::from(dst_level) >= dst.mipmap_level_count()
+        {
+            return Err(Error("resolve subresource out of bounds".into()));
+        }
+        let src_size = [src.width() as u32, src.height() as u32];
+        let dst_size = [(dst.width() as u32 >> dst_level).max(1), (dst.height() as u32 >> dst_level).max(1)];
+        let region = match region {
+            Some(region) => region,
+            None if src_size == dst_size => ResolveRegion { src_origin: [0; 2], dst_origin: [0; 2], size: src_size },
+            None => return Err(Error("whole resolve requires equal mip sizes".into())),
+        };
+        for i in 0..2 {
+            if region.src_origin[i].checked_add(region.size[i]).is_none_or(|v| v > src_size[i])
+                || region.dst_origin[i].checked_add(region.size[i]).is_none_or(|v| v > dst_size[i])
+            {
+                return Err(Error("resolve rectangle out of bounds".into()));
+            }
+        }
+        if region.size.contains(&0) {
+            return Ok(());
+        }
+
+        if classify_format(format).has_depth && src.pixel_format() == format && dst.pixel_format() == format {
+            return self.resolve_depth(cb, src, src_slice, ResolveSlice { texture: dst, level: dst_level, slice: dst_slice }, region, true);
+        }
+        let bytes = resolve_color_bytes(format);
+        if bytes.is_none() || resolve_color_bytes(src.pixel_format()) != bytes || resolve_color_bytes(dst.pixel_format()) != bytes {
+            return Err(Error("incompatible or unsupported MSAA resolve format".into()));
+        }
+
+        let src_view = (src.pixel_format() != format || src.array_length() > 1)
+            .then(|| view_ms_slice(src, format, src_slice)).transpose()?;
+        let src = src_view.as_ref().unwrap_or(src);
+        let dst_view = (dst.pixel_format() != format)
+            .then(|| view_2d_slice(dst, format, dst_level, dst_slice)).transpose()?;
+        let dst = if let Some(view) = &dst_view {
+            ResolveSlice { texture: view, level: 0, slice: 0 }
+        } else {
+            ResolveSlice { texture: dst, level: dst_level, slice: dst_slice }
+        };
+        let hardware = supports_hw_color_resolve(format);
+        if hardware && src_size == dst_size && region.src_origin == [0; 2]
+            && region.dst_origin == [0; 2] && region.size == src_size
+        {
+            return resolve_render_pass(cb, src, 0, dst, src_size[0], src_size[1]);
+        }
+
+        // A resolve store action has no rectangle. For narrower regions crop
+        // its result; compute can resolve just the requested source rectangle.
+        // Scratch also allows ordinary resolve destinations without ShaderWrite.
+        let [width, height] = if hardware { src_size } else { region.size };
+        let scratch = self.device.new_texture(&TextureDescriptor {
+            pixel_format: format,
+            width,
+            height,
+            usage: sys::WMTTextureUsage(if hardware { 4 } else { 2 }),
+            options: sys::WMTResourceOptions::WMTResourceStorageModePrivate,
+            ..Default::default()
+        })?;
+        let src_origin = if hardware {
+            resolve_render_pass(cb, src, 0, ResolveSlice { texture: &scratch, level: 0, slice: 0 }, width, height)?;
+            region.src_origin
+        } else {
+            self.resolve_compute(cb, src, &scratch, color_resolve_kind(format), region.src_origin)?;
+            [0; 2]
+        };
+        let [sx, sy] = src_origin.map(u64::from);
+        let [dx, dy] = region.dst_origin.map(u64::from);
+        let [w, h] = region.size.map(u64::from);
+        let mut blit = cb.blit_encoder()?;
+        blit.copy_from_texture_to_texture(&scratch, 0, 0, [sx, sy, 0], [w, h, 1],
+            dst.texture, dst.slice.into(), dst.level.into(), [dx, dy, 0]);
+        blit.finish();
+        Ok(())
+    }
+
     /// Resolves `src_msaa` (mip 0, `src_slice`) into `dst` (`dst_level`, `dst_slice`)
     /// using `format` (or `dst.pixel_format()` if `format == WMTPixelFormatInvalid`).
     ///
@@ -654,7 +783,11 @@ impl ClearResolve {
 
         let dst_sub = ResolveSlice { texture: dst, level: dst_level, slice: dst_slice };
         if planes.has_depth {
-            return self.resolve_depth(cb, src_msaa, src_slice, dst_sub, fmt, planes.has_stencil);
+            if src_msaa.pixel_format() != fmt || dst.pixel_format() != fmt {
+                return Err(Error("depth resolve requires matching depth formats".into()));
+            }
+            let region = ResolveRegion { src_origin: [0; 2], dst_origin: [0; 2], size: [dst_w, dst_h] };
+            return self.resolve_depth(cb, src_msaa, src_slice, dst_sub, region, false);
         }
         if planes.has_stencil {
             return Err(Error("stencil-only MSAA resolve is not supported".into()));
@@ -685,19 +818,11 @@ impl ClearResolve {
 
         // Compute resolve fallback: 32-bit float average, or Uint/Sint sample-0.
         let src_planes = classify_format(src_msaa.pixel_format());
-        let kind = match planes.color.unwrap_or(ColorKind::Float) {
-            ColorKind::Float => {
-                if src_planes.has_depth {
-                    ResolveComputeKind::Sample0Float
-                } else {
-                    ResolveComputeKind::AvgFloat
-                }
-            }
-            ColorKind::Uint => ResolveComputeKind::Sample0Uint,
-            ColorKind::Sint => ResolveComputeKind::Sample0Sint,
+        let kind = if src_planes.has_depth && planes.color == Some(ColorKind::Float) {
+            ResolveComputeKind::Sample0Float
+        } else {
+            color_resolve_kind(fmt)
         };
-        let pso = self.resolve_compute_pso(kind)?;
-
         // Bind a 2DMS view of `src_msaa` if it's an array or has a different format
         // (unless reading a depth texture as depth2d_ms/texture2d_ms directly).
         let src_view = if !src_planes.has_depth && (src_msaa.array_length() > 1 || src_msaa.pixel_format() != fmt) {
@@ -713,11 +838,18 @@ impl ClearResolve {
         let src_tex = src_view.as_ref().unwrap_or(src_msaa);
         let dst_tex = dst_view.as_ref().unwrap_or(dst);
 
-        let groups = [u64::from(dst_w).div_ceil(8), u64::from(dst_h).div_ceil(8), 1];
+        self.resolve_compute(cb, src_tex, dst_tex, kind, [0; 2])
+    }
+
+    fn resolve_compute(&self, cb: &CommandBuffer, src: &Texture, dst: &Texture, kind: ResolveComputeKind, origin: [u32; 2]) -> Result<()> {
+        let pso = self.resolve_compute_pso(kind)?;
+        let bytes = origin.map(u32::to_le_bytes);
+        let groups = [dst.width().div_ceil(8), dst.height().div_ceil(8), 1];
         cb.compute(&[
             Compute::Pipeline { pipeline: &pso, threads_per_group: [8, 8, 1] },
-            Compute::Texture { texture: src_tex, index: 0 },
-            Compute::Texture { texture: dst_tex, index: 1 },
+            Compute::Texture { texture: src, index: 0 },
+            Compute::Texture { texture: dst, index: 1 },
+            Compute::Bytes { bytes: bytes.as_flattened(), index: 0 },
             Compute::Dispatch { groups },
         ])
     }
@@ -728,11 +860,13 @@ impl ClearResolve {
         src_msaa: &Texture,
         src_slice: u16,
         dst: ResolveSlice<'_>,
-        fmt: WMTPixelFormat,
-        has_stencil: bool,
+        region: ResolveRegion,
+        average: bool,
     ) -> Result<()> {
         let w = (dst.texture.width() as u32 >> dst.level).max(1);
         let h = (dst.texture.height() as u32 >> dst.level).max(1);
+        let fmt = dst.texture.pixel_format();
+        let has_stencil = classify_format(fmt).has_stencil;
         let depth_fmt = fmt.0;
         let stencil_fmt = if has_stencil { fmt.0 } else { 0 };
         let pso = self.resolve_depth_pso(depth_fmt, stencil_fmt)?;
@@ -752,7 +886,7 @@ impl ClearResolve {
             texture: dst.texture,
             level: dst.level,
             slice: dst.slice,
-            load: load_dont_care,
+            load: if region.dst_origin == [0; 2] && region.size == [w, h] { load_dont_care } else { load_preserve },
             store,
             clear_depth: 1.0,
             clear_stencil: 0,
@@ -776,8 +910,14 @@ impl ClearResolve {
             znear: 0.0,
             zfar: 1.0,
         };
-        let scissor = WMTScissorRect { x: 0, y: 0, width: w.into(), height: h.into() };
+        let scissor = WMTScissorRect {
+            x: region.dst_origin[0].into(), y: region.dst_origin[1].into(),
+            width: region.size[0].into(), height: region.size[1].into(),
+        };
         let depth_z = 0.0f32.to_le_bytes();
+        let [sx, sy] = region.src_origin;
+        let [dx, dy] = region.dst_origin;
+        let params = [sx, sy, dx, dy, u32::from(average)].map(u32::to_le_bytes);
         cb.render_pass_with(
             &pass,
             &[
@@ -796,6 +936,7 @@ impl ClearResolve {
                 Render::DepthStencil { state: &self.resolve_depth_dss, stencil_ref: 0 },
                 Render::VertexBytes { bytes: &depth_z, index: 0 },
                 Render::FragmentTexture { texture: src_tex, index: 0 },
+                Render::FragmentBytes { bytes: params.as_flattened(), index: 0 },
                 Render::Draw {
                     primitive_type: sys::WMTPrimitiveType::WMTPrimitiveTypeTriangle,
                     vertex_start: 0,
@@ -805,6 +946,14 @@ impl ClearResolve {
                 },
             ],
         )
+    }
+}
+
+fn color_resolve_kind(format: WMTPixelFormat) -> ResolveComputeKind {
+    match classify_format(format).color {
+        Some(ColorKind::Uint) => ResolveComputeKind::Sample0Uint,
+        Some(ColorKind::Sint) => ResolveComputeKind::Sample0Sint,
+        _ => ResolveComputeKind::AvgFloat,
     }
 }
 
@@ -848,6 +997,10 @@ fn resolve_render_pass(
     unsafe { sys::MTLCommandEncoder_endEncoding(encoder) };
     Ok(())
 }
+
+#[cfg(all(test, windows))]
+#[path = "clear_resolve/f80_tests.rs"]
+mod f80_tests;
 
 #[cfg(test)]
 mod tests {

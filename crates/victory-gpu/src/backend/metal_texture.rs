@@ -72,6 +72,27 @@ pub(crate) struct MetalTexture {
     /// Mip levels and array slices of the texture.
     pub(crate) mips: u32,
     pub(crate) slices: u32,
+    pub(crate) companion: std::sync::OnceLock<Option<super::metal_depth::DepthCompanion>>,
+}
+
+impl MetalTexture {
+    pub(crate) fn depth_companion(&self, device: &victory_metal::Device, dsv: u32) -> Option<super::metal_depth::DepthCompanion> {
+        use super::metal_depth::DepthCompanion;
+        let pixel = DepthCompanion::format(self.pixel)?;
+        if dsv != 0 && pixel_format(dsv) != Some(pixel) {
+            return None;
+        }
+        self.companion.get_or_init(|| {
+            let _pool = victory_metal::Pool::new();
+            match DepthCompanion::new(device, self, pixel) {
+                Ok(companion) => Some(companion),
+                Err(error) => {
+                    tracing::debug!(%error, format = self.desc.format, "Metal: depth companion unavailable");
+                    None
+                }
+            }
+        }).clone()
+    }
 }
 
 /// The Metal pixel format of a DXGI format (with the Apple GPU's depth
@@ -97,8 +118,7 @@ impl MetalBackend {
             return t.clone();
         }
         let made = self.make_texture(r).map(Arc::new);
-        self.textures.lock().unwrap_or_else(|e| e.into_inner()).insert(key, made.clone());
-        made
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(made).clone()
     }
 
     fn make_texture(&self, r: This) -> Option<MetalTexture> {
@@ -114,8 +134,7 @@ impl MetalBackend {
         // (its typeless or colour format says only the size): Metal takes
         // only depth formats as depth attachments (a colour one there is a
         // GPU fault). Shaders still read it, depth sampling into red.
-        // Not for one shaders also write: Metal depth formats take no
-        // shader writes (its depth views are left out instead).
+        // Not for one shaders also write: a depth view uses a companion.
         let pixel = if d.flags & DEPTH != 0 && d.flags & UNORDERED == 0 { depth_pixel(d.format).unwrap_or(pixel) } else { pixel };
         let mips = u32::from(d.mip_levels.max(1));
         // Metal Shader Converter lowers DXIL 1D textures to height-one 2D.
@@ -165,7 +184,7 @@ impl MetalBackend {
             chunks.residency().add(&[texture.handle()]);
             chunks.residency().commit();
         }
-        let t = MetalTexture { texture, pixel, desc: d, mips, slices };
+        let t = MetalTexture { texture, pixel, desc: d, mips, slices, companion: Default::default() };
         if d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0 && super::metal::texture_fill_on() {
             self.fill(&t, memory);
             FILLED.lock().unwrap_or_else(|e| e.into_inner()).insert(memory as usize, r as usize);

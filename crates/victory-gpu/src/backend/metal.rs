@@ -169,6 +169,7 @@ pub(crate) enum MetalOp {
     Draw(super::metal_draw::MetalDraw),
     Clear(super::metal_draw::MetalClear),
     Copy(super::metal_draw::MetalTexCopy),
+    Resolve(super::metal_draw::MetalResolve),
 }
 
 /// Memory for the one-view tables of a submission (resident, GPU reads it
@@ -338,7 +339,7 @@ impl MetalBackend {
                         blob += (indices.len() * 4).next_multiple_of(256);
                     }
                 }
-                MetalOp::Clear(_) | MetalOp::Copy(_) => {}
+                MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => {}
             }
         }
         let need = tables + blob.div_ceil(entry) + 256 / entry + 1;
@@ -416,7 +417,7 @@ impl MetalBackend {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((tops, a, u, vt, zt));
                 }
-                MetalOp::Clear(_) | MetalOp::Copy(_) => {
+                MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
@@ -426,9 +427,21 @@ impl MetalBackend {
         // `VICTORY_METAL_SPLIT=1`: every pass in a command buffer of its own,
         // waited for, so a GPU fault names the pass that made it.
         static SPLIT: OnceLock<bool> = OnceLock::new();
+        static CR: OnceLock<victory_metal::Result<victory_metal::clear_resolve::ClearResolve>> = OnceLock::new();
         let split = *SPLIT.get_or_init(|| std::env::var("VICTORY_METAL_SPLIT").is_ok_and(|v| v == "1"));
         let load = sys::WMTLoadAction::WMTLoadActionLoad;
         let store = sys::WMTStoreAction::WMTStoreActionStore;
+        let mut depth_sync = super::metal_depth::DepthSync::default();
+        let load_depth = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, a: &super::metal_draw::Attachment| {
+            a.companion.as_ref().is_none_or(|d| {
+                encoded("depth companion load", sync.load(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
+            })
+        };
+        let store_depth = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, a: &super::metal_draw::Attachment| {
+            a.companion.as_ref().is_none_or(|d| {
+                encoded("depth companion store", sync.store(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
+            })
+        };
         let mut i = 0;
         let mut ok = true;
         while i < ops.len() && ok {
@@ -454,6 +467,7 @@ impl MetalBackend {
                         i += 1;
                     }
                     ok = encoded("compute pass", cb.compute(&steps), || String::new());
+                    depth_sync.colour_may_change();
                 }
                 MetalOp::Copy(c) => {
                     if let Err(e) = super::metal_copy::encode_texture_to_texture(
@@ -475,12 +489,30 @@ impl MetalBackend {
                             tracing::info!(error = %e, "Metal: a texture copy left out");
                         }
                     }
+                    depth_sync.colour_may_change();
+                    i += 1;
+                }
+                MetalOp::Resolve(r) => {
+                    let result = match CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
+                        Ok(cr) => cr.resolve_region(
+                            &cb, &r.src, r.src_slice, &r.dst, r.dst_level, r.dst_slice, r.format, r.region,
+                        ),
+                        Err(e) => Err(e.clone()),
+                    };
+                    if let Err(error) = result {
+                        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            tracing::warn!(%error, format = r.format.0, "Metal: a resolve left out");
+                        }
+                    }
                     i += 1;
                 }
                 MetalOp::Clear(c) if !c.rects.is_empty() => {
                     // Rectangles: F49's quad-per-rectangle clear.
-                    static CR: OnceLock<Option<victory_metal::clear_resolve::ClearResolve>> = OnceLock::new();
-                    if let Some(cr) = CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device).ok()) {
+                    if let Ok(cr) = CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
+                        if !load_depth(&mut depth_sync, &cb, &c.target) {
+                            return false;
+                        }
                         let target = victory_metal::clear_resolve::ClearTarget {
                             texture: &c.target.texture,
                             pixel_format: sys::WMTPixelFormat(c.target.pixel),
@@ -492,10 +524,18 @@ impl MetalBackend {
                             Some(v) => victory_metal::clear_resolve::ClearValue::Color(v.map(|x| x as f32)),
                             None => victory_metal::clear_resolve::ClearValue::DepthStencil { depth: c.depth, stencil: c.stencil },
                         };
-                        if let Err(e) = cr.clear_rects(&cb, &target, &c.rects, value) {
-                            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                                tracing::info!(error = %e, "Metal: a rectangle clear left out");
+                        match cr.clear_rects(&cb, &target, &c.rects, value) {
+                            Ok(()) => {
+                                depth_sync.colour_may_change();
+                                if c.depth.is_some() {
+                                    ok = store_depth(&mut depth_sync, &cb, &c.target);
+                                }
+                            }
+                            Err(e) => {
+                                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                    tracing::info!(error = %e, "Metal: a rectangle clear left out");
+                                }
                             }
                         }
                     }
@@ -504,6 +544,9 @@ impl MetalBackend {
                 MetalOp::Clear(c) => {
                     let clear = sys::WMTLoadAction::WMTLoadActionClear;
                     let mut pass = RenderPass { width: c.target.width, height: c.target.height, samples: c.target.samples, ..Default::default() };
+                    if c.depth.is_none() && !load_depth(&mut depth_sync, &cb, &c.target) {
+                        return false;
+                    }
                     if let Some(color) = c.color {
                         pass.colors[0] = Some(PassColor { texture: &c.target.texture, level: c.target.level, slice: c.target.slice, load: clear, store, clear: color });
                     } else {
@@ -522,10 +565,19 @@ impl MetalBackend {
                         }
                     }
                     ok = encoded("clear pass", cb.render_pass_with(&pass, &[]), || format!("{}x{} format {} level {} slice {}", c.target.width, c.target.height, c.target.pixel, c.target.level, c.target.slice));
+                    depth_sync.colour_may_change();
+                    if ok && c.depth.is_some() {
+                        ok = store_depth(&mut depth_sync, &cb, &c.target);
+                    }
                     i += 1;
                 }
                 MetalOp::Draw(first) => {
                     let t = first.targets.clone();
+                    if let Some(d) = &t.depth
+                        && !load_depth(&mut depth_sync, &cb, d)
+                    {
+                        return false;
+                    }
                     // Indirect records of this run of draws, translated on
                     // the GPU before its render pass opens (F42).
                     static TRANSLATOR: OnceLock<Option<victory_metal::indirect::IndirectTranslator>> = OnceLock::new();
@@ -579,11 +631,13 @@ impl MetalBackend {
                         }
                     }
                     let mut steps: Vec<Render> = Vec::new();
+                    let mut depth_written = false;
                     while let Some(MetalOp::Draw(d)) = ops.get(i).map(|o| &**o) {
                         if !d.targets.same(&t) {
                             break;
                         }
                         let g = &d.pso;
+                        depth_written |= g.depth_write;
                         steps.push(Render::Pipeline { pipeline: &g.pso });
                         steps.push(Render::DepthStencil { state: &g.dss, stencil_ref: d.stencil_ref });
                         steps.push(Render::Rasterizer {
@@ -695,11 +749,20 @@ impl MetalBackend {
                         let colors: Vec<u32> = t.colors.iter().map(|c| c.as_ref().map_or(0, |c| c.pixel)).collect();
                         format!("{}x{} samples {} colors {:?} depth {:?} stencil {}", t.width, t.height, t.samples, colors, t.depth.as_ref().map(|d| d.pixel), t.stencil)
                     });
+                    depth_sync.colour_may_change();
+                    if ok && let Some(a) = &t.depth {
+                        if depth_written {
+                            ok = store_depth(&mut depth_sync, &cb, a);
+                        } else if let Some(d) = &a.companion {
+                            depth_sync.preserve(d, a.level, a.slice);
+                        }
+                    }
                 }
             }
             if split && ok {
                 cb.commit();
                 if let Err(e) = cb.wait() {
+                    depth_sync.colour_may_change();
                     let what: Vec<String> = ops[group_start..i]
                         .iter()
                         .take(4)
@@ -707,6 +770,7 @@ impl MetalBackend {
                             MetalOp::Dispatch(_) => "dispatch".to_string(),
                             MetalOp::Draw(d) => format!("draw {}", d.pso.name),
                             MetalOp::Copy(c) => format!("copy {} → {}", c.src.pixel.0, c.dst.pixel.0),
+                            MetalOp::Resolve(r) => format!("resolve {} mip {} slice {}", r.format.0, r.dst_level, r.dst_slice),
                             MetalOp::Clear(c) => {
                                 let t = &c.target.texture;
                                 format!(
@@ -751,7 +815,7 @@ impl MetalBackend {
                     match &**op {
                         MetalOp::Dispatch(_) => dispatches += 1,
                         MetalOp::Draw(_) => draws += 1,
-                        MetalOp::Clear(_) | MetalOp::Copy(_) => clears += 1,
+                        MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => clears += 1,
                     }
                 }
                 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1342,3 +1406,7 @@ fn encoded(what: &str, r: victory_metal::Result<()>, detail: impl FnOnce() -> St
         }
     }
 }
+
+#[cfg(test)]
+#[path = "metal_depth_replay_tests.rs"]
+mod depth_replay_tests;

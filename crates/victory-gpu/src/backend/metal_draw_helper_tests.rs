@@ -200,6 +200,7 @@ fn attachment(device: &Device, format: Pixel, array: bool) -> Attachment {
         width: 8,
         height: 8,
         samples: 1,
+        companion: None,
     }
 }
 
@@ -250,6 +251,7 @@ fn targets_require_exact_formats_and_sample_count() {
     // fit reads cached metadata only; the real PSO/state are never drawn.
     let mut pipeline = MetalGraphics {
         name: String::new(),
+        depth_write: true,
         pso: device
             .render_pipeline(&lib, "f71_vs", &lib, "f71_fs", color, 1)
             .unwrap(),
@@ -356,6 +358,7 @@ fn depth_resource_views_use_only_compatible_formats() {
         desc,
         mips: 1,
         slices: 1,
+        companion: Default::default(),
     };
     for wanted in [62, 47, 21] {
         assert_eq!(

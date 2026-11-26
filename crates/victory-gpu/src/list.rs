@@ -1201,7 +1201,7 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
-    if crate::backend::metal_draw::draws_on() {
+    if crate::backend::metal_draw::draws_on() && metal_resolve(this, dst, dst_sub, src, src_sub, format).is_none() {
         crate::backend::metal_draw::note_write(dst as usize, 3);
     }
     #[cfg(windows)]
@@ -1262,6 +1262,60 @@ extern "system" fn resolve(
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
 }
+
+#[cfg(windows)]
+fn metal_resolve(this: This, dst: This, dst_sub: u32, src: This, src_sub: u32, format: u32) -> Option<()> {
+    use crate::backend::metal::{MetalOp, backend};
+    use crate::backend::metal_copy::decode_subresource;
+    use crate::backend::metal_draw::MetalResolve;
+    use crate::backend::metal_texture::{is_depth_pixel, pixel_format};
+    use victory_metal::clear_resolve::ResolveRegion;
+
+    let m = backend()?;
+    let _pool = victory_metal::Pool::new();
+    let (s, d) = (m.texture_for(src)?, m.texture_for(dst)?);
+    if s.desc.dimension != 3 || d.desc.dimension != 3 || s.desc.sample_count <= 1
+        || d.desc.sample_count > 1 || s.desc.flags & 3 == 0
+    {
+        return None;
+    }
+    let (Some((0, 0, ss)), Some((0, dl, ds))) = (
+        decode_subresource(src_sub, s.mips, s.slices),
+        decode_subresource(dst_sub, d.mips, d.slices),
+    ) else { return None };
+    let pixel = if format == 0 { d.pixel } else { pixel_format(format)? };
+    if [s.pixel, d.pixel, pixel].into_iter().any(|p| is_depth_pixel(p.0))
+        && (s.pixel != pixel || d.pixel != pixel || d.desc.flags & 2 == 0)
+    {
+        return None;
+    }
+
+    let src_size = [s.texture.width() as u32, s.texture.height() as u32];
+    let dst_size = [(d.texture.width() as u32 >> dl).max(1), (d.texture.height() as u32 >> dl).max(1)];
+    // Match the console's clipped resolve, using sizes at the selected mip.
+    let region = (src_size != dst_size).then_some(ResolveRegion {
+        src_origin: [0; 2],
+        dst_origin: [0; 2],
+        size: [src_size[0].min(dst_size[0]), src_size[1].min(dst_size[1])],
+    });
+    let op = MetalOp::Resolve(MetalResolve {
+        src: s.texture.clone(),
+        src_slice: ss as u16,
+        dst: d.texture.clone(),
+        dst_level: dl as u16,
+        dst_slice: ds as u16,
+        format: pixel,
+        region,
+    });
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).metal.push(std::sync::Arc::new(op));
+    Some(())
+}
+
+#[cfg(all(test, windows))]
+#[path = "list/resolve_metal_tests.rs"]
+mod resolve_metal_tests;
 
 #[repr(C)]
 pub(crate) struct Rect {

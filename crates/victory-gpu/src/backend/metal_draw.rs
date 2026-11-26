@@ -51,6 +51,7 @@ pub(crate) struct MetalGraphics {
     pub(crate) name: String,
     pub(crate) pso: RenderPipeline,
     pub(crate) dss: DepthStencilState,
+    pub(crate) depth_write: bool,
     /// Fill, cull, depth clip, winding (Metal values).
     pub(crate) raster: [u8; 4],
     /// Depth bias, slope scale, clamp.
@@ -274,6 +275,7 @@ impl MetalBackend {
             name: p.name.clone(),
             pso,
             dss,
+            depth_write: ds.depth_write,
             vertex_slots,
             raster: [
                 r.fill.map_or(0, |v| v as u64 as u8),
@@ -313,6 +315,21 @@ impl MetalBackend {
             return None;
         }
         let pixel = super::metal_texture::view_format(&t, format);
+        if depth && !super::metal_texture::is_depth_pixel(t.pixel.0)
+            && let Some(companion) = t.depth_companion(&self.device, format)
+        {
+            return Some(Attachment {
+                resource: resource as usize,
+                texture: companion.texture.clone(),
+                pixel: companion.texture.pixel_format().0,
+                level: level as u16,
+                slice: slice as u16,
+                width: (companion.texture.width() as u32 >> level).max(1),
+                height: (companion.texture.height() as u32 >> level).max(1),
+                samples: 1,
+                companion: Some(companion),
+            });
+        }
         // A depth view needs a depth format and a target view a colour one
         // (the other way round is a GPU fault, not an error).
         if super::metal_texture::is_depth_pixel(pixel.0) != depth {
@@ -353,7 +370,7 @@ impl MetalBackend {
         };
         let width = (t.desc.width as u32 >> level).max(1);
         let height = (t.desc.height.max(1) >> level).max(1);
-        Some(Attachment { resource: resource as usize, texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8 })
+        Some(Attachment { resource: resource as usize, texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8, companion: None })
     }
 }
 
@@ -371,6 +388,7 @@ pub(crate) struct Attachment {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) samples: u8,
+    pub(crate) companion: Option<super::metal_depth::DepthCompanion>,
 }
 
 impl Attachment {
@@ -878,6 +896,16 @@ pub(crate) struct MetalTexCopy {
     pub(crate) dst_origin: [u64; 3],
 }
 
+pub(crate) struct MetalResolve {
+    pub(crate) src: Texture,
+    pub(crate) src_slice: u16,
+    pub(crate) dst: Texture,
+    pub(crate) dst_level: u16,
+    pub(crate) dst_slice: u16,
+    pub(crate) format: sys::WMTPixelFormat,
+    pub(crate) region: Option<victory_metal::clear_resolve::ResolveRegion>,
+}
+
 /// One pixel of a captured format as 8-bit RGB (floats clamped to 0..1).
 fn rgb8(format: u32, p: &[u8]) -> [u8; 3] {
     let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -930,8 +958,8 @@ fn half_to_f32(h: u16) -> f32 {
 pub(crate) static DRAWN_TARGETS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
 /// What wrote each title texture since the last capture (only when
-/// capturing): draws, clears, copies on Metal; resolves and buffer copies
-/// that run on D3D12 only.
+/// capturing): draws, clears, copies on Metal; resolves left on D3D12
+/// and D3D12-only buffer copies.
 pub(crate) static WRITES: std::sync::Mutex<Vec<(usize, [u32; 9])>> = std::sync::Mutex::new(Vec::new());
 
 pub(crate) const WRITE_NAMES: [&str; 9] = ["draw", "clear", "copy", "resolve_d3d_only", "buffer_copy_d3d_only", "uav_view", "draw_asked", "draw_no_host_pipeline", "draw_not_ready"];

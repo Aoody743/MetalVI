@@ -17,6 +17,8 @@ pub mod metal;
 #[allow(dead_code)]
 pub mod metal_texture;
 #[cfg(windows)]
+mod metal_depth;
+#[cfg(windows)]
 #[allow(dead_code)]
 pub mod metal_detile;
 #[cfg(windows)]

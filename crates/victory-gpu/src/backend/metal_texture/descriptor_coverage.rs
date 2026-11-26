@@ -165,6 +165,7 @@ fragment float4 f(float4 p [[position]], uint s [[sample_id]]) {
         pixel: FORMAT,
         mips,
         slices,
+        companion: Default::default(),
     })
 }
 
