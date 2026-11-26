@@ -333,6 +333,9 @@ impl MetalBackend {
                         blob += s.top.len().next_multiple_of(256);
                     }
                     blob += if d.pso.geometry.is_some() { 1536 } else { 512 };
+                    if let DrawKind::Generated { indices, .. } = &d.kind {
+                        blob += (indices.len() * 4).next_multiple_of(256);
+                    }
                 }
                 MetalOp::Clear(_) => {}
             }
@@ -392,6 +395,16 @@ impl MetalBackend {
                             };
                             let zt = put(&[0u8; 8]);
                             (a, u, vt, zt)
+                        }
+                        DrawKind::Generated { indices, .. } => {
+                            // The indices in the ring; MSC's draw arguments
+                            // take the index buffer's byte offset.
+                            let bytes: Vec<u8> = indices.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            let io = put(&bytes);
+                            let (mut args, index_type) = draw_params(&d.kind);
+                            args[2] = io as u32;
+                            let args: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            (put(&args), put(&index_type.to_le_bytes()), io, 0)
                         }
                         _ => {
                             let (args, index_type) = draw_params(&d.kind);
@@ -547,6 +560,16 @@ impl MetalBackend {
                                 base_instance: *first_instance,
                             },
                             DrawKind::Mesh { groups } => Render::DrawMesh { groups: *groups, object_threads: [1, 1, 1], mesh_threads: g.mesh_threads },
+                            DrawKind::Generated { indices, instances, base, first_instance } => Render::DrawIndexed {
+                                primitive_type: primitive,
+                                index_type: 1,
+                                index_count: indices.len() as u64,
+                                index_buffer: &r.buffer,
+                                index_offset: *vtable,
+                                instance_count: *instances,
+                                base_vertex: *base,
+                                base_instance: *first_instance,
+                            },
                             DrawKind::Geometry { draw, .. } => Render::DrawMesh {
                                 groups: draw.groups,
                                 object_threads: draw.object_threads,

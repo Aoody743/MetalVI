@@ -2041,8 +2041,19 @@ impl State {
             return;
         };
         let _pool = victory_metal::Pool::new();
+        use crate::backend::metal_draw::ConsoleTopology;
+        let console = match self.topology {
+            TRIANGLE_FAN => Some(ConsoleTopology::TriangleFan),
+            LINE_LOOP => Some(ConsoleTopology::LineLoop),
+            QUADS => Some(ConsoleTopology::Quads),
+            QUAD_STRIP => Some(ConsoleTopology::QuadStrip),
+            _ => None,
+        }
+        .filter(|_| !g.mesh && g.geometry.is_none());
         let primitive = if g.mesh || g.geometry.is_some() {
             3
+        } else if let Some(c) = console {
+            c.primitive()
         } else {
             match crate::backend::metal_map::map_topology(self.topology as i32) {
                 Some(t) => t.primitive_type as u64 as u8,
@@ -2061,6 +2072,9 @@ impl State {
             }
         };
         if targets.width == 0 || !targets.fit(&g) {
+            if targets.width != 0 {
+                crate::backend::metal_draw::note_mismatch(&targets, &g);
+            }
             count_draw(DrawDrop::Targets);
             return;
         }
@@ -2099,7 +2113,17 @@ impl State {
                 }
             }
         }
-        let kind = if let Some(config) = g.geometry {
+        // Console topologies: list indices made here, from the draw's
+        // vertex ids or from the title's index buffer (read in place).
+        let kind = if let Some(c) = console {
+            match self.console_draw(c, kind) {
+                Some(k) => k,
+                None => {
+                    count_draw(DrawDrop::IndexBuffer);
+                    return;
+                }
+            }
+        } else if let Some(config) = g.geometry {
             match kind {
                 DrawKindIn::Vertices { count, instances, first, first_instance } => {
                     let Some(draw) = config.draw(count, instances, first, first_instance, None) else {
@@ -2202,6 +2226,48 @@ impl State {
             primitive,
             kind,
         })));
+    }
+
+    /// A draw in console topology `c` as a [`DrawKind::Generated`]: its
+    /// vertex ids (relative to the first vertex) or the title's indices
+    /// expanded into list indices. `None` if the index buffer is unusable.
+    #[cfg(windows)]
+    fn console_draw(
+        &self,
+        c: crate::backend::metal_draw::ConsoleTopology,
+        kind: crate::backend::metal_draw::DrawKindIn,
+    ) -> Option<crate::backend::metal_draw::DrawKind> {
+        use crate::backend::metal_draw::{DrawKind, DrawKindIn, console_indices};
+        match kind {
+            DrawKindIn::Vertices { count, instances, first, first_instance } => {
+                let src: Vec<u32> = (0..count).collect();
+                Some(DrawKind::Generated { indices: console_indices(c, &src), instances, base: first as i32, first_instance })
+            }
+            DrawKindIn::Indexed { count, instances, first, base, first_instance } => {
+                let v = self.index;
+                let width = match v.format {
+                    57 => 2u64, // R16_UINT
+                    42 => 4,    // R32_UINT
+                    _ => return None,
+                };
+                let first_byte = u64::from(first) * width;
+                if v.address == 0 || v.address % width != 0 || first_byte + u64::from(count) * width > u64::from(v.size) {
+                    return None;
+                }
+                let at = (v.address + first_byte) as *const u8;
+                // SAFETY: inside the title's index buffer view (checked
+                // above); title memory is mapped in this process.
+                let src: Vec<u32> = unsafe {
+                    if width == 2 {
+                        std::slice::from_raw_parts(at.cast::<u16>(), count as usize).iter().map(|&i| u32::from(i)).collect()
+                    } else {
+                        std::slice::from_raw_parts(at.cast::<u32>(), count as usize).to_vec()
+                    }
+                };
+                Some(DrawKind::Generated { indices: console_indices(c, &src), instances, base, first_instance })
+            }
+            DrawKindIn::Mesh { .. } => None,
+        }
     }
 
     /// The bound render targets and depth view as Metal attachments.

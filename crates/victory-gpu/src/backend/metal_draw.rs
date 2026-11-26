@@ -453,6 +453,10 @@ pub(crate) enum DrawKind {
     Indexed { count: u32, instances: u32, base: i32, first_instance: u32, buffer: Buffer, offset: u32, index_type: u8 },
     Mesh { groups: [u64; 3] },
     Geometry { draw: victory_metal::msc::GeometryDraw, _index: Option<Buffer> },
+    /// A console topology Metal lacks (fan, quads, quad strip, line loop),
+    /// drawn from 32-bit indices made at record time (relative to `base`,
+    /// as a non-indexed draw's vertex ids are relative to its first vertex).
+    Generated { indices: Vec<u32>, instances: u32, base: i32, first_instance: u32 },
 }
 
 /// One draw as recorded into a title list.
@@ -584,6 +588,10 @@ pub(crate) fn draw_params(kind: &DrawKind) -> ([u32; 5], u16) {
             ([count, instances, offset, base as u32, first_instance], u16::from(index_type) + 1)
         }
         DrawKind::Mesh { .. } | DrawKind::Geometry { .. } => ([0; 5], 0),
+        // the index offset is the ring's, filled in by `run`
+        DrawKind::Generated { ref indices, instances, base, first_instance } => {
+            ([indices.len() as u32, instances, 0, base as u32, first_instance], 2)
+        }
     }
 }
 
@@ -717,5 +725,97 @@ fn dump_failed(p: &HostPipeline) {
         if crate::read_file(&path).is_err() {
             let _ = std::fs::write(&path, &s.translated().host.dxil);
         }
+    }
+}
+
+/// Console topologies Metal has no primitive type for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConsoleTopology {
+    TriangleFan,
+    LineLoop,
+    Quads,
+    QuadStrip,
+}
+
+impl ConsoleTopology {
+    /// MTLPrimitiveType of the lists they become (triangle 3, line 1).
+    pub(crate) fn primitive(self) -> u8 {
+        if self == ConsoleTopology::LineLoop { 1 } else { 3 }
+    }
+}
+
+/// The list indices drawing `src` (the draw's vertex indices, in order) as
+/// `t`: quads as (0,1,2)(0,2,3), quad strips as (0,1,3)(0,3,2) per step of
+/// two, fans as (0,i,i+1), a line loop as its lines and the closing one.
+/// Leftover vertices that make no whole primitive are dropped, as the
+/// hardware does.
+pub(crate) fn console_indices(t: ConsoleTopology, src: &[u32]) -> Vec<u32> {
+    let n = src.len();
+    let mut out = Vec::new();
+    match t {
+        ConsoleTopology::Quads => {
+            for q in src.chunks_exact(4) {
+                out.extend_from_slice(&[q[0], q[1], q[2], q[0], q[2], q[3]]);
+            }
+        }
+        ConsoleTopology::QuadStrip => {
+            let mut i = 0;
+            while i + 3 < n {
+                out.extend_from_slice(&[src[i], src[i + 1], src[i + 3], src[i], src[i + 3], src[i + 2]]);
+                i += 2;
+            }
+        }
+        ConsoleTopology::TriangleFan => {
+            for i in 1..n.saturating_sub(1) {
+                out.extend_from_slice(&[src[0], src[i], src[i + 1]]);
+            }
+        }
+        ConsoleTopology::LineLoop => {
+            if n >= 2 {
+                for i in 0..n {
+                    out.extend_from_slice(&[src[i], src[(i + 1) % n]]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Logs a target/pipeline mismatch once per kind (first 16 kinds).
+pub(crate) fn note_mismatch(t: &Targets, g: &MetalGraphics) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let targets: Vec<u32> = t.colors.iter().map(|c| c.as_ref().map_or(0, |c| c.pixel)).collect();
+    let key = format!(
+        "targets {:?} depth {} stencil {} samples {} / pipeline {:?} depth {} stencil {} samples {}",
+        targets,
+        t.depth.as_ref().map_or(0, |d| d.pixel),
+        t.stencil,
+        t.samples,
+        g.colors,
+        g.depth,
+        g.stencil,
+        g.samples
+    );
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 16 && !seen.contains(&key) {
+        tracing::info!(mismatch = %key, pipeline = %g.name, "Metal draws: targets do not fit the pipeline (first of its kind)");
+        seen.push(key);
+    }
+}
+
+#[cfg(test)]
+mod console_topology_tests {
+    use super::*;
+
+    #[test]
+    fn console_topologies_become_lists() {
+        let v: Vec<u32> = (0..8).collect();
+        assert_eq!(console_indices(ConsoleTopology::Quads, &v[..8]), [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
+        assert_eq!(console_indices(ConsoleTopology::QuadStrip, &v[..6]), [0, 1, 3, 0, 3, 2, 2, 3, 5, 2, 5, 4]);
+        assert_eq!(console_indices(ConsoleTopology::TriangleFan, &v[..5]), [0, 1, 2, 0, 2, 3, 0, 3, 4]);
+        assert_eq!(console_indices(ConsoleTopology::LineLoop, &v[..3]), [0, 1, 1, 2, 2, 0]);
+        // leftovers dropped; indexed sources map through
+        assert_eq!(console_indices(ConsoleTopology::Quads, &[9, 8, 7, 6, 5]), [9, 8, 7, 9, 7, 6]);
+        assert!(console_indices(ConsoleTopology::TriangleFan, &[1, 2]).is_empty());
     }
 }
