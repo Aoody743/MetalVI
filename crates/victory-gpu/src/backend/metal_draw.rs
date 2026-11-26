@@ -929,6 +929,29 @@ fn half_to_f32(h: u16) -> f32 {
 /// pixel area (for captures of intermediate targets).
 pub(crate) static DRAWN_TARGETS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// What wrote each title texture since the last capture (only when
+/// capturing): draws, clears, copies on Metal; resolves and buffer copies
+/// that run on D3D12 only.
+pub(crate) static WRITES: std::sync::Mutex<Vec<(usize, [u32; 5])>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) const WRITE_NAMES: [&str; 5] = ["draw", "clear", "copy", "resolve_d3d_only", "buffer_copy_d3d_only"];
+
+/// Notes a write of kind `kind` (an index into [`WRITE_NAMES`]) to `resource`.
+pub(crate) fn note_write(resource: usize, kind: usize) {
+    if capture_every() == 0 {
+        return;
+    }
+    let mut w = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    match w.iter_mut().find(|(r, _)| *r == resource) {
+        Some((_, n)) => n[kind] += 1,
+        None => {
+            let mut n = [0; 5];
+            n[kind] = 1;
+            w.push((resource, n));
+        }
+    }
+}
+
 /// Notes the colour targets of a recorded draw (only when capturing).
 pub(crate) fn note_targets(t: &Targets) {
     if capture_every() == 0 {
@@ -936,6 +959,7 @@ pub(crate) fn note_targets(t: &Targets) {
     }
     let mut d = DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
     for a in t.colors.iter().flatten() {
+        note_write(a.resource, 0);
         if !d.iter().any(|(r, _)| *r == a.resource) {
             d.push((a.resource, u64::from(a.width) * u64::from(a.height)));
         }

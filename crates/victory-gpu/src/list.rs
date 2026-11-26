@@ -1050,6 +1050,9 @@ extern "system" fn copy_texture_region(
             )
         };
         // Texture to texture on Metal too (F50), in list order.
+        if crate::backend::metal_draw::draws_on() && src.kind == FOOTPRINT && dst.kind != FOOTPRINT {
+            crate::backend::metal_draw::note_write(dst.resource as usize, 4);
+        }
         if crate::backend::metal_draw::draws_on() && src.kind != FOOTPRINT && dst.kind != FOOTPRINT {
             // SAFETY: a subresource location's union starts with its index.
             let (si, di) = unsafe {
@@ -1077,6 +1080,7 @@ fn metal_copy(this: This, src: This, si: u32, dst: This, di: u32, at: [u32; 3], 
     let Some(m) = crate::backend::metal::backend() else { return };
     let _pool = victory_metal::Pool::new();
     let (Some(s), Some(d)) = (m.texture_for(src), m.texture_for(dst)) else { return };
+    crate::backend::metal_draw::note_write(dst as usize, 2);
     // (plane, mip, slice)
     let (Some((_, sl, ss)), Some((_, dl, ds))) = (decode_subresource(si, s.mips, s.slices.max(1)), decode_subresource(di, d.mips, d.slices.max(1))) else {
         return;
@@ -1196,6 +1200,10 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    #[cfg(windows)]
+    if crate::backend::metal_draw::draws_on() {
+        crate::backend::metal_draw::note_write(dst as usize, 3);
+    }
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
@@ -1331,6 +1339,7 @@ fn metal_clear(
     let Some((level, slice)) = level_slice(&words, depth_view) else { return };
     let _pool = victory_metal::Pool::new();
     let Some(target) = m.attachment(record.resource, words[0], level, slice, depth_view) else { return };
+    crate::backend::metal_draw::note_write(record.resource as usize, 1);
     let has_stencil = matches!(target.pixel, 260 | 261);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };

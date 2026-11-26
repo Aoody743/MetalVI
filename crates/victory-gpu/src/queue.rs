@@ -898,6 +898,18 @@ extern "system" fn present(
         // SAFETY: the plane lists `count` resources.
         let resource = unsafe { *plane.resources };
         m.capture(resource, &format!("frame{frame:06}"));
+        // What wrote the presented texture since the last capture.
+        let writes = std::mem::take(&mut *crate::backend::metal_draw::WRITES.lock().unwrap_or_else(|e| e.into_inner()));
+        let mine = writes.iter().find(|(r, _)| *r == resource as usize).map_or([0; 5], |(_, n)| *n);
+        let names = crate::backend::metal_draw::WRITE_NAMES;
+        tracing::info!(
+            frame,
+            resource = resource as usize,
+            pixel = m.texture_for(resource).map_or(0, |t| t.pixel.0),
+            writes = %names.iter().zip(mine).map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" "),
+            textures_written = writes.len(),
+            "Metal capture: writes to the presented texture"
+        );
         // And the largest targets Metal drew into since the last capture.
         let mut drawn = std::mem::take(&mut *crate::backend::metal_draw::DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
         drawn.sort_by_key(|&(_, area)| std::cmp::Reverse(area));
