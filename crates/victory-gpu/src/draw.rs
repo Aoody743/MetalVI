@@ -2089,17 +2089,24 @@ impl State {
             use victory_metal::msc::{VERTEX_TABLE_SLOTS, VertexBufferEntry, vertex_table_bytes};
             let mut entries = [VertexBufferEntry::default(); VERTEX_TABLE_SLOTS];
             let mut buffers = Vec::new();
-            let chunks = m.chunks();
+            let mut chunks = m.chunks();
             for (i, entry) in entries.iter_mut().enumerate() {
                 if g.vertex_slots & (1u32 << i) == 0 {
                     continue;
                 }
                 let view = self.vertex[i];
-                if view.stride == 0 {
-                    count_draw(DrawDrop::VertexFetch);
-                    return;
+                // An unbound slot reads zeros on D3D12: an empty entry. A
+                // stride of 0 (every vertex the same element) is legal.
+                if view.address == 0 || view.size == 0 {
+                    continue;
                 }
-                let Some((buffer, offset)) = chunks.resident_window(view.address, u64::from(view.size)) else {
+                // Wrapped on first use, as index buffers are (a resident
+                // window alone refused every buffer not wrapped yet).
+                let Some((buffer, offset)) = chunks.window_buffer(view.address, u64::from(view.size)) else {
+                    crate::backend::metal_draw::note_once(format!(
+                        "vertex fetch: slot {i} {:#x}+{:#x} stride {} not wrappable",
+                        view.address, view.size, view.stride
+                    ));
                     count_draw(DrawDrop::VertexFetch);
                     return;
                 };
