@@ -57,11 +57,11 @@ impl MetalBackend {
     /// False if it could not (the caller may present the D3D12 way).
     pub(crate) fn present_metal(&self, resource: This) -> bool {
         static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
-        let Some(source) = self.texture_for(resource) else { return false };
+        let Some(source) = self.texture_for(resource) else { return fell_back("no Metal texture for the presented resource") };
         let _pool = victory_metal::Pool::new();
         let mut guard = PRESENTER.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            let Some(hwnd) = crate::host::title_window() else { return false };
+            let Some(hwnd) = crate::host::title_window() else { return fell_back("no title window") };
             let layer = match MetalLayer::for_window(&self.device, hwnd.0 as isize) {
                 Ok(l) => l,
                 Err(e) => {
@@ -90,8 +90,8 @@ impl MetalBackend {
             let _ = p.layer.set_drawable_size(f64::from(cw), f64::from(ch));
             p.size = (cw, ch);
         }
-        let Ok(drawable) = p.layer.next_drawable() else { return false };
-        let Ok(target) = drawable.texture() else { return false };
+        let Ok(drawable) = p.layer.next_drawable() else { return fell_back("no drawable from the layer") };
+        let Ok(target) = drawable.texture() else { return fell_back("the drawable has no texture") };
         let target = Texture::from_object(target);
         // F55 first: the source's typed format decides the transfer.
         if let Some(conv) = p.converter.as_mut() {
@@ -153,9 +153,9 @@ impl MetalBackend {
                 base_instance: 0,
             },
         ];
-        let Ok(cb) = self.queue.command_buffer() else { return false };
+        let Ok(cb) = self.queue.command_buffer() else { return fell_back("no command buffer") };
         if cb.render_pass_with(&pass, &steps).is_err() {
-            return false;
+            return fell_back("the blit pass did not encode");
         }
         cb.present(&drawable);
         cb.commit();
@@ -172,6 +172,27 @@ fn client_size(hwnd: Option<windows::Win32::Foundation::HWND>) -> (u32, u32) {
         return (0, 0);
     }
     ((r.right - r.left).max(0) as u32, (r.bottom - r.top).max(0) as u32)
+}
+
+/// A present Metal could not make, so the D3D12 picture shows this frame:
+/// logged the first time per reason, then every 1024th.
+fn fell_back(why: &'static str) -> bool {
+    static SEEN: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let n = match seen.iter_mut().find(|(w, _)| *w == why) {
+        Some((_, n)) => {
+            *n += 1;
+            *n
+        }
+        None => {
+            seen.push((why, 1));
+            1
+        }
+    };
+    if n == 1 || n.is_multiple_of(1024) {
+        tracing::warn!(times = n, "Metal present fell back to the D3D12 picture: {why}");
+    }
+    false
 }
 
 /// Logs a present failure the first few times only (presents retry every frame).
