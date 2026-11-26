@@ -2,7 +2,7 @@
 
 <p align="center">
 <b>An open-source research runtime for running the Xbox Series build of Grand Theft Auto VI on Apple Silicon Macs, with a native Metal backend and zero-copy unified memory.</b><br>
-<b>Model Used: Antigravity - Gemini 4 Neon, Gemini 4 Hydrogen(Initial Setup)<p>Codex - GPT-6.2 Sol(Development)</p><p>Doubao Work - Deepseek V4.1 Flash(Research & Basic Work since I have no enough tokens)</p> </b><br>
+<center> <b>Model Used: Antigravity - Gemini 4 Neon, Gemini 4 Hydrogen (Initial Setup)<p><center>Codex - GPT-6.2 Sol (Development)</p><p><center>Doubao Work - Deepseek V4.1 Flash (Research & Basic Work since I have no enough tokens)</p> <p><center>Claude Code - Claude Opus 5.5 & Claude Sonnet 5.5 (Planning + most adaptions)</p> </b><br>
 M1 · M2 · M3 · M4 · M5 &nbsp;|&nbsp; macOS 15+ &nbsp;|&nbsp; Rust · Wine · Metal · Metal Shader Converter
 </p>
 
