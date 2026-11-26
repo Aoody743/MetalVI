@@ -207,7 +207,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                         of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
                     )
                 });
-                tracing::info!(
+                tracing::debug!(
                     view = ?placed,
                     texture = ?source,
                     width = of_from.Width,

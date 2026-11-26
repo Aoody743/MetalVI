@@ -172,7 +172,7 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
-                    Ok(t) => tracing::info!(
+                    Ok(t) => tracing::debug!(
                         stage = self.stage,
                         hash = %self.hash,
                         user_data = t.host.user_data.len(),
@@ -403,7 +403,7 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        tracing::debug!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
     }
 }
 

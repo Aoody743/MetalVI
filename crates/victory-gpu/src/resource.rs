@@ -1329,7 +1329,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // the one target dumps and the captured frame's list of commands
         // name.
         if r.desc.flags & 6 == 6 {
-            tracing::info!(
+            tracing::debug!(
                 resource = ?this,
                 desc = ?r.desc,
                 twin = twin.is_some(),

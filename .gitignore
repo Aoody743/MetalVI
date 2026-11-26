@@ -82,3 +82,38 @@ Thumbs.db
 # redistributed. Each user builds it from their own MSC install.
 /native/victorymetal/build/
 /scripts/macos/*.dylib
+
+# ---------------------------------------------------------------------------
+# F70 (repo hygiene): artifacts produced by our own tooling. These keep
+# warm-up output, suite temp dirs, capture folders, patch fallbacks, private
+# Wine prefixes and generic build dirs out of `git status`. The allowlist in
+# xtask/src/policy.rs remains the authoritative check.
+# ---------------------------------------------------------------------------
+
+# F46 (victory-warm-metal): MSC converted shaders in VICTORY_METAL_CACHE
+# (`<hash32>.vmsc`; `<hash32>.tmp<pid>.<thread>` atomic-write siblings), and a
+# metal-cache directory if the cache is ever pointed inside the repository.
+*.vmsc
+*.tmp[0-9]*
+/metal-cache/
+
+# F58 (scripts/macos/metal-suite.sh): mktemp directories `metal-suite.XXXXXXXX`
+# (private Wine prefix, copied Wine tree, logs) if the suite temp/log dir is
+# created inside the repository.
+metal-suite.*/
+
+# Frame capture (VICTORY_CAPTURE folder): frame-<n>.png, frame-<n>-ops.txt.
+/capture/
+/captures/
+
+# Patch fallbacks: original copies and rejected hunks from apply/patch.
+*.orig
+*.rej
+
+# Private Wine prefixes mistakenly created inside the repository.
+/prefix/
+/wineprefix/
+/prefixes/
+
+# Generic build output directory (Cargo's own /target/ is already ignored).
+/build/
