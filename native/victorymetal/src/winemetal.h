@@ -860,6 +860,9 @@ struct WMTMeshRenderPipelineInfo {
 WINEMETAL_API obj_handle_t
 MTLDevice_newRenderPipelineState(obj_handle_t device, const struct WMTRenderPipelineInfo *info, obj_handle_t *err_out);
 
+WINEMETAL_API obj_handle_t VM_NewRenderPipelineStageIn(obj_handle_t device,
+    const struct WMTRenderPipelineInfo *info, obj_handle_t stage_in_library, obj_handle_t *err_out);
+
 WINEMETAL_API obj_handle_t MTLDevice_newMeshRenderPipelineState(
     obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info, obj_handle_t *err_out
 );
@@ -1229,6 +1232,7 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetBlendFactor,
   WMTRenderCommandSetStencilRef,
   WMTRenderCommandSetDepthStencilState,
+  WMTRenderCommandSetVertexBytes,
 };
 
 struct wmtcmd_render_nop {

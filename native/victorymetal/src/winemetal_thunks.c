@@ -5,6 +5,7 @@
 #endif
 
 #include "winemetal_thunks.h"
+#include "msc.h"
 #include <wineunixlib.h>
 #include "assert.h"
 #include "string.h"
@@ -359,6 +360,19 @@ MTLDevice_newRenderPipelineState(obj_handle_t device, const struct WMTRenderPipe
   if (err_out)
     *err_out = params.ret_error;
   return params.ret_pso;
+}
+
+WINEMETAL_API obj_handle_t
+VM_NewRenderPipelineStageIn(obj_handle_t device, const struct WMTRenderPipelineInfo *info,
+                            obj_handle_t stage_in_library, obj_handle_t *err_out) {
+  struct unixcall_renderpso_stage_in params = {0};
+  params.pipeline.device = device;
+  WMT_MEMPTR_SET(params.pipeline.info, info);
+  params.stage_in_library = stage_in_library;
+  UNIX_CALL(VM_UNIX_RENDER_PIPELINE_STAGE_IN, &params);
+  if (err_out)
+    *err_out = params.pipeline.ret_error;
+  return params.pipeline.ret_pso;
 }
 
 WINEMETAL_API obj_handle_t

@@ -519,8 +519,7 @@ MTLMeshRenderPipelineDescriptor ()
 #endif
 
 static NTSTATUS
-_MTLDevice_newRenderPipelineState(void *obj) {
-  struct unixcall_mtldevice_newrenderpso *params = obj;
+new_render_pipeline(struct unixcall_mtldevice_newrenderpso *params, id<MTLLibrary> stage_in) {
   const struct WMTRenderPipelineInfo *info = params->info.ptr;
   MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
 
@@ -563,6 +562,22 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   descriptor.vertexFunction = (id<MTLFunction>)info->vertex_function;
   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
   descriptor.supportIndirectCommandBuffers = info->support_indirect_command_buffers;
+  if (stage_in) {
+    NSString *name = stage_in.functionNames.firstObject;
+    id<MTLFunction> helper = name ? [stage_in newFunctionWithName:name] : nil;
+    if (!helper) {
+      [descriptor release];
+      params->ret_pso = 0;
+      params->ret_error = (obj_handle_t)[[NSError alloc] initWithDomain:@"victorymetal.stage-in" code:1 userInfo:
+          @{NSLocalizedDescriptionKey: @"No stage-in function in Metal library"}];
+      return STATUS_SUCCESS;
+    }
+    MTLLinkedFunctions *linked = [[MTLLinkedFunctions alloc] init];
+    linked.functions = @[helper];
+    descriptor.vertexLinkedFunctions = linked;
+    [linked release];
+    [helper release];
+  }
 
   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
@@ -581,6 +596,17 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   }
   [descriptor release];
   return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newRenderPipelineState(void *obj) {
+  return new_render_pipeline(obj, nil);
+}
+
+static NTSTATUS
+_VM_NewRenderPipelineStageIn(void *obj) {
+  struct unixcall_renderpso_stage_in *params = obj;
+  return new_render_pipeline(&params->pipeline, (id<MTLLibrary>)params->stage_in_library);
 }
 
 static NTSTATUS
@@ -946,6 +972,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetFragmentBytes: {
       struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
       [encoder setFragmentBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexBytes: {
+      struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
+      [encoder setVertexBytes:body->bytes.ptr length:body->length atIndex:body->index];
       break;
     }
     case WMTRenderCommandSetFragmentTexture: {
@@ -3191,6 +3222,7 @@ NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
 extern NTSTATUS _MSC_Compile(void *args);
 extern NTSTATUS _MSC_Free(void *args);
 extern NTSTATUS _VM_GpuResourceID(void *args);
+extern NTSTATUS _MSC_CompileStageIn(void *args);
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -3343,6 +3375,8 @@ const void *__wine_unix_call_funcs[] = {
     &_MSC_Compile,
     &_MSC_Free,
     &_VM_GpuResourceID,
+    &_MSC_CompileStageIn,
+    &_VM_NewRenderPipelineStageIn,
 };
 
 #ifndef DXMT_NATIVE
@@ -3496,5 +3530,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MSC_Compile,
     &_MSC_Free,
     &_VM_GpuResourceID,
+    &_MSC_CompileStageIn,
+    &_VM_NewRenderPipelineStageIn,
 };
 #endif

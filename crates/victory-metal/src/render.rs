@@ -9,9 +9,7 @@
 //! Bind points follow the Metal Shader Converter runtime
 //! (`metal_irconverter_runtime.h`, see [`crate::msc`]): descriptor heap at 0,
 //! sampler heap at 1, top-level argument buffer at 2. On a render encoder the
-//! heap buffers are set on both the vertex and fragment stages; the top-level
-//! bytes go to the fragment stage (the vertex stage has no `setVertexBytes`
-//! command in winemetal).
+//! heap buffers and top-level bytes can be bound to both shader stages.
 
 use core::ffi::c_void;
 
@@ -46,6 +44,8 @@ pub enum Render<'a> {
     Pipeline { pipeline: &'a RenderPipeline },
     /// `setVertexBuffer:offset:atIndex:` (heap buffers, vertex stage).
     VertexBuffer { buffer: &'a Buffer, offset: u64, index: u8 },
+    /// `setVertexBytes:length:atIndex:`.
+    VertexBytes { bytes: &'a [u8], index: u8 },
     /// `setFragmentBuffer:offset:atIndex:` (heap buffers, fragment stage).
     FragmentBuffer { buffer: &'a Buffer, offset: u64, index: u8 },
     /// `setFragmentBytes:length:atIndex:` (top-level argument buffer bytes).
@@ -292,6 +292,27 @@ impl Device {
         fragment: Option<(&Object, &str)>,
         desc: &RenderPipelineDesc,
     ) -> Result<RenderPipeline> {
+        self.render_pipeline_impl(vertex, fragment, desc, None)
+    }
+
+    /// A render pipeline whose vertex stage calls a synthesized stage-in function.
+    pub fn render_pipeline_stage_in(
+        &self,
+        vertex: (&Object, &str),
+        fragment: Option<(&Object, &str)>,
+        desc: &RenderPipelineDesc,
+        stage_in_library: &Object,
+    ) -> Result<RenderPipeline> {
+        self.render_pipeline_impl(vertex, fragment, desc, Some(stage_in_library))
+    }
+
+    fn render_pipeline_impl(
+        &self,
+        vertex: (&Object, &str),
+        fragment: Option<(&Object, &str)>,
+        desc: &RenderPipelineDesc,
+        stage_in_library: Option<&Object>,
+    ) -> Result<RenderPipeline> {
         let _pool = Pool::new();
         let function = |lib: &Object, name: &str| -> Result<Object> {
             let c = std::ffi::CString::new(name).map_err(|_| Error("function name has a NUL".into()))?;
@@ -329,7 +350,12 @@ impl Device {
         info.max_tessellation_factor = 64;
         let mut err = 0;
         // SAFETY: info is valid for the call; newRenderPipelineState returns owned (+1).
-        let pso = Object::adopt(unsafe { sys::MTLDevice_newRenderPipelineState(self.handle(), &info, &mut err) })
+        let pso = Object::adopt(unsafe {
+            match stage_in_library {
+                Some(lib) => sys::VM_NewRenderPipelineStageIn(self.handle(), &info, lib.handle(), &mut err),
+                None => sys::MTLDevice_newRenderPipelineState(self.handle(), &info, &mut err),
+            }
+        })
             .ok_or_else(|| error_text(err, "newRenderPipelineState"))?;
         Ok(RenderPipeline(pso))
     }
@@ -493,8 +519,12 @@ impl CommandBuffer {
                     offset,
                     index,
                 }),
-                Render::FragmentBytes { bytes, index } => Box::new(sys::wmtcmd_render_setbytes {
-                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetFragmentBytes,
+                Render::FragmentBytes { bytes, index } | Render::VertexBytes { bytes, index } => Box::new(sys::wmtcmd_render_setbytes {
+                    type_: if matches!(step, Render::VertexBytes { .. }) {
+                        sys::WMTRenderCommandType::WMTRenderCommandSetVertexBytes
+                    } else {
+                        sys::WMTRenderCommandType::WMTRenderCommandSetFragmentBytes
+                    },
                     reserved: [0; 3],
                     next: null_next(),
                     bytes: sys::WMTMemoryPointer { ptr: bytes.as_ptr() as *mut c_void },

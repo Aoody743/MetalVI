@@ -9,6 +9,7 @@
 //! goes at bind point 0 and the sampler heap at 1 (metal_irconverter_runtime.h).
 
 use core::ffi::c_void;
+use std::ffi::CString;
 
 use crate::{ComputePipeline, Device, Error, Object, Pool, Result, error_text, sys};
 
@@ -16,6 +17,10 @@ use crate::{ComputePipeline, Device, Error, Object, Pool, Result, error_text, sy
 pub const DESCRIPTOR_HEAP_BIND_POINT: u8 = 0;
 pub const SAMPLER_HEAP_BIND_POINT: u8 = 1;
 pub const ARGUMENT_BUFFER_BIND_POINT: u8 = 2;
+pub const DRAW_ARGUMENTS_BIND_POINT: u8 = 4;
+pub const DRAW_UNIFORMS_BIND_POINT: u8 = 5;
+pub const VERTEX_TABLE_BIND_POINT: u8 = 6;
+pub const VERTEX_TABLE_SLOTS: usize = 31;
 
 /// IRShaderStage numbering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +94,59 @@ struct CompileParams {
     locations: [RawLocation; 64],
     ret: i32,
     error: [u8; 1024],
+}
+
+/// D3D input element for a vertex shader with a separate Metal stage-in function.
+#[derive(Clone, Copy, Debug)]
+pub struct VertexInput<'a> {
+    pub semantic: &'a str,
+    pub semantic_index: u32,
+    /// DXGI/IRFormat value.
+    pub format: u32,
+    pub slot: u32,
+    /// Resolved byte offset, not D3D12_APPEND_ALIGNED_ELEMENT.
+    pub offset: u32,
+    /// `None` for per-vertex data or the D3D instance step rate.
+    pub instance_step_rate: Option<u32>,
+}
+
+#[repr(C)]
+struct RawInput {
+    semantic: *const core::ffi::c_char,
+    semantic_index: u32,
+    format: u32,
+    slot: u32,
+    offset: u32,
+    per_instance: u32,
+    step_rate: u32,
+}
+
+#[repr(C)]
+struct StageInParams {
+    compile: *mut CompileParams,
+    elements: *const RawInput,
+    count: u32,
+    metallib: *mut c_void,
+    metallib_len: u64,
+}
+
+/// One entry of MSC's IRRuntimeVertexBuffers table (vertex bind point 6).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VertexBufferEntry {
+    pub address: u64,
+    pub length: u32,
+    pub stride: u32,
+}
+
+/// Serialize the GPU addresses and draw-time buffer sizes and strides.
+pub fn vertex_table_bytes(entries: &[VertexBufferEntry; VERTEX_TABLE_SLOTS]) -> [u8; VERTEX_TABLE_SLOTS * 16] {
+    let mut bytes = [0; VERTEX_TABLE_SLOTS * 16];
+    for (out, entry) in bytes.chunks_exact_mut(16).zip(entries) {
+        out[..8].copy_from_slice(&entry.address.to_le_bytes());
+        out[8..12].copy_from_slice(&entry.length.to_le_bytes());
+        out[12..].copy_from_slice(&entry.stride.to_le_bytes());
+    }
+    bytes
 }
 
 /// msc.h `struct msc_location`.
@@ -167,6 +225,57 @@ impl Converted {
 
 /// Converts one DXIL container (as victory-shader emits it) for `stage`.
 pub fn convert(dxil: &[u8], stage: Stage, params: &[RootParam], samplers: &[StaticSampler]) -> Result<Converted> {
+    convert_impl(dxil, stage, params, samplers, &[]).map(|(shader, _)| shader)
+}
+
+/// The vertex shader and its matching, layout-specific stage-in metallib.
+pub struct ConvertedVertex {
+    pub shader: Converted,
+    pub stage_in: Vec<u8>,
+}
+
+pub fn convert_vertex_with_stage_in(
+    dxil: &[u8],
+    params: &[RootParam],
+    samplers: &[StaticSampler],
+    inputs: &[VertexInput<'_>],
+) -> Result<ConvertedVertex> {
+    if inputs.is_empty() || inputs.len() > VERTEX_TABLE_SLOTS {
+        return Err(Error("Metal stage-in needs 1 to 31 input elements".into()));
+    }
+    let names: Vec<_> = inputs
+        .iter()
+        .map(|input| CString::new(input.semantic).map_err(|_| Error("vertex semantic contains a NUL".into())))
+        .collect::<Result<_>>()?;
+    let elements: Vec<_> = inputs
+        .iter()
+        .zip(&names)
+        .map(|(input, name)| {
+            if input.slot as usize >= VERTEX_TABLE_SLOTS || input.offset == u32::MAX || name.as_bytes().is_empty() {
+                return Err(Error("invalid Metal vertex input slot, offset or semantic".into()));
+            }
+            Ok(RawInput {
+                semantic: name.as_ptr(),
+                semantic_index: input.semantic_index,
+                format: input.format,
+                slot: input.slot,
+                offset: input.offset,
+                per_instance: u32::from(input.instance_step_rate.is_some()),
+                step_rate: input.instance_step_rate.unwrap_or(0),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let (shader, stage_in) = convert_impl(dxil, Stage::Vertex, params, samplers, &elements)?;
+    Ok(ConvertedVertex { shader, stage_in })
+}
+
+fn convert_impl(
+    dxil: &[u8],
+    stage: Stage,
+    params: &[RootParam],
+    samplers: &[StaticSampler],
+    inputs: &[RawInput],
+) -> Result<(Converted, Vec<u8>)> {
     let raw: Vec<RawParam> = params
         .iter()
         .map(|p| match *p {
@@ -197,15 +306,42 @@ pub fn convert(dxil: &[u8], stage: Stage, params: &[RootParam], samplers: &[Stat
         ret: -1,
         error: [0; 1024],
     };
-    // SAFETY: every pointer is valid for the call; the unix side fills the outs.
-    let ret = unsafe { MSC_Compile(&mut p) };
+    let mut stage_in = StageInParams {
+        compile: &mut p,
+        elements: inputs.as_ptr(),
+        count: inputs.len() as u32,
+        metallib: core::ptr::null_mut(),
+        metallib_len: 0,
+    };
+    let ret = if inputs.is_empty() {
+        // SAFETY: every pointer is valid for the call; the unix side fills the outs.
+        unsafe { MSC_Compile(&mut p) }
+    } else {
+        let f = sys::symbol(b"MSC_CompileStageIn\0");
+        if f.is_null() {
+            return Err(Error("victorymetal.dll has no MSC_CompileStageIn (rebuild native/victorymetal)".into()));
+        }
+        // SAFETY: signature from msc.h. The input layout and names outlive the call.
+        unsafe {
+            core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut StageInParams) -> i32>(f)(&mut stage_in)
+        }
+    };
     if ret != 0 || p.metallib.is_null() {
         return Err(Error(format!("Metal Shader Converter: {}", c_text(&p.error))));
     }
-    // SAFETY: the unix side malloc'd metallib_len bytes there.
-    let metallib = unsafe { std::slice::from_raw_parts(p.metallib.cast::<u8>(), p.metallib_len as usize) }.to_vec();
-    // SAFETY: given back to the allocator that made it.
-    unsafe { MSC_Free(p.metallib) };
+    let copy = |ptr: *mut c_void, len: u64| {
+        if ptr.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: unix allocated and initialized len bytes; free with the same allocator.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len as usize).to_vec();
+            MSC_Free(ptr);
+            bytes
+        }
+    };
+    let metallib = copy(p.metallib, p.metallib_len);
+    let helper = copy(stage_in.metallib, stage_in.metallib_len);
     let layout = p.locations[..p.num_locations as usize]
         .iter()
         .map(|l| crate::ir::Location {
@@ -216,12 +352,12 @@ pub fn convert(dxil: &[u8], stage: Stage, params: &[RootParam], samplers: &[Stat
             size: l.size,
         })
         .collect();
-    Ok(Converted {
+    Ok((Converted {
         metallib,
         entry: c_text(&p.entry),
         threadgroup: p.threadgroup,
         top_level: crate::ir::TopLevel::new(layout, p.top_level_size),
-    })
+    }, helper))
 }
 
 impl Device {

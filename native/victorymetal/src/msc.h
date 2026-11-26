@@ -17,6 +17,8 @@
 #define MSC_UNIX_COMPILE 146
 #define MSC_UNIX_FREE 147
 #define VM_UNIX_GPU_RESOURCE_ID 148
+#define MSC_UNIX_COMPILE_STAGE_IN 149
+#define VM_UNIX_RENDER_PIPELINE_STAGE_IN 150
 
 /* One root parameter of the root signature victory builds per pipeline
  * (pipeline/host.rs): 32-bit constants or a root descriptor. Heaps are
@@ -79,6 +81,19 @@ struct msc_free_params {
   void *ptr;
 };
 
+struct msc_input_element {
+  const char *semantic;
+  uint32_t semantic_index, format, slot, offset, per_instance, step_rate;
+};
+
+struct msc_stage_in_params {
+  struct msc_compile_params *compile;
+  const struct msc_input_element *elements;
+  uint32_t count;
+  void *metallib;
+  uint64_t metallib_len;
+};
+
 /* gpuResourceID of a texture or sampler state (argument-buffer capable),
  * for descriptor entries; 0 for anything else. */
 struct vm_resource_id_params {
@@ -88,6 +103,7 @@ struct vm_resource_id_params {
 WINEMETAL_API uint64_t VM_GpuResourceID(uint64_t handle);
 
 WINEMETAL_API int MSC_Compile(struct msc_compile_params *params);
+WINEMETAL_API int MSC_CompileStageIn(struct msc_stage_in_params *params);
 WINEMETAL_API void MSC_Free(void *ptr);
 
 #endif

@@ -1806,6 +1806,7 @@ impl WMTRenderCommandType {
     pub const WMTRenderCommandSetBlendFactor: WMTRenderCommandType = WMTRenderCommandType(43);
     pub const WMTRenderCommandSetStencilRef: WMTRenderCommandType = WMTRenderCommandType(44);
     pub const WMTRenderCommandSetDepthStencilState: WMTRenderCommandType = WMTRenderCommandType(45);
+    pub const WMTRenderCommandSetVertexBytes: WMTRenderCommandType = WMTRenderCommandType(46);
 }
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -3335,6 +3336,13 @@ pub unsafe fn MTLDevice_newRenderPipelineState(device: obj_handle_t, info: *cons
     assert!(f != 0, "victorymetal.dll has no MTLDevice_newRenderPipelineState (or is not installed)");
     // SAFETY: the export has the signature winemetal.h declares.
     unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(obj_handle_t, *const WMTRenderPipelineInfo, *mut obj_handle_t) -> obj_handle_t>(f)(device, info, err_out) }
+}
+pub unsafe fn VM_NewRenderPipelineStageIn(device: obj_handle_t, info: *const WMTRenderPipelineInfo, stage_in_library: obj_handle_t, err_out: *mut obj_handle_t) -> obj_handle_t {
+    static F: OnceLock<usize> = OnceLock::new();
+    let f = *F.get_or_init(|| symbol(b"VM_NewRenderPipelineStageIn\0") as usize);
+    assert!(f != 0, "victorymetal.dll has no VM_NewRenderPipelineStageIn (or is not installed)");
+    // SAFETY: the export has the signature winemetal.h declares.
+    unsafe { core::mem::transmute::<usize, unsafe extern "C" fn(obj_handle_t, *const WMTRenderPipelineInfo, obj_handle_t, *mut obj_handle_t) -> obj_handle_t>(f)(device, info, stage_in_library, err_out) }
 }
 pub unsafe fn MTLDevice_newMeshRenderPipelineState(device: obj_handle_t, info: *const WMTMeshRenderPipelineInfo, err_out: *mut obj_handle_t) -> obj_handle_t {
     static F: OnceLock<usize> = OnceLock::new();

@@ -139,6 +139,11 @@ struct unixcall_mtldevice_newrenderpso {
   obj_handle_t ret_pso;
 };
 
+struct unixcall_renderpso_stage_in {
+  struct unixcall_mtldevice_newrenderpso pipeline;
+  obj_handle_t stage_in_library;
+};
+
 struct unixcall_mtldevice_newmeshrenderpso {
   obj_handle_t device;
   struct WMTConstMemoryPointer info;

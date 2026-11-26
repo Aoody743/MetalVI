@@ -10,6 +10,14 @@ int MSC_Compile(struct msc_compile_params *params) {
   return params->ret;
 }
 
+int MSC_CompileStageIn(struct msc_stage_in_params *params) {
+  params->compile->ret = -1;
+  params->compile->error[0] = 0;
+  if (WINE_UNIX_CALL(MSC_UNIX_COMPILE_STAGE_IN, params))
+    return -1;
+  return params->compile->ret;
+}
+
 void MSC_Free(void *ptr) {
   struct msc_free_params params = {ptr};
   WINE_UNIX_CALL(MSC_UNIX_FREE, &params);

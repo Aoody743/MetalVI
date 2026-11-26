@@ -20,8 +20,7 @@ static void fail(struct msc_compile_params *p, const char *what, IRError *err) {
   p->ret = -1;
 }
 
-NTSTATUS _MSC_Compile(void *args) {
-  struct msc_compile_params *p = args;
+static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params *stage_in) {
   p->metallib = NULL;
   p->metallib_len = 0;
   p->threadgroup[0] = p->threadgroup[1] = p->threadgroup[2] = 0;
@@ -137,6 +136,8 @@ NTSTATUS _MSC_Compile(void *args) {
   /* D3D12 semantics: reads past a view give 0, writes past it are dropped
    * (title memory is the GPU's memory here: a stray write is corruption). */
   IRCompilerSetCompatibilityFlags(compiler, IRCompatibilityFlagBoundsCheck);
+  if (stage_in)
+    IRCompilerSetStageInGenerationMode(compiler, IRStageInCodeGenerationModeUseSeparateStageInFunction);
   IRObject *input = IRObjectCreateFromDXIL(p->dxil, p->dxil_len, IRBytecodeOwnershipNone);
   IRObject *output = IRCompilerAllocCompileAndLink(compiler, NULL, input, &err);
   if (!output) {
@@ -157,8 +158,38 @@ NTSTATUS _MSC_Compile(void *args) {
         const char *e = IRShaderReflectionGetEntryPointFunctionName(named);
         if (e)
           snprintf(p->entry, sizeof(p->entry), "%s", e);
+        if (stage_in) {
+          IRVersionedInputLayoutDescriptor layout = {0};
+          layout.version = IRInputLayoutDescriptorVersion_1;
+          layout.desc_1_0.numElements = stage_in->count;
+          for (uint32_t i = 0; i < stage_in->count; ++i) {
+            const struct msc_input_element *e = &stage_in->elements[i];
+            layout.desc_1_0.semanticNames[i] = e->semantic;
+            layout.desc_1_0.inputElementDescs[i] = (IRInputElementDescriptor1){
+                .semanticIndex = e->semantic_index, .format = (IRFormat)e->format,
+                .inputSlot = e->slot, .alignedByteOffset = e->offset,
+                .inputSlotClass = e->per_instance ? IRInputClassificationPerInstanceData : IRInputClassificationPerVertexData,
+                .instanceDataStepRate = e->per_instance ? e->step_rate : 0,
+            };
+          }
+          IRMetalLibBinary *helper = IRMetalLibBinaryCreate();
+          if (helper && IRMetalLibSynthesizeStageInFunction(compiler, named, &layout, helper)) {
+            stage_in->metallib_len = IRMetalLibGetBytecodeSize(helper);
+            stage_in->metallib = malloc(stage_in->metallib_len);
+            if (stage_in->metallib)
+              IRMetalLibGetBytecode(helper, stage_in->metallib);
+          }
+          if (helper)
+            IRMetalLibBinaryDestroy(helper);
+        }
       }
       IRShaderReflectionDestroy(named);
+      if (stage_in && !stage_in->metallib) {
+        free(p->metallib);
+        p->metallib = NULL;
+        p->metallib_len = 0;
+        fail(p, "IRMetalLibSynthesizeStageInFunction", NULL);
+      }
       if (p->stage == IRShaderStageCompute) {
         IRShaderReflection *refl = IRShaderReflectionCreate();
         if (IRObjectGetReflection(output, IRShaderStageCompute, refl)) {
@@ -180,6 +211,21 @@ NTSTATUS _MSC_Compile(void *args) {
   IRCompilerDestroy(compiler);
   IRRootSignatureDestroy(sig);
   return STATUS_SUCCESS;
+}
+
+NTSTATUS _MSC_Compile(void *args) {
+  return compile(args, NULL);
+}
+
+NTSTATUS _MSC_CompileStageIn(void *args) {
+  struct msc_stage_in_params *p = args;
+  p->metallib = NULL;
+  p->metallib_len = 0;
+  if (p->compile->stage != IRShaderStageVertex || !p->count || p->count > 31) {
+    fail(p->compile, "invalid vertex input layout", NULL);
+    return STATUS_SUCCESS;
+  }
+  return compile(p->compile, p);
 }
 
 NTSTATUS _MSC_Free(void *args) {
