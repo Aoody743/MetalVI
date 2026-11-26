@@ -592,7 +592,7 @@ pub(crate) fn scissor(r: &windows::Win32::Foundation::RECT, width: u32, height: 
     let t = r.top.clamp(0, height as i32) as u64;
     let rr = r.right.clamp(0, width as i32) as u64;
     let b = r.bottom.clamp(0, height as i32) as u64;
-    (rr > l && b > t).then_some(sys::WMTScissorRect { x: l, y: t, width: rr - l, height: b - t })
+    (rr > l && b > t).then(|| sys::WMTScissorRect { x: l, y: t, width: rr - l, height: b - t })
 }
 
 /// The bytes MSC's vertex stages read at the draw-arguments bind point
@@ -687,6 +687,10 @@ pub(crate) fn stage_buffer(bind: u8, buffer: &Buffer, offset: u64, index: u8) ->
         _ => Render::MeshBuffer { buffer, offset, index },
     }
 }
+
+#[cfg(test)]
+#[path = "metal_draw_helper_tests.rs"]
+mod helper_tests;
 
 #[cfg(test)]
 mod tests {
