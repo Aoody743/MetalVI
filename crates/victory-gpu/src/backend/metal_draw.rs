@@ -229,6 +229,25 @@ impl MetalBackend {
             }
         }
         let mut desc = render_desc(&m);
+        // `VICTORY_METAL_DEBUG_FRAGMENT=<text>` (diagnosis): pipelines whose
+        // name contains <text> draw solid magenta instead of their pixel
+        // shader, telling a draw that rasterises nothing from one whose
+        // pixel shader writes zeros.
+        if let Ok(want) = std::env::var("VICTORY_METAL_DEBUG_FRAGMENT")
+            && !want.is_empty()
+            && p.name.contains(&want)
+            && fragment.is_some()
+        {
+            const DEBUG_MSL: &str = "#include <metal_stdlib>\nusing namespace metal;\nfragment float4 debug_fs() { return float4(1.0, 0.0, 1.0, 1.0); }\n";
+            match self.device.library_msl(DEBUG_MSL) {
+                Ok(lib) => {
+                    tracing::warn!(pipeline = %p.name, "Metal: debug fragment (solid magenta) in place of the pixel shader");
+                    // Its bindings stay: extra fragment buffers are harmless.
+                    fragment = Some((lib, "debug_fs".to_string()));
+                }
+                Err(e) => tracing::warn!(error = %e, "Metal: the debug fragment did not compile"),
+            }
+        }
         let frag = fragment.as_ref().map(|(l, n)| (l, n.as_str()));
         let make = |desc: &victory_metal::render::RenderPipelineDesc| match (geometry_config, &vertex, &mesh, &stage_in) {
             (Some(cfg), Some((vl, vn)), Some((ml, mn)), Some(sin)) => {
