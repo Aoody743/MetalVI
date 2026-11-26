@@ -30,6 +30,7 @@ pub enum Stage {
     Fragment = 2,
     Mesh = 5,
     Amplification = 6,
+    Geometry = 7,
     Compute = 8,
 }
 
@@ -130,6 +131,96 @@ struct StageInParams {
     metallib_len: u64,
 }
 
+#[repr(C)]
+struct GeometryParams {
+    stage_in: StageInParams,
+    vertex_output_size: u32,
+    max_input_primitives: u32,
+    max_payload_size: u32,
+    gs_instances: u32,
+}
+
+/// Reflection needed to construct a triangle-list geometry emulation pipeline.
+#[derive(Clone, Copy, Debug)]
+pub struct GeometryConfig {
+    pub vertex_output_size: u32,
+    pub max_input_primitives: u32,
+    pub max_payload_size: u32,
+}
+
+/// MSC's triangle-list object/mesh draw ABI (Metal 3 runtime helper).
+#[derive(Clone, Copy, Debug)]
+pub struct GeometryDraw {
+    pub args: [u8; 20],
+    pub info: [u8; 24],
+    pub groups: [u64; 3],
+    pub object_threads: [u64; 3],
+    pub mesh_threads: [u64; 3],
+}
+
+impl GeometryConfig {
+    pub(crate) fn object_vertex_stride(self) -> Option<u32> {
+        if self.vertex_output_size == 0 || !(1..=256).contains(&self.max_input_primitives)
+            || !(1..=16384).contains(&self.max_payload_size) {
+            return None;
+        }
+        let primitives = ((16384 - 32) / self.vertex_output_size / 3)
+            .min(1024 * self.max_input_primitives)
+            .min(256 / 3);
+        (primitives != 0).then_some(primitives * 3)
+    }
+
+    /// The index address points at the start of the index view; `first` is in elements.
+    /// Returns None for an empty draw or invalid config.
+    pub fn draw(
+        self, count: u32, instances: u32, first: u32, first_instance: u32,
+        index: Option<(u8, u64, i32)>,
+    ) -> Option<GeometryDraw> {
+        let stride = self.object_vertex_stride()?;
+        let count = count / 3 * 3;
+        if count == 0 || instances == 0 || instances > u16::MAX.into() {
+            return None;
+        }
+        let (args_words, index_type, address) = match index {
+            None => ([count, instances, first, first_instance, 0], 0u16, 0u64),
+            Some((t @ 0..=1, address, base)) if address != 0 => (
+                [count, instances, first, base as u32, first_instance], u16::from(t) + 1, address,
+            ),
+            _ => return None,
+        };
+        let mut args = [0; 20];
+        for (out, value) in args.chunks_exact_mut(4).zip(args_words) {
+            out.copy_from_slice(&value.to_le_bytes());
+        }
+        let mut info = [0; 24];
+        info[..2].copy_from_slice(&index_type.to_le_bytes());
+        info[2] = 3; // IRRuntimePrimitiveTypeTriangle
+        info[3] = 3; // threadsPerPatch
+        for (out, value) in info[4..16].chunks_exact_mut(2).zip([
+            self.max_input_primitives, stride, self.max_input_primitives, instances, stride / 3, 3,
+        ]) {
+            out.copy_from_slice(&(value as u16).to_le_bytes());
+        }
+        info[16..].copy_from_slice(&address.to_le_bytes());
+        Some(GeometryDraw {
+            args, info,
+            groups: [u64::from(count.div_ceil(stride)), u64::from(instances), 1],
+            object_threads: [u64::from(stride), 1, 1],
+            mesh_threads: [u64::from(self.max_input_primitives), 1, 1],
+        })
+    }
+}
+
+pub struct ConvertedGeometryVertex {
+    pub shader: ConvertedVertex,
+    pub vertex_output_size: u32,
+}
+
+pub struct ConvertedGeometry {
+    pub shader: Converted,
+    pub config: GeometryConfig,
+}
+
 /// One entry of MSC's IRRuntimeVertexBuffers table (vertex bind point 6).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VertexBufferEntry {
@@ -225,7 +316,7 @@ impl Converted {
 
 /// Converts one DXIL container (as victory-shader emits it) for `stage`.
 pub fn convert(dxil: &[u8], stage: Stage, params: &[RootParam], samplers: &[StaticSampler]) -> Result<Converted> {
-    convert_impl(dxil, stage, params, samplers, &[]).map(|(shader, _)| shader)
+    convert_impl(dxil, stage, params, samplers, &[], false).map(|(shader, _, _)| shader)
 }
 
 /// The vertex shader and its matching, layout-specific stage-in metallib.
@@ -242,6 +333,40 @@ pub fn convert_vertex_with_stage_in(
 ) -> Result<ConvertedVertex> {
     if inputs.is_empty() || inputs.len() > VERTEX_TABLE_SLOTS {
         return Err(Error("Metal stage-in needs 1 to 31 input elements".into()));
+    }
+    encode_vertex_inputs(inputs, |elements| {
+        let (shader, stage_in, _) = convert_impl(dxil, Stage::Vertex, params, samplers, elements, false)?;
+        Ok(ConvertedVertex { shader, stage_in })
+    })
+}
+
+pub fn convert_geometry_vertex(
+    dxil: &[u8], params: &[RootParam], samplers: &[StaticSampler], inputs: &[VertexInput<'_>],
+) -> Result<ConvertedGeometryVertex> {
+    encode_vertex_inputs(inputs, |elements| {
+        let (shader, stage_in, reflection) = convert_impl(dxil, Stage::Vertex, params, samplers, elements, true)?;
+        if reflection[0] == 0 || stage_in.is_empty() {
+            return Err(Error("missing object-stage vertex reflection or stage-in".into()));
+        }
+        Ok(ConvertedGeometryVertex { shader: ConvertedVertex { shader, stage_in }, vertex_output_size: reflection[0] })
+    })
+}
+
+pub fn convert_geometry(
+    dxil: &[u8], params: &[RootParam], samplers: &[StaticSampler], vertex_output_size: u32,
+) -> Result<ConvertedGeometry> {
+    let (shader, _, [_, max_input_primitives, max_payload_size, gs_instances]) =
+        convert_impl(dxil, Stage::Geometry, params, samplers, &[], true)?;
+    let config = GeometryConfig { vertex_output_size, max_input_primitives, max_payload_size };
+    if gs_instances != 1 || config.object_vertex_stride().is_none() {
+        return Err(Error(format!("unsupported triangle geometry reflection {config:?}, GS instances={gs_instances}")));
+    }
+    Ok(ConvertedGeometry { shader, config })
+}
+
+fn encode_vertex_inputs<T>(inputs: &[VertexInput<'_>], use_elements: impl FnOnce(&[RawInput]) -> Result<T>) -> Result<T> {
+    if inputs.len() > VERTEX_TABLE_SLOTS {
+        return Err(Error("Metal stage-in supports up to 31 input elements".into()));
     }
     let names: Vec<_> = inputs
         .iter()
@@ -265,8 +390,7 @@ pub fn convert_vertex_with_stage_in(
             })
         })
         .collect::<Result<_>>()?;
-    let (shader, stage_in) = convert_impl(dxil, Stage::Vertex, params, samplers, &elements)?;
-    Ok(ConvertedVertex { shader, stage_in })
+    use_elements(&elements)
 }
 
 fn convert_impl(
@@ -275,7 +399,8 @@ fn convert_impl(
     params: &[RootParam],
     samplers: &[StaticSampler],
     inputs: &[RawInput],
-) -> Result<(Converted, Vec<u8>)> {
+    geometry: bool,
+) -> Result<(Converted, Vec<u8>, [u32; 4])> {
     let raw: Vec<RawParam> = params
         .iter()
         .map(|p| match *p {
@@ -306,14 +431,26 @@ fn convert_impl(
         ret: -1,
         error: [0; 1024],
     };
-    let mut stage_in = StageInParams {
-        compile: &mut p,
-        elements: inputs.as_ptr(),
-        count: inputs.len() as u32,
-        metallib: core::ptr::null_mut(),
-        metallib_len: 0,
+    let mut options = GeometryParams {
+        stage_in: StageInParams {
+            compile: &mut p, elements: inputs.as_ptr(), count: inputs.len() as u32,
+            metallib: core::ptr::null_mut(), metallib_len: 0,
+        },
+        vertex_output_size: 0,
+        max_input_primitives: 0,
+        max_payload_size: 0,
+        gs_instances: 0,
     };
-    let ret = if inputs.is_empty() {
+    let ret = if geometry {
+        let f = sys::symbol(b"MSC_CompileGeometry\0");
+        if f.is_null() {
+            return Err(Error("victorymetal.dll has no MSC_CompileGeometry (rebuild native/victorymetal)".into()));
+        }
+        // SAFETY: signature from msc.h; input pointers live through the call.
+        unsafe {
+            core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut GeometryParams) -> i32>(f)(&mut options)
+        }
+    } else if inputs.is_empty() {
         // SAFETY: every pointer is valid for the call; the unix side fills the outs.
         unsafe { MSC_Compile(&mut p) }
     } else {
@@ -323,7 +460,7 @@ fn convert_impl(
         }
         // SAFETY: signature from msc.h. The input layout and names outlive the call.
         unsafe {
-            core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut StageInParams) -> i32>(f)(&mut stage_in)
+            core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut StageInParams) -> i32>(f)(&mut options.stage_in)
         }
     };
     if ret != 0 || p.metallib.is_null() {
@@ -341,7 +478,7 @@ fn convert_impl(
         }
     };
     let metallib = copy(p.metallib, p.metallib_len);
-    let helper = copy(stage_in.metallib, stage_in.metallib_len);
+    let helper = copy(options.stage_in.metallib, options.stage_in.metallib_len);
     let layout = p.locations[..p.num_locations as usize]
         .iter()
         .map(|l| crate::ir::Location {
@@ -357,7 +494,7 @@ fn convert_impl(
         entry: c_text(&p.entry),
         threadgroup: p.threadgroup,
         top_level: crate::ir::TopLevel::new(layout, p.top_level_size),
-    }, helper))
+    }, helper, [options.vertex_output_size, options.max_input_primitives, options.max_payload_size, options.gs_instances]))
 }
 
 impl Device {
@@ -391,5 +528,80 @@ impl Device {
     pub fn compute_pipeline_converted(&self, converted: &Converted) -> Result<ComputePipeline> {
         let library = self.library(&converted.metallib)?;
         self.compute_pipeline_from_library(&library, &converted.entry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn u16_at(bytes: &[u8], at: usize) -> u16 {
+        u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap())
+    }
+
+    fn u32_at(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    fn u64_at(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn geometry_config_stride_and_validation() {
+        // vertex_output_size=16 -> (16384-32)/16/3 = 340, capped to 256/3 = 85 prims -> 255 verts.
+        let cfg = GeometryConfig { vertex_output_size: 16, max_input_primitives: 32, max_payload_size: 16256 };
+        assert_eq!(cfg.object_vertex_stride(), Some(255));
+
+        // Large vertex output (e.g. 256 bytes): (16384-32)/256/3 = 21 prims -> 63 verts.
+        let big = GeometryConfig { vertex_output_size: 256, max_input_primitives: 32, max_payload_size: 16384 };
+        assert_eq!(big.object_vertex_stride(), Some(63));
+
+        // Invalid configs.
+        assert_eq!(GeometryConfig { vertex_output_size: 0, max_input_primitives: 32, max_payload_size: 1024 }.object_vertex_stride(), None);
+        assert_eq!(GeometryConfig { vertex_output_size: 16, max_input_primitives: 0, max_payload_size: 1024 }.object_vertex_stride(), None);
+        assert_eq!(GeometryConfig { vertex_output_size: 16, max_input_primitives: 257, max_payload_size: 1024 }.object_vertex_stride(), None);
+        assert_eq!(GeometryConfig { vertex_output_size: 16, max_input_primitives: 32, max_payload_size: 0 }.object_vertex_stride(), None);
+        assert_eq!(GeometryConfig { vertex_output_size: 16, max_input_primitives: 32, max_payload_size: 16385 }.object_vertex_stride(), None);
+        assert_eq!(GeometryConfig { vertex_output_size: 6000, max_input_primitives: 32, max_payload_size: 16384 }.object_vertex_stride(), None);
+    }
+
+    #[test]
+    fn geometry_draw_abi_layout_direct_and_indexed() {
+        let cfg = GeometryConfig { vertex_output_size: 16, max_input_primitives: 32, max_payload_size: 16256 };
+
+        // Direct draw spanning 2 object threadgroups (288 > 255) and 3 instances, truncated from 290 to 288.
+        let direct = cfg.draw(290, 3, 6, 2, None).unwrap();
+        assert_eq!(direct.groups, [2, 3, 1]);
+        assert_eq!(direct.object_threads, [255, 1, 1]);
+        assert_eq!(direct.mesh_threads, [32, 1, 1]);
+        assert_eq!([0, 4, 8, 12, 16].map(|o| u32_at(&direct.args, o)), [288, 3, 6, 2, 0]);
+        assert_eq!(u16_at(&direct.info, 0), 0); // kIRNonIndexedDraw
+        assert_eq!(direct.info[2], 3); // IRRuntimePrimitiveTypeTriangle
+        assert_eq!(direct.info[3], 3); // threadsPerPatch
+        assert_eq!(u16_at(&direct.info, 4), 32); // maxInputPrimitivesPerMeshThreadgroup
+        assert_eq!(u16_at(&direct.info, 6), 255); // objectThreadgroupVertexStride
+        assert_eq!(u16_at(&direct.info, 8), 32); // meshThreadgroupPrimitiveStride
+        assert_eq!(u16_at(&direct.info, 10), 3); // gsInstanceCount
+        assert_eq!(u16_at(&direct.info, 12), 85); // patchesPerObjectThreadgroup
+        assert_eq!(u16_at(&direct.info, 14), 3); // inputControlPointsPerPatch
+        assert_eq!(u64_at(&direct.info, 16), 0);
+
+        // R16 indexed with negative baseVertex, R32 indexed.
+        let r16 = cfg.draw(6, 1, 1, 0, Some((0, 0x1234_5678_9abc, -5))).unwrap();
+        assert_eq!([0, 4, 8, 12, 16].map(|o| u32_at(&r16.args, o)), [6, 1, 1, (-5i32) as u32, 0]);
+        assert_eq!(u16_at(&r16.info, 0), 1);
+        assert_eq!(u64_at(&r16.info, 16), 0x1234_5678_9abc);
+
+        let r32 = cfg.draw(3, 2, 4, 5, Some((1, 0xdead_beef, 10))).unwrap();
+        assert_eq!([0, 4, 8, 12, 16].map(|o| u32_at(&r32.args, o)), [3, 2, 4, 10, 5]);
+        assert_eq!(u16_at(&r32.info, 0), 2);
+        assert_eq!(u64_at(&r32.info, 16), 0xdead_beef);
+
+        // Rejections.
+        assert!(cfg.draw(2, 1, 0, 0, None).is_none());
+        assert!(cfg.draw(3, 0, 0, 0, None).is_none());
+        assert!(cfg.draw(3, 1, 0, 0, Some((0, 0, 0))).is_none());
+        assert!(cfg.draw(3, 1, 0, 0, Some((2, 0x1000, 0))).is_none());
     }
 }

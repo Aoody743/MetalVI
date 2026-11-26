@@ -23,6 +23,15 @@ void MSC_Free(void *ptr) {
   WINE_UNIX_CALL(MSC_UNIX_FREE, &params);
 }
 
+int MSC_CompileGeometry(struct msc_geometry_params *params) {
+  struct msc_compile_params *compile = params->stage_in.compile;
+  compile->ret = -1;
+  compile->error[0] = 0;
+  if (WINE_UNIX_CALL(MSC_UNIX_COMPILE_GEOMETRY, params))
+    return -1;
+  return compile->ret;
+}
+
 uint64_t VM_GpuResourceID(uint64_t handle) {
   struct vm_resource_id_params params = {handle, 0};
   if (WINE_UNIX_CALL(VM_UNIX_GPU_RESOURCE_ID, &params))

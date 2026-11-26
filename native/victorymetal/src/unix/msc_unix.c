@@ -20,7 +20,8 @@ static void fail(struct msc_compile_params *p, const char *what, IRError *err) {
   p->ret = -1;
 }
 
-static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params *stage_in) {
+static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params *stage_in,
+                        struct msc_geometry_params *geometry) {
   p->metallib = NULL;
   p->metallib_len = 0;
   p->threadgroup[0] = p->threadgroup[1] = p->threadgroup[2] = 0;
@@ -136,6 +137,10 @@ static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params
   /* D3D12 semantics: reads past a view give 0, writes past it are dropped
    * (title memory is the GPU's memory here: a stray write is corruption). */
   IRCompilerSetCompatibilityFlags(compiler, IRCompatibilityFlagBoundsCheck);
+  if (geometry && p->stage == IRShaderStageVertex) {
+    IRCompilerEnableGeometryAndTessellationEmulation(compiler, true);
+    IRCompilerSetInputTopology(compiler, IRInputTopologyTriangle);
+  }
   if (stage_in)
     IRCompilerSetStageInGenerationMode(compiler, IRStageInCodeGenerationModeUseSeparateStageInFunction);
   IRObject *input = IRObjectCreateFromDXIL(p->dxil, p->dxil_len, IRBytecodeOwnershipNone);
@@ -158,6 +163,23 @@ static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params
         const char *e = IRShaderReflectionGetEntryPointFunctionName(named);
         if (e)
           snprintf(p->entry, sizeof(p->entry), "%s", e);
+        if (geometry && p->stage == IRShaderStageVertex) {
+          IRVersionedVSInfo vs;
+          if (IRShaderReflectionCopyVertexInfo(named, IRReflectionVersion_1_0, &vs)) {
+            geometry->vertex_output_size = vs.info_1_0.vertex_output_size_in_bytes;
+            IRShaderReflectionReleaseVertexInfo(&vs);
+          }
+        } else if (geometry && p->stage == IRShaderStageGeometry) {
+          IRVersionedGSInfo gs;
+          if (IRShaderReflectionCopyGeometryInfo(named, IRReflectionVersion_1_0, &gs)) {
+            if (gs.info_1_0.input_primitive == IRInputPrimitiveTriangle) {
+              geometry->max_input_primitives = gs.info_1_0.max_input_primitives_per_mesh_threadgroup;
+              geometry->max_payload_size = gs.info_1_0.max_payload_size_in_bytes;
+              geometry->gs_instances = gs.info_1_0.instance_count;
+            }
+            IRShaderReflectionReleaseGeometryInfo(&gs);
+          }
+        }
         if (stage_in) {
           IRVersionedInputLayoutDescriptor layout = {0};
           layout.version = IRInputLayoutDescriptorVersion_1;
@@ -214,7 +236,7 @@ static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params
 }
 
 NTSTATUS _MSC_Compile(void *args) {
-  return compile(args, NULL);
+  return compile(args, NULL, NULL);
 }
 
 NTSTATUS _MSC_CompileStageIn(void *args) {
@@ -225,7 +247,21 @@ NTSTATUS _MSC_CompileStageIn(void *args) {
     fail(p->compile, "invalid vertex input layout", NULL);
     return STATUS_SUCCESS;
   }
-  return compile(p->compile, p);
+  return compile(p->compile, p, NULL);
+}
+
+NTSTATUS _MSC_CompileGeometry(void *args) {
+  struct msc_geometry_params *p = args;
+  struct msc_stage_in_params *s = &p->stage_in;
+  s->metallib = NULL;
+  s->metallib_len = 0;
+  p->vertex_output_size = p->max_input_primitives = p->max_payload_size = p->gs_instances = 0;
+  if (s->compile->stage == IRShaderStageVertex && s->count <= 31)
+    return compile(s->compile, s, p);
+  if (s->compile->stage == IRShaderStageGeometry && !s->count)
+    return compile(s->compile, NULL, p);
+  fail(s->compile, "invalid triangle geometry-emulation stage or vertex layout", NULL);
+  return STATUS_SUCCESS;
 }
 
 NTSTATUS _MSC_Free(void *args) {

@@ -382,6 +382,68 @@ impl Device {
             Some((lib, name)) => Some(function(lib, name)?),
             None => None,
         };
+        let mut info = Self::mesh_pipeline_info(desc);
+        info.mesh_function = mesh.handle();
+        info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
+        let mut err = 0;
+        // SAFETY: info is valid for the call; returns owned (+1).
+        let pso = Object::adopt(unsafe { sys::MTLDevice_newMeshRenderPipelineState(self.handle(), &info, &mut err) })
+            .ok_or_else(|| error_text(err, "newMeshRenderPipelineState"))?;
+        Ok(RenderPipeline(pso))
+    }
+
+    /// An MSC vertex/geometry pair, linked as an object/mesh render pipeline.
+    pub fn geometry_render_pipeline_desc(
+        &self, vertex: (&Object, &str), mesh: (&Object, &str), stage_in: &Object,
+        fragment: Option<(&Object, &str)>, desc: &RenderPipelineDesc, config: crate::msc::GeometryConfig,
+    ) -> Result<RenderPipeline> {
+        let _pool = Pool::new();
+        let cstring = |name: &str| std::ffi::CString::new(name).map_err(|_| Error("function name has a NUL".into()));
+        let function = |lib: &Object, name: &str| -> Result<Object> {
+            let c = cstring(name)?;
+            // SAFETY: library and string live through the call; returns owned (+1).
+            Object::adopt(unsafe { sys::MTLLibrary_newFunction(lib.handle(), c.as_ptr()) })
+                .ok_or_else(|| Error(format!("no function {name:?} in the library")))
+        };
+        let fragment = fragment.map(|(l, n)| function(l, n)).transpose()?;
+        let vertex_name = cstring(vertex.1)?;
+        let geometry_name = cstring(mesh.1)?;
+        if config.object_vertex_stride().is_none() {
+            return Err(Error("invalid MSC geometry configuration".into()));
+        }
+        #[repr(C)]
+        struct Functions {
+            vertex_library: obj_handle_t,
+            geometry_library: obj_handle_t,
+            stage_in_library: obj_handle_t,
+            vertex_name: sys::WMTConstMemoryPointer,
+            geometry_name: sys::WMTConstMemoryPointer,
+            vertex_output_size: u32,
+        }
+        let functions = Functions {
+            vertex_library: vertex.0.handle(), geometry_library: mesh.0.handle(), stage_in_library: stage_in.handle(),
+            vertex_name: sys::WMTConstMemoryPointer { ptr: vertex_name.as_ptr().cast() },
+            geometry_name: sys::WMTConstMemoryPointer { ptr: geometry_name.as_ptr().cast() },
+            vertex_output_size: config.vertex_output_size,
+        };
+        let mut info = Self::mesh_pipeline_info(desc);
+        info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
+        info.payload_memory_length = config.max_payload_size.saturating_add(32).min(16384) as u16;
+        let raw = sys::symbol(b"VM_NewGeometryPipeline\0");
+        if raw.is_null() {
+            return Err(Error("victorymetal.dll has no VM_NewGeometryPipeline (rebuild native/victorymetal)".into()));
+        }
+        let mut err = 0;
+        // SAFETY: the shared C structs and all pointed-to data live through the call.
+        let pso = unsafe {
+            let f: unsafe extern "C" fn(obj_handle_t, *const sys::WMTMeshRenderPipelineInfo, *const Functions, *mut obj_handle_t) -> obj_handle_t =
+                core::mem::transmute(raw);
+            f(self.handle(), &info, &functions, &mut err)
+        };
+        Object::adopt(pso).map(RenderPipeline).ok_or_else(|| error_text(err, "VM_NewGeometryPipeline"))
+    }
+
+    fn mesh_pipeline_info(desc: &RenderPipelineDesc) -> sys::WMTMeshRenderPipelineInfo {
         // SAFETY: all-zero is the default for the info struct.
         let mut info: sys::WMTMeshRenderPipelineInfo = unsafe { std::mem::zeroed() };
         for (out, c) in info.colors.iter_mut().zip(&desc.colors) {
@@ -400,13 +462,7 @@ impl Device {
         info.raster_sample_count = desc.sample_count.max(1);
         info.depth_pixel_format = sys::WMTPixelFormat(desc.depth_format);
         info.stencil_pixel_format = sys::WMTPixelFormat(desc.stencil_format);
-        info.mesh_function = mesh.handle();
-        info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
-        let mut err = 0;
-        // SAFETY: info is valid for the call; returns owned (+1).
-        let pso = Object::adopt(unsafe { sys::MTLDevice_newMeshRenderPipelineState(self.handle(), &info, &mut err) })
-            .ok_or_else(|| error_text(err, "newMeshRenderPipelineState"))?;
-        Ok(RenderPipeline(pso))
+        info
     }
 
     /// A depth-stencil state from `desc`.

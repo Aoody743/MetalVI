@@ -62,6 +62,8 @@ pub(crate) struct MetalGraphics {
     pub(crate) vertex_slots: u32,
     pub(crate) mesh: bool,
     pub(crate) mesh_threads: [u64; 3],
+    /// Non-none when compiled as a triangle-list geometry-emulation pipeline (for RECTANGLES).
+    pub(crate) geometry: Option<victory_metal::msc::GeometryConfig>,
     /// What its targets must be (Metal pixel formats; 0 none) and their
     /// sample count.
     pub(crate) colors: [u32; 8],
@@ -73,6 +75,7 @@ pub(crate) struct MetalGraphics {
 pub(crate) const STAGE_VERTEX: u8 = 0;
 pub(crate) const STAGE_FRAGMENT: u8 = 1;
 pub(crate) const STAGE_MESH: u8 = 2;
+pub(crate) const STAGE_OBJECT: u8 = 3;
 
 /// Dual-source blend factors (Metal 15..=18) as their first-source kind: a
 /// pixel shader that does not write the second output (MSC gives it none)
@@ -88,28 +91,61 @@ fn single_source(f: u8) -> u8 {
 }
 
 impl MetalBackend {
-    /// The Metal pipeline of title graphics pipeline `key`, made on first use.
-    pub(crate) fn graphics_pipeline(&self, key: usize, p: &HostPipeline) -> Option<Arc<MetalGraphics>> {
-        if let Some(known) = self.graphics.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+    /// The Metal pipeline of title graphics pipeline `key` (normal or rectangle-emulation), made on first use.
+    pub(crate) fn graphics_pipeline(&self, key: usize, p: &HostPipeline, rects: bool) -> Option<Arc<MetalGraphics>> {
+        if let Some(known) = self.graphics.lock().unwrap_or_else(|e| e.into_inner()).get(&(key, rects)) {
             return known.clone();
         }
-        let made = self.make_graphics(p);
+        let made = self.make_graphics(p, rects);
         if made.is_err() {
             dump_failed(p);
         }
         if let Err(e) = &made {
             static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
-                tracing::warn!(pipeline = %p.name, error = %e, "no Metal pipeline for a graphics pipeline");
+                tracing::warn!(pipeline = %p.name, rects, error = %e, "no Metal pipeline for a graphics pipeline");
             }
         }
         let made = made.ok().map(Arc::new);
-        self.graphics.lock().unwrap_or_else(|e| e.into_inner()).insert(key, made.clone());
+        self.graphics.lock().unwrap_or_else(|e| e.into_inner()).insert((key, rects), made.clone());
         made
     }
 
-    fn make_graphics(&self, p: &HostPipeline) -> Result<MetalGraphics, String> {
-        use victory_metal::msc::{Stage, VERTEX_TABLE_SLOTS, VertexInput, convert_vertex_with_stage_in};
+    fn vertex_inputs<'a>(
+        input: &'a map::PipelineStateInput,
+        p: &HostPipeline,
+        vertex_slots: &mut u32,
+    ) -> Result<Vec<victory_metal::msc::VertexInput<'a>>, String> {
+        use victory_metal::msc::{VERTEX_TABLE_SLOTS, VertexInput};
+        if input.elements.is_empty() {
+            return Ok(Vec::new());
+        }
+        if input.elements.len() != p.inputs.len() {
+            return Err("Metal vertex layout disagrees with resolved host layout".into());
+        }
+        let mut elements = Vec::with_capacity(input.elements.len());
+        for (source, resolved) in input.elements.iter().zip(&p.inputs) {
+            if source.input_slot as usize >= VERTEX_TABLE_SLOTS
+                || !matches!(source.slot_class, 0 | 1)
+                || crate::resource::element(resolved.format).is_none()
+            {
+                return Err("unsupported Metal vertex input".into());
+            }
+            *vertex_slots |= 1u32 << source.input_slot;
+            elements.push(VertexInput {
+                semantic: &source.semantic_name,
+                semantic_index: source.semantic_index,
+                format: resolved.format,
+                slot: source.input_slot,
+                offset: resolved.offset,
+                instance_step_rate: resolved.per_instance.then_some(source.instance_step_rate),
+            });
+        }
+        Ok(elements)
+    }
+
+    fn make_graphics(&self, p: &HostPipeline, rects: bool) -> Result<MetalGraphics, String> {
+        use victory_metal::msc::{Stage, convert_geometry, convert_geometry_vertex, convert_vertex_with_stage_in};
         let input = p.metal_input.as_ref().ok_or("no graphics state kept")?;
         let m = map::map_pipeline_state(input);
         map::check_integer_blending(&m.color)?;
@@ -119,64 +155,87 @@ impl MetalBackend {
         let mut fragment = None;
         let mut mesh = None;
         let mut stage_in = None;
+        let mut geometry_config = None;
         let mut vertex_slots = 0;
         let mut mesh_threads = [1u64; 3];
-        for s in &p.stages {
-            let (stage, bind) = match s.shader.stage {
-                "vertex" => (Stage::Vertex, STAGE_VERTEX),
-                "pixel" => (Stage::Fragment, STAGE_FRAGMENT),
-                "mesh" => (Stage::Mesh, STAGE_MESH),
-                other => return Err(format!("{other} stage")),
-            };
-            let host = &s.translated().host;
-            let c = if stage == Stage::Vertex && !input.elements.is_empty() {
-                if input.elements.len() != p.inputs.len() {
-                    return Err("Metal vertex layout disagrees with resolved host layout".into());
-                }
-                let mut elements = Vec::with_capacity(input.elements.len());
-                for (source, resolved) in input.elements.iter().zip(&p.inputs) {
-                    if source.input_slot as usize >= VERTEX_TABLE_SLOTS
-                        || !matches!(source.slot_class, 0 | 1)
-                        || crate::resource::element(resolved.format).is_none()
-                    {
-                        return Err("unsupported Metal vertex input".into());
+        if rects {
+            if p.mesh {
+                return Err("mesh pipeline cannot draw rectangles".into());
+            }
+            let vs_stage = p.stages.iter().find(|s| s.shader.stage == "vertex").ok_or("no vertex stage for rectangles")?;
+            let ps_stage = p.stages.iter().find(|s| s.shader.stage == "pixel");
+            let vs_host = &vs_stage.translated().host;
+            let ps_host = ps_stage.map(|s| &s.translated().host);
+            let gs_dxil = victory_shader::emit::rect_list_gs(&vs_host.dxil, ps_host.map(|h| &h.dxil[..]))
+                .map_err(|e| format!("rect_list_gs: {e}"))?;
+            let elements = Self::vertex_inputs(input, p, &mut vertex_slots)?;
+            let v = convert_geometry_vertex(&vs_host.dxil, &root_params(vs_host), &static_samplers(vs_host), &elements)
+                .map_err(|e| e.to_string())?;
+            let g = convert_geometry(&gs_dxil, &[], &[], v.vertex_output_size).map_err(|e| e.to_string())?;
+            let olib = self.device.library(&v.shader.shader.metallib).map_err(|e| e.to_string())?;
+            let sin = self.device.library(&v.shader.stage_in).map_err(|e| e.to_string())?;
+            let mlib = self.device.library(&g.shader.metallib).map_err(|e| e.to_string())?;
+            let f = ps_host.map(|h| convert_cached(h, Stage::Fragment)).transpose()?;
+            let flib = f.as_ref().map(|c| self.device.library(&c.metallib).map_err(|e| e.to_string())).transpose()?;
+            for s in &p.stages {
+                match s.shader.stage {
+                    "vertex" => stages.push((v.shader.shader.top_level.clone(), STAGE_OBJECT)),
+                    "pixel" => {
+                        if let Some(c) = &f {
+                            stages.push((c.top_level.clone(), STAGE_FRAGMENT));
+                        }
                     }
-                    vertex_slots |= 1u32 << source.input_slot;
-                    elements.push(VertexInput {
-                        semantic: &source.semantic_name,
-                        semantic_index: source.semantic_index,
-                        format: resolved.format,
-                        slot: source.input_slot,
-                        offset: resolved.offset,
-                        instance_step_rate: resolved.per_instance.then_some(source.instance_step_rate),
-                    });
+                    other => return Err(format!("{other} stage")),
                 }
-                // Kept with this graphics pipeline's layout, never in the
-                // cache for ordinary vertex shaders.
-                let compiled = convert_vertex_with_stage_in(&host.dxil, &root_params(host), &static_samplers(host), &elements)
-                    .map_err(|e| e.to_string())?;
-                stage_in = Some(self.device.library(&compiled.stage_in).map_err(|e| e.to_string())?);
-                compiled.shader
-            } else {
-                convert_cached(host, stage)?
-            };
-            let lib = self.device.library(&c.metallib).map_err(|e| e.to_string())?;
-            stages.push((c.top_level.clone(), bind));
-            match bind {
-                STAGE_VERTEX => vertex = Some((lib, c.entry)),
-                STAGE_FRAGMENT => fragment = Some((lib, c.entry)),
-                _ => {
-                    mesh_threads = c.threadgroup.map(|t| u64::from(t.max(1)));
-                    mesh = Some((lib, c.entry));
+            }
+            vertex = Some((olib, v.shader.shader.entry));
+            mesh = Some((mlib, g.shader.entry));
+            stage_in = Some(sin);
+            if let (Some(lib), Some(c)) = (flib, f) {
+                fragment = Some((lib, c.entry));
+            }
+            geometry_config = Some(g.config);
+        } else {
+            for s in &p.stages {
+                let (stage, bind) = match s.shader.stage {
+                    "vertex" => (Stage::Vertex, STAGE_VERTEX),
+                    "pixel" => (Stage::Fragment, STAGE_FRAGMENT),
+                    "mesh" => (Stage::Mesh, STAGE_MESH),
+                    other => return Err(format!("{other} stage")),
+                };
+                let host = &s.translated().host;
+                let c = if stage == Stage::Vertex && !input.elements.is_empty() {
+                    let elements = Self::vertex_inputs(input, p, &mut vertex_slots)?;
+                    // Kept with this graphics pipeline's layout, never in the
+                    // cache for ordinary vertex shaders.
+                    let compiled = convert_vertex_with_stage_in(&host.dxil, &root_params(host), &static_samplers(host), &elements)
+                        .map_err(|e| e.to_string())?;
+                    stage_in = Some(self.device.library(&compiled.stage_in).map_err(|e| e.to_string())?);
+                    compiled.shader
+                } else {
+                    convert_cached(host, stage)?
+                };
+                let lib = self.device.library(&c.metallib).map_err(|e| e.to_string())?;
+                stages.push((c.top_level.clone(), bind));
+                match bind {
+                    STAGE_VERTEX => vertex = Some((lib, c.entry)),
+                    STAGE_FRAGMENT => fragment = Some((lib, c.entry)),
+                    _ => {
+                        mesh_threads = c.threadgroup.map(|t| u64::from(t.max(1)));
+                        mesh = Some((lib, c.entry));
+                    }
                 }
             }
         }
         let mut desc = render_desc(&m);
         let frag = fragment.as_ref().map(|(l, n)| (l, n.as_str()));
-        let make = |desc: &victory_metal::render::RenderPipelineDesc| match (&vertex, &mesh, &stage_in) {
-            (Some((l, n)), _, Some(stage_in)) => self.device.render_pipeline_stage_in((l, n), frag, desc, stage_in),
-            (Some((l, n)), _, None) => self.device.render_pipeline_desc((l, n), frag, desc),
-            (None, Some((l, n)), None) => self.device.mesh_render_pipeline_desc((l, n), frag, desc),
+        let make = |desc: &victory_metal::render::RenderPipelineDesc| match (geometry_config, &vertex, &mesh, &stage_in) {
+            (Some(cfg), Some((vl, vn)), Some((ml, mn)), Some(sin)) => {
+                self.device.geometry_render_pipeline_desc((vl, vn), (ml, mn), sin, frag, desc, cfg)
+            }
+            (None, Some((l, n)), _, Some(stage_in)) => self.device.render_pipeline_stage_in((l, n), frag, desc, stage_in),
+            (None, Some((l, n)), _, None) => self.device.render_pipeline_desc((l, n), frag, desc),
+            (None, None, Some((l, n)), None) => self.device.mesh_render_pipeline_desc((l, n), frag, desc),
             _ => Err(victory_metal::Error("no vertex or mesh stage".into())),
         };
         let pso = match make(&desc) {
@@ -224,8 +283,9 @@ impl MetalBackend {
             ],
             bias: [r.depth_bias.depth_bias as f32, r.depth_bias.slope_scale, r.depth_bias.clamp],
             stages,
-            mesh: mesh.is_some(),
+            mesh: mesh.is_some() && geometry_config.is_none(),
             mesh_threads,
+            geometry: geometry_config,
             colors: desc.colors.map(|c| c.pixel_format),
             depth: desc.depth_format,
             stencil: desc.stencil_format,
@@ -392,6 +452,7 @@ pub(crate) enum DrawKind {
     Vertices { count: u32, instances: u32, first: u32, first_instance: u32 },
     Indexed { count: u32, instances: u32, base: i32, first_instance: u32, buffer: Buffer, offset: u32, index_type: u8 },
     Mesh { groups: [u64; 3] },
+    Geometry { draw: victory_metal::msc::GeometryDraw, _index: Option<Buffer> },
 }
 
 /// One draw as recorded into a title list.
@@ -522,7 +583,7 @@ pub(crate) fn draw_params(kind: &DrawKind) -> ([u32; 5], u16) {
             // The direct Metal IR helper uses the buffer byte offset, not the D3D index number.
             ([count, instances, offset, base as u32, first_instance], u16::from(index_type) + 1)
         }
-        DrawKind::Mesh { .. } => ([0; 5], 0),
+        DrawKind::Mesh { .. } | DrawKind::Geometry { .. } => ([0; 5], 0),
     }
 }
 
@@ -596,6 +657,7 @@ pub(crate) fn stage_buffer(bind: u8, buffer: &Buffer, offset: u64, index: u8) ->
     match bind {
         STAGE_VERTEX => Render::VertexBuffer { buffer, offset, index },
         STAGE_FRAGMENT => Render::FragmentBuffer { buffer, offset, index },
+        STAGE_OBJECT => Render::ObjectBuffer { buffer, offset, index },
         _ => Render::MeshBuffer { buffer, offset, index },
     }
 }

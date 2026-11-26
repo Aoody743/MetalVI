@@ -398,6 +398,19 @@ MTLBlitCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_b
   UNIX_CALL(36, &params);
 }
 
+WINEMETAL_API obj_handle_t
+VM_NewGeometryPipeline(obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info,
+                       const struct WMTGeometryFunctions *functions, obj_handle_t *err_out) {
+  struct unixcall_geometry_pso params = {0};
+  params.pipeline.device = device;
+  WMT_MEMPTR_SET(params.pipeline.info, info);
+  WMT_MEMPTR_SET(params.functions, functions);
+  UNIX_CALL(VM_UNIX_RENDER_PIPELINE_GEOMETRY, &params);
+  if (err_out)
+    *err_out = params.pipeline.ret_error;
+  return params.pipeline.ret_pso;
+}
+
 WINEMETAL_API void
 MTLComputeCommandEncoder_encodeCommands(obj_handle_t encoder, const struct wmtcmd_base *cmd_head) {
   struct unixcall_generic_obj_cmd_noret params;

@@ -867,6 +867,16 @@ WINEMETAL_API obj_handle_t MTLDevice_newMeshRenderPipelineState(
     obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info, obj_handle_t *err_out
 );
 
+struct WMTGeometryFunctions {
+  obj_handle_t vertex_library, geometry_library, stage_in_library;
+  struct WMTConstMemoryPointer vertex_name, geometry_name;
+  uint32_t vertex_output_size;
+};
+
+WINEMETAL_API obj_handle_t VM_NewGeometryPipeline(obj_handle_t device,
+    const struct WMTMeshRenderPipelineInfo *info, const struct WMTGeometryFunctions *functions,
+    obj_handle_t *err_out);
+
 struct WMTSize {
   uint64_t width;
   uint64_t height;

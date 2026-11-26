@@ -2035,12 +2035,13 @@ impl State {
         use crate::backend::metal_draw::{DrawDrop, DrawKind, DrawKindIn, MetalDraw, StageBind, count_draw};
         let Some(m) = crate::backend::metal::backend() else { return };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
-        let Some(g) = m.graphics_pipeline(self.pipeline, p) else {
+        let rects = self.topology == RECTANGLES && !p.mesh && !matches!(kind, DrawKindIn::Mesh { .. });
+        let Some(g) = m.graphics_pipeline(self.pipeline, p, rects) else {
             count_draw(DrawDrop::NoPipeline);
             return;
         };
         let _pool = victory_metal::Pool::new();
-        let primitive = if g.mesh {
+        let primitive = if g.mesh || g.geometry.is_some() {
             3
         } else {
             match crate::backend::metal_map::map_topology(self.topology as i32) {
@@ -2098,34 +2099,76 @@ impl State {
                 }
             }
         }
-        let kind = match kind {
-            DrawKindIn::Vertices { count, instances, first, first_instance } => DrawKind::Vertices { count, instances, first, first_instance },
-            DrawKindIn::Indexed { count, instances, first, base, first_instance } => {
-                let v = self.index;
-                let (index_type, index_width) = match v.format {
-                    57 => (0, 2u64), // R16_UINT
-                    42 => (1, 4),    // R32_UINT
-                    _ => {
+        let kind = if let Some(config) = g.geometry {
+            match kind {
+                DrawKindIn::Vertices { count, instances, first, first_instance } => {
+                    let Some(draw) = config.draw(count, instances, first, first_instance, None) else {
+                        count_draw(DrawDrop::Topology);
+                        return;
+                    };
+                    DrawKind::Geometry { draw, _index: None }
+                }
+                DrawKindIn::Indexed { count, instances, first, base, first_instance } => {
+                    let v = self.index;
+                    let (index_type, index_width) = match v.format {
+                        57 => (0u8, 2u64), // R16_UINT
+                        42 => (1, 4),      // R32_UINT
+                        _ => {
+                            count_draw(DrawDrop::IndexBuffer);
+                            return;
+                        }
+                    };
+                    let first_byte = u64::from(first) * index_width;
+                    if v.address == 0 || v.address % index_width != 0 || first_byte + u64::from(count) * index_width > u64::from(v.size) {
                         count_draw(DrawDrop::IndexBuffer);
                         return;
                     }
-                };
-                let first_byte = u64::from(first) * index_width;
-                if v.address == 0 || v.address % index_width != 0 || first_byte + u64::from(count) * index_width > u64::from(v.size) {
-                    count_draw(DrawDrop::IndexBuffer);
+                    let Some((buffer, view_offset)) = m.chunks().resident_window(v.address, u64::from(v.size)) else {
+                        count_draw(DrawDrop::IndexBuffer);
+                        return;
+                    };
+                    let address = buffer.gpu_address + view_offset;
+                    let Some(draw) = config.draw(count, instances, first, first_instance, Some((index_type, address, base))) else {
+                        count_draw(DrawDrop::Topology);
+                        return;
+                    };
+                    DrawKind::Geometry { draw, _index: Some(buffer) }
+                }
+                DrawKindIn::Mesh { .. } => {
+                    count_draw(DrawDrop::Topology);
                     return;
                 }
-                let Some((buffer, view_offset)) = m.chunks().window_buffer(v.address, u64::from(v.size)) else {
-                    count_draw(DrawDrop::IndexBuffer);
-                    return;
-                };
-                let Ok(offset) = u32::try_from(view_offset + first_byte) else {
-                    count_draw(DrawDrop::IndexBuffer);
-                    return;
-                };
-                DrawKind::Indexed { count, instances, base, first_instance, buffer, offset, index_type }
             }
-            DrawKindIn::Mesh { groups } => DrawKind::Mesh { groups: [u64::from(groups), 1, 1] },
+        } else {
+            match kind {
+                DrawKindIn::Vertices { count, instances, first, first_instance } => DrawKind::Vertices { count, instances, first, first_instance },
+                DrawKindIn::Indexed { count, instances, first, base, first_instance } => {
+                    let v = self.index;
+                    let (index_type, index_width) = match v.format {
+                        57 => (0, 2u64), // R16_UINT
+                        42 => (1, 4),    // R32_UINT
+                        _ => {
+                            count_draw(DrawDrop::IndexBuffer);
+                            return;
+                        }
+                    };
+                    let first_byte = u64::from(first) * index_width;
+                    if v.address == 0 || v.address % index_width != 0 || first_byte + u64::from(count) * index_width > u64::from(v.size) {
+                        count_draw(DrawDrop::IndexBuffer);
+                        return;
+                    }
+                    let Some((buffer, view_offset)) = m.chunks().window_buffer(v.address, u64::from(v.size)) else {
+                        count_draw(DrawDrop::IndexBuffer);
+                        return;
+                    };
+                    let Ok(offset) = u32::try_from(view_offset + first_byte) else {
+                        count_draw(DrawDrop::IndexBuffer);
+                        return;
+                    };
+                    DrawKind::Indexed { count, instances, base, first_instance, buffer, offset, index_type }
+                }
+                DrawKindIn::Mesh { groups } => DrawKind::Mesh { groups: [u64::from(groups), 1, 1] },
+            }
         };
         let full = victory_metal::sys::WMTViewport {
             originX: 0.0,
@@ -2759,7 +2802,7 @@ impl State {
                 (vertices, first)
             };
             #[cfg(windows)]
-            if crate::backend::metal_draw::draws_on() && !rects {
+            if crate::backend::metal_draw::draws_on() {
                 self.metal_draw(crate::backend::metal_draw::DrawKindIn::Vertices { count: vertices, instances, first, first_instance });
             }
             #[cfg(feature = "diagnostics")]

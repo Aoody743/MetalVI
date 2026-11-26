@@ -610,9 +610,8 @@ _VM_NewRenderPipelineStageIn(void *obj) {
 }
 
 static NTSTATUS
-_MTLDevice_newMeshRenderPipelineState(void *obj) {
-  struct unixcall_mtldevice_newmeshrenderpso *params = obj;
-  const struct WMTMeshRenderPipelineInfo *info = params->info.ptr;
+new_mesh_render_pipeline(struct unixcall_mtldevice_newmeshrenderpso *params,
+                         const struct WMTMeshRenderPipelineInfo *info, id<MTLFunction> stage_in) {
   MTLMeshRenderPipelineDescriptor *descriptor = [[MTLMeshRenderPipelineDescriptor alloc] init];
 
   for (unsigned i = 0; i < 8; i++) {
@@ -652,6 +651,12 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   descriptor.meshFunction = (id<MTLFunction>)info->mesh_function;
   descriptor.fragmentFunction = (id<MTLFunction>)info->fragment_function;
   descriptor.payloadMemoryLength = info->payload_memory_length;
+  if (stage_in) {
+    MTLLinkedFunctions *linked = [[MTLLinkedFunctions alloc] init];
+    linked.functions = @[stage_in];
+    descriptor.objectLinkedFunctions = linked;
+    [linked release];
+  }
 
   descriptor.meshThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->mesh_tgsize_is_multiple_of_sgwidth;
   descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth = info->object_tgsize_is_multiple_of_sgwidth;
@@ -682,6 +687,62 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
   }
 #endif
   [descriptor release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_newMeshRenderPipelineState(void *obj) {
+  struct unixcall_mtldevice_newmeshrenderpso *params = obj;
+  return new_mesh_render_pipeline(params, params->info.ptr, nil);
+}
+
+static NTSTATUS
+_VM_NewGeometryPipeline(void *obj) {
+  struct unixcall_geometry_pso *params = obj;
+  const struct WMTGeometryFunctions *f = params->functions.ptr;
+  struct WMTMeshRenderPipelineInfo info = *(const struct WMTMeshRenderPipelineInfo *)params->pipeline.info.ptr;
+  if (!f || !f->vertex_library || !f->geometry_library || !f->stage_in_library ||
+      !f->vertex_name.ptr || !f->geometry_name.ptr) {
+    params->pipeline.ret_pso = 0;
+    params->pipeline.ret_error = (obj_handle_t)[[NSError alloc] initWithDomain:@"victorymetal.geometry" code:2 userInfo:
+        @{NSLocalizedDescriptionKey: @"Invalid geometry pipeline function arguments"}];
+    return STATUS_SUCCESS;
+  }
+  MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
+  BOOL tess = NO;
+  [values setConstantValue:&tess type:MTLDataTypeBool withName:@"tessellationEnabled"];
+  NSString *object_name = [NSString stringWithFormat:@"%s.dxil_irconverter_object_shader",
+                           (const char *)f->vertex_name.ptr];
+  NSError *err = nil;
+  id<MTLFunction> object = [(id<MTLLibrary>)f->vertex_library newFunctionWithName:object_name
+                                                             constantValues:values error:&err];
+  id<MTLFunction> mesh = nil, helper = nil;
+  if (object) {
+    err = nil;
+    [values setConstantValue:&f->vertex_output_size type:MTLDataTypeInt withName:@"vertex_shader_output_size_fc"];
+    NSString *name = [NSString stringWithUTF8String:f->geometry_name.ptr];
+    mesh = [(id<MTLLibrary>)f->geometry_library newFunctionWithName:name constantValues:values error:&err];
+  }
+  if (mesh) {
+    id<MTLLibrary> lib = (id<MTLLibrary>)f->stage_in_library;
+    NSString *name = lib.functionNames.firstObject;
+    if (name)
+      helper = [lib newFunctionWithName:name];
+  }
+  if (helper) {
+    info.object_function = (obj_handle_t)object;
+    info.mesh_function = (obj_handle_t)mesh;
+    new_mesh_render_pipeline(&params->pipeline, &info, helper);
+  } else {
+    params->pipeline.ret_pso = 0;
+    params->pipeline.ret_error = (obj_handle_t)(err ? [err retain] :
+        [[NSError alloc] initWithDomain:@"victorymetal.geometry" code:1 userInfo:
+         @{NSLocalizedDescriptionKey: @"Missing geometry-emulation shader or object stage-in"}]);
+  }
+  [helper release];
+  [mesh release];
+  [object release];
+  [values release];
   return STATUS_SUCCESS;
 }
 
@@ -3223,6 +3284,7 @@ extern NTSTATUS _MSC_Compile(void *args);
 extern NTSTATUS _MSC_Free(void *args);
 extern NTSTATUS _VM_GpuResourceID(void *args);
 extern NTSTATUS _MSC_CompileStageIn(void *args);
+extern NTSTATUS _MSC_CompileGeometry(void *args);
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -3377,6 +3439,8 @@ const void *__wine_unix_call_funcs[] = {
     &_VM_GpuResourceID,
     &_MSC_CompileStageIn,
     &_VM_NewRenderPipelineStageIn,
+    &_MSC_CompileGeometry,
+    &_VM_NewGeometryPipeline,
 };
 
 #ifndef DXMT_NATIVE
@@ -3532,5 +3596,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_VM_GpuResourceID,
     &_MSC_CompileStageIn,
     &_VM_NewRenderPipelineStageIn,
+    &_MSC_CompileGeometry,
+    &_VM_NewGeometryPipeline,
 };
 #endif

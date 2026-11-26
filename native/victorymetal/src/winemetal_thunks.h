@@ -151,6 +151,11 @@ struct unixcall_mtldevice_newmeshrenderpso {
   obj_handle_t ret_pso;
 };
 
+struct unixcall_geometry_pso {
+  struct unixcall_mtldevice_newmeshrenderpso pipeline;
+  struct WMTConstMemoryPointer functions;
+};
+
 struct unixcall_generic_obj_cmd_noret {
   obj_handle_t encoder;
   struct WMTConstMemoryPointer cmd_head;

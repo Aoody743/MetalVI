@@ -208,8 +208,8 @@ pub(crate) struct MetalBackend {
     sampler_states: Mutex<HashMap<[u32; 11], victory_metal::sampler::SamplerState>>,
     /// The GPU detile kernels, compiled on first use (`None`: they failed).
     detiler: OnceLock<Option<super::metal_detile::Detiler>>,
-    /// Graphics pipelines by title pipeline object (`None`: refused).
-    pub(crate) graphics: Mutex<HashMap<usize, Option<Arc<super::metal_draw::MetalGraphics>>>>,
+    /// Graphics pipelines by (title pipeline object, rectangle emulation) (`None`: refused).
+    pub(crate) graphics: Mutex<HashMap<(usize, bool), Option<Arc<super::metal_draw::MetalGraphics>>>>,
     /// Depth-stencil states by description.
     pub(crate) depth_stencils: Mutex<HashMap<victory_metal::render::DepthStencilDesc, victory_metal::render::DepthStencilState>>,
     /// Render target views in another pixel format, by (resource, format).
@@ -332,7 +332,7 @@ impl MetalBackend {
                         tables += s.tables.len();
                         blob += s.top.len().next_multiple_of(256);
                     }
-                    blob += 512;
+                    blob += if d.pso.geometry.is_some() { 1536 } else { 512 };
                 }
                 MetalOp::Clear(_) => {}
             }
@@ -369,28 +369,42 @@ impl MetalBackend {
             next_byte = (at + bytes.len()).next_multiple_of(256);
             at as u64
         };
-        // Per op: dispatch top bytes, or per draw its stages' top offsets
-        // and its draw-argument / index-type offsets.
+        // Per op: dispatch top bytes, or per draw its stages' top offsets,
+        // draw-argument / uniforms-or-info offsets, and geometry vertex-table / zero-TLAB offsets.
         let mut dispatch_tops: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
-        let mut draw_offsets: Vec<(Vec<u64>, u64, u64)> = Vec::with_capacity(ops.len());
+        let mut draw_offsets: Vec<(Vec<u64>, u64, u64, u64, u64)> = Vec::with_capacity(ops.len());
         for op in ops {
             match &**op {
                 MetalOp::Dispatch(c) => {
                     dispatch_tops.push(patch(&c.top, &c.tables));
-                    draw_offsets.push((Vec::new(), 0, 0));
+                    draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
                 MetalOp::Draw(d) => {
                     let tops = d.stages.iter().map(|s| { let t = patch(&s.top, &s.tables); put(&t) }).collect();
-                    let (args, index_type) = draw_params(&d.kind);
-                    let args: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    let a = put(&args);
-                    let u = put(&index_type.to_le_bytes());
+                    let (a, u, vt, zt) = match &d.kind {
+                        DrawKind::Geometry { draw, .. } => {
+                            let a = put(&draw.args);
+                            let u = put(&draw.info);
+                            let vt = if let Some(fetch) = &d.vertex {
+                                put(&fetch.table)
+                            } else {
+                                put(&[0u8; msc::VERTEX_TABLE_SLOTS * 16])
+                            };
+                            let zt = put(&[0u8; 8]);
+                            (a, u, vt, zt)
+                        }
+                        _ => {
+                            let (args, index_type) = draw_params(&d.kind);
+                            let args: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
+                            (put(&args), put(&index_type.to_le_bytes()), 0, 0)
+                        }
+                    };
                     dispatch_tops.push(Vec::new());
-                    draw_offsets.push((tops, a, u));
+                    draw_offsets.push((tops, a, u, vt, zt));
                 }
                 MetalOp::Clear(_) => {
                     dispatch_tops.push(Vec::new());
-                    draw_offsets.push((Vec::new(), 0, 0));
+                    draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
             }
         }
@@ -483,7 +497,7 @@ impl MetalBackend {
                         steps.push(Render::BlendColorStencil { color: d.blend, stencil_ref: d.stencil_ref });
                         steps.push(Render::Viewports { viewports: std::slice::from_ref(&d.viewport) });
                         steps.push(Render::Scissors { rects: std::slice::from_ref(&d.scissor) });
-                        let (tops, args, uniforms) = &draw_offsets[i];
+                        let (tops, args, uniforms, vtable, zero_tlab) = &draw_offsets[i];
                         for (s, &top) in d.stages.iter().zip(tops) {
                             if let Some(b) = &s.heap {
                                 steps.push(stage_buffer(s.bind, b, 0, msc::DESCRIPTOR_HEAP_BIND_POINT));
@@ -493,14 +507,24 @@ impl MetalBackend {
                             }
                             if !s.top.is_empty() {
                                 steps.push(stage_buffer(s.bind, &r.buffer, top, msc::ARGUMENT_BUFFER_BIND_POINT));
+                            } else if s.bind == super::metal_draw::STAGE_OBJECT {
+                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *zero_tlab, index: msc::ARGUMENT_BUFFER_BIND_POINT });
                             }
                             if s.bind == STAGE_VERTEX {
                                 // MSC's draw arguments and index type (IRRuntimeDrawPrimitives).
-                                steps.push(stage_buffer(s.bind, &r.buffer, *args, 4));
-                                steps.push(stage_buffer(s.bind, &r.buffer, *uniforms, 5));
+                                steps.push(stage_buffer(s.bind, &r.buffer, *args, msc::DRAW_ARGUMENTS_BIND_POINT));
+                                steps.push(stage_buffer(s.bind, &r.buffer, *uniforms, msc::DRAW_UNIFORMS_BIND_POINT));
                                 if let Some(fetch) = &d.vertex {
                                     steps.push(Render::VertexBytes { bytes: &fetch.table, index: msc::VERTEX_TABLE_BIND_POINT });
                                 }
+                            } else if s.bind == super::metal_draw::STAGE_OBJECT {
+                                // MSC's geometry-emulation object/mesh ABI.
+                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *args, index: msc::DRAW_ARGUMENTS_BIND_POINT });
+                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *uniforms, index: msc::DRAW_UNIFORMS_BIND_POINT });
+                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *vtable, index: msc::VERTEX_TABLE_BIND_POINT });
+                                steps.push(Render::MeshBuffer { buffer: &r.buffer, offset: *zero_tlab, index: msc::ARGUMENT_BUFFER_BIND_POINT });
+                                steps.push(Render::MeshBuffer { buffer: &r.buffer, offset: *args, index: msc::DRAW_ARGUMENTS_BIND_POINT });
+                                steps.push(Render::MeshBuffer { buffer: &r.buffer, offset: *uniforms, index: msc::DRAW_UNIFORMS_BIND_POINT });
                             }
                         }
                         let primitive = sys::WMTPrimitiveType(d.primitive);
@@ -523,6 +547,11 @@ impl MetalBackend {
                                 base_instance: *first_instance,
                             },
                             DrawKind::Mesh { groups } => Render::DrawMesh { groups: *groups, object_threads: [1, 1, 1], mesh_threads: g.mesh_threads },
+                            DrawKind::Geometry { draw, .. } => Render::DrawMesh {
+                                groups: draw.groups,
+                                object_threads: draw.object_threads,
+                                mesh_threads: draw.mesh_threads,
+                            },
                         });
                         i += 1;
                     }
