@@ -1093,6 +1093,9 @@ static SNAPS: Mutex<Vec<(usize, usize, usize)>> = Mutex::new(Vec::new());
 /// its lists go to the card: takes the snapshots [`Shadow::writing`] noted.
 /// Nothing to do without the switch.
 pub(crate) fn take_snapshots() {
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     let snaps = std::mem::take(&mut *SNAPS.lock().unwrap_or_else(|e| e.into_inner()));
     if snaps.is_empty() {
         return;
@@ -1140,6 +1143,9 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    if crate::watch::skip_d3d12_host() {
+        return vec![Vec::new(); work.len()];
+    }
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
@@ -2169,6 +2175,9 @@ impl Shadow {
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if crate::watch::skip_d3d12_host() {
+            return;
+        }
         let len = len.min(self.start + self.len - address);
         list.defer_refresh(self, address as usize, len as usize);
     }
@@ -2225,7 +2234,7 @@ impl Shadow {
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        if self.place.is_some() || crate::watch::skip_d3d12_host() {
             return;
         }
         let len = len.min(self.left(address));
@@ -2241,7 +2250,7 @@ impl Shadow {
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
     pub(crate) fn writing(&self, address: usize, len: usize) {
-        if self.place.is_some() {
+        if self.place.is_some() || crate::watch::skip_d3d12_host() {
             return;
         }
         let range = (address, address + len);
@@ -2359,7 +2368,7 @@ impl Shadow {
     /// [`Shadow::copy_back`]; `found`, if given, is the pieces of the range
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
-        if self.place.is_some() {
+        if self.place.is_some() || crate::watch::skip_d3d12_host() {
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -2846,7 +2855,7 @@ impl Shadow {
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
         // In place: the card reads title memory itself.
-        if self.place.is_some() {
+        if self.place.is_some() || crate::watch::skip_d3d12_host() {
             return 0;
         }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
@@ -3612,6 +3621,9 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if crate::watch::skip_d3d12_host() {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map
@@ -4041,4 +4053,21 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod metal_cut_tests {
+    use super::{buffer_extent, register, unregister};
+
+    #[test]
+    fn buffer_extent_works_without_shadow_allocation() {
+        let resource = 0xfeed_0001usize;
+        let start = 0x7_0000_0000u64;
+        let len = 0x4_0000u64;
+        register(resource, start, len);
+        assert_eq!(buffer_extent(start + 0x1000), Some((start, start + len)));
+        assert_eq!(buffer_extent(start + len), None);
+        unregister(resource, start);
+        assert_eq!(buffer_extent(start + 0x1000), None);
+    }
 }

@@ -24,6 +24,10 @@ use std::time::Instant;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+};
 use crate::{HleModule, hle_export};
 
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -342,6 +346,12 @@ struct Trace {
     taken: usize,
     takes: u32,
     partial_takes: u32,
+    /// Times `pump` filled the ring completely (`writable` cleared to 0).
+    full_waits: u32,
+    /// Times `advance_read` requested more blocks than were decoded in the ring.
+    ring_underruns: u32,
+    /// Times `advance_read` found the ring completely empty (`available == 0`).
+    ring_empty_takes: u32,
     frames: u32,
     bad_frames: u32,
     /// The loudest sample written.
@@ -433,6 +443,9 @@ impl Xma {
                 taken: 0,
                 takes: 0,
                 partial_takes: 0,
+                full_waits: 0,
+                ring_underruns: 0,
+                ring_empty_takes: 0,
                 frames: 0,
                 bad_frames: 0,
                 peak: 0,
@@ -458,6 +471,9 @@ impl Xma {
             taken = t.taken * SAMPLES_PER_BLOCK / context.channels(),
             takes = t.takes,
             partial_takes = t.partial_takes,
+            full_waits = t.full_waits,
+            ring_underruns = t.ring_underruns,
+            ring_empty_takes = t.ring_empty_takes,
             frames = t.frames,
             bad_frames = t.bad_frames,
             peak = t.peak,
@@ -476,8 +492,16 @@ impl Xma {
         // The decoder writes the same words.
         let mut slot = lock(&self.voices[index as usize]);
         let size = context.field(0, 22, 5).max(1);
+        let read_before = context.field(9, 0, 5);
+        let write = context.field(0, 27, 5);
+        let writable = context.field(1, 31, 1);
+        let available = if writable == 0 {
+            size
+        } else {
+            (write + size - read_before) % size
+        };
         // The count is the title's: reduced first, so the sum stays small.
-        let read = (context.field(9, 0, 5) + blocks % size) % size;
+        let read = (read_before + blocks % size) % size;
         context.set_field(9, 0, 5, read);
         if blocks > 0 {
             context.set_field(1, 31, 1, 1);
@@ -487,6 +511,14 @@ impl Xma {
             t.taken += blocks as usize;
             t.takes += 1;
             t.partial_takes += u32::from(blocks < size);
+            if blocks > 0 && !voice.ended {
+                if available == 0 {
+                    t.ring_empty_takes += 1;
+                    t.ring_underruns += 1;
+                } else if available < blocks {
+                    t.ring_underruns += 1;
+                }
+            }
         }
         drop(slot);
         wake_decoder();
@@ -536,6 +568,7 @@ fn pump(context: Context, voice: &mut Voice) {
         if write == context.field(9, 0, 5) {
             // Full: nothing more until the title advances its read block.
             context.set_field(1, 31, 1, 0);
+            voice.trace.full_waits += 1;
         }
     }
 }
@@ -660,10 +693,17 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    #[cfg(windows)]
+                    // SAFETY: best-effort priority bump so CPU contention does
+                    // not starve XMA ring refills; ignore failure under Wine.
+                    unsafe {
+                        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                    }
                     loop {
                         xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono;
+                        // poll at <= half that period so a missed refill is short.
+                        std::thread::park_timeout(std::time::Duration::from_millis(1));
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
@@ -1078,6 +1118,64 @@ mod tests {
         submit(DISABLE_XMA, &[1]);
         assert_eq!(produced(&xma()), None);
         (m.release)(acp);
+        ApuFree(input);
+        ApuFree(output);
+        assert_eq!(AcpHalReleaseShapeContexts(), S_OK);
+    }
+
+    #[test]
+    fn xma_distinguishes_full_ring_from_underrun() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let mut request = ShapeContexts {
+            counts: [0, 0, 0, 0, 4, 0],
+            arrays: [std::ptr::null_mut(); 6],
+            apu: [0; 6],
+        };
+        assert_eq!(AcpHalAllocateShapeContexts(&mut request), S_OK);
+        let context = Context(request.arrays[4].cast::<u32>().wrapping_add(16));
+
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1000, 0x800, 1), S_OK);
+        let stream = silent_stream();
+        unsafe { std::ptr::copy_nonoverlapping(stream.as_ptr(), input.cast(), stream.len()) };
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, 0x400, 0x100, 2),
+            S_OK
+        );
+
+        context.set(0, 2 | (1 << 20) | (4 << 22));
+        context.set(1, (1 << 31) | (3 << 27));
+        context.set(2, 32);
+        context.set(5, input_apu);
+        context.set(7, output_apu);
+
+        // Use a local Xma so the global `wake_decoder()` thread cannot race
+        // with deterministic pump/advance_read steps.
+        let local = Xma {
+            array: request.arrays[4] as usize,
+            voices: (0..4).map(|_| Mutex::new(None)).collect(),
+        };
+        local.enable(1);
+        local.pump();
+        let stats = || {
+            lock(&local.voices[1])
+                .as_ref()
+                .map(|v| (v.trace.full_waits, v.trace.ring_underruns, v.trace.ring_empty_takes))
+        };
+        // Full ring sets writable=0 and counts full_waits=1, zero underruns.
+        assert_eq!(stats(), Some((1, 0, 0)));
+
+        // Consume all 4 blocks when full -> no underrun.
+        local.advance_read(1, 4);
+        assert_eq!(stats(), Some((1, 0, 0)));
+
+        // Ring is now empty (read == write, writable == 1); advancing before
+        // pump refills it records a real ring underrun and empty take.
+        local.advance_read(1, 2);
+        assert_eq!(stats(), Some((1, 1, 1)));
+
+        local.disable(1);
         ApuFree(input);
         ApuFree(output);
         assert_eq!(AcpHalReleaseShapeContexts(), S_OK);

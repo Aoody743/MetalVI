@@ -120,6 +120,46 @@ pub fn fault_tracking() -> bool {
     *ENABLED
 }
 
+/// Pure decision helper for [`skip_d3d12_host`].
+pub(crate) fn should_skip_d3d12_host(
+    metal: Option<&str>,
+    metal_draw: Option<&str>,
+    metal_present: Option<&str>,
+    cuts: Option<&str>,
+) -> bool {
+    match cuts {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    metal == Some("compute") && metal_draw == Some("1") && metal_present == Some("1")
+}
+
+/// Whether D3D12-only host copies, descriptor mirroring, and write-watch
+/// tracking can be skipped because Metal draws and presents the window
+/// (`VICTORY_METAL=compute`, `VICTORY_METAL_DRAW=1`, `VICTORY_METAL_PRESENT=1`),
+/// or `VICTORY_METAL_CPU_CUTS=1` (`0` forces D3D12 host work on).
+pub(crate) fn skip_d3d12_host() -> bool {
+    static SKIP: LazyLock<bool> = LazyLock::new(|| {
+        let val = |k: &str| std::env::var(k).ok();
+        let skip = should_skip_d3d12_host(
+            val("VICTORY_METAL").as_deref(),
+            val("VICTORY_METAL_DRAW").as_deref(),
+            val("VICTORY_METAL_PRESENT").as_deref(),
+            val("VICTORY_METAL_CPU_CUTS").as_deref(),
+        );
+        if skip {
+            tracing::info!("Metal CPU cuts active: skipping D3D12 host copies, descriptor mirroring, and write-watch guards");
+        }
+        skip
+    });
+    *SKIP
+}
+
+fn has_guards() -> bool {
+    fault_tracking() || view_guard()
+}
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.
@@ -169,7 +209,7 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
-    if !fault_tracking() {
+    if !fault_tracking() || skip_d3d12_host() {
         return;
     }
     let mut pieces: Vec<(usize, usize)> = ranges
@@ -269,7 +309,7 @@ pub(crate) fn once() -> bool {
 /// refresh) as [`ask_ahead`] does, and lets that asking stand until
 /// [`ask_once_end`].
 pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
-    if !once() || !fault_tracking() {
+    if !once() || !fault_tracking() || skip_d3d12_host() {
         return;
     }
     ask_once_end();
@@ -401,7 +441,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    if !fault_tracking() {
+    if !fault_tracking() || skip_d3d12_host() {
         return None;
     }
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -789,10 +829,14 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
-    // The length is the title's (`fread`'s size times count, saturated).
-    open(&mut guards(), at, at.saturating_add(len));
-    // A placed texture there changes with no descriptor written.
-    crate::descriptor::host::remapped(at, len);
+    if has_guards() && !skip_d3d12_host() {
+        // The length is the title's (`fread`'s size times count, saturated).
+        open(&mut guards(), at, at.saturating_add(len));
+    }
+    if !skip_d3d12_host() {
+        // A placed texture there changes with no descriptor written.
+        crate::descriptor::host::remapped(at, len);
+    }
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
@@ -992,9 +1036,11 @@ pub(crate) fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading>
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     note_range_changed(at, len);
-    // A placed texture there arrives, goes or changes with no descriptor
-    // written.
-    crate::descriptor::host::remapped(at, len);
+    if !skip_d3d12_host() {
+        // A placed texture there arrives, goes or changes with no descriptor
+        // written.
+        crate::descriptor::host::remapped(at, len);
+    }
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
@@ -1002,6 +1048,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // The Metal backend's no-copy wrappers there still show the old pages.
     #[cfg(windows)]
     crate::backend::metal::title_memory_remapped(at as u64, len as u64);
+    if !has_guards() {
+        return;
+    }
     let mut g = guards();
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
@@ -1673,5 +1722,17 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn metal_host_skip_gate_matrix() {
+        use super::should_skip_d3d12_host;
+        assert!(!should_skip_d3d12_host(None, None, None, None));
+        assert!(!should_skip_d3d12_host(Some("compute"), None, None, None));
+        assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), None, None));
+        assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), Some("0"), None));
+        assert!(should_skip_d3d12_host(Some("compute"), Some("1"), Some("1"), None));
+        assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), Some("1"), Some("0")));
+        assert!(should_skip_d3d12_host(None, None, None, Some("1")));
     }
 }

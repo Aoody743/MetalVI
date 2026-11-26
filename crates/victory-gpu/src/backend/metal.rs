@@ -935,7 +935,7 @@ impl MetalBackend {
 /// Where Metal Shader Converter's output for a shader and root signature is
 /// kept between runs: `VICTORY_METAL_CACHE`, else `<VICTORY_CACHE_DIR>/metal`.
 /// The name is a hash of the DXIL, the signature and the converter version.
-fn msc_cache_path(
+pub(crate) fn msc_cache_path(
     dxil: &[u8],
     params: &[victory_metal::msc::RootParam],
     samplers: &[victory_metal::msc::StaticSampler],

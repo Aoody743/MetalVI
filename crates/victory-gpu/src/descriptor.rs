@@ -77,6 +77,9 @@ impl Heap {
     /// costs over 100 MB of commit, which its boot needs for its page pool.
     #[cfg(windows)]
     pub(crate) fn host(&self) -> Option<&host::HostHeap> {
+        if crate::watch::skip_d3d12_host() {
+            return None;
+        }
         if let Some(h) = self.host.get() {
             return h.as_ref();
         }
@@ -145,6 +148,9 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
@@ -635,6 +641,9 @@ static MADE_LATE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new(
 /// texture's own lock: nothing else is locked here).
 #[cfg(windows)]
 pub(crate) fn texture_made(resource: usize) {
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     MADE_LATE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -645,6 +654,9 @@ pub(crate) fn texture_made(resource: usize) {
 /// which has no host copy: it waits for one.
 #[cfg(windows)]
 fn wait_for(resource: usize, handle: u64) {
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     /// A texture with more slots waiting than this is in use for all we
     /// know (its views are being copied about): its host copy is made.
     const MOST: usize = 64;
@@ -671,6 +683,9 @@ fn wait_for(resource: usize, handle: u64) {
 /// the thread that submits: a slot is read when a list runs.
 #[cfg(windows)]
 pub(crate) fn make_waiting() {
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     let made = std::mem::take(&mut *MADE_LATE.lock().unwrap_or_else(|e| e.into_inner()));
     for resource in made {
         let handles = WAITING

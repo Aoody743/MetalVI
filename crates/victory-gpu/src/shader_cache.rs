@@ -79,6 +79,7 @@ fn build() -> &'static [u8; 32] {
         // the translations an earlier run had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_HALF_SYNC",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
@@ -255,7 +256,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
     out
 }
 
-fn decode(bytes: &[u8]) -> Option<HostShader> {
+pub fn decode(bytes: &[u8]) -> Option<HostShader> {
     struct Reader<'a>(&'a [u8]);
     impl<'a> Reader<'a> {
         fn take(&mut self, n: usize) -> Option<&'a [u8]> {

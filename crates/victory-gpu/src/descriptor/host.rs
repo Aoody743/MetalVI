@@ -279,6 +279,9 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     /// Ranges kept until a pass takes them.
     /// (A world's first minutes note tens of thousands between two passes:
     /// 131,072 were dropped in one run at the 32,768 there were.)
@@ -725,6 +728,9 @@ pub(crate) const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        if crate::watch::skip_d3d12_host() {
+            return None;
+        }
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -927,7 +933,7 @@ impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
-        if self.sampler || n == 0 || n > self.dynamic {
+        if crate::watch::skip_d3d12_host() || self.sampler || n == 0 || n > self.dynamic {
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -983,6 +989,9 @@ impl HostHeap {
     /// ([`TextureQueue::due`]), and the queue's counts
     /// ([`TextureQueue::census`]).
     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+        if crate::watch::skip_d3d12_host() {
+            return (Vec::new(), [0; 5]);
+        }
         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
     }
@@ -1012,6 +1021,9 @@ impl HostHeap {
     /// rest of the run. A changed one goes back into the queue. Returns how
     /// many were unchanged and changed, and how many wait for a look.
     pub(crate) fn texture_slots_rechecked(&self, frame: u64) -> [u64; 3] {
+        if crate::watch::skip_d3d12_host() {
+            return [0; 3];
+        }
         /// Looks per pass (each reads 48 KiB), and the time they may take.
         const MOST: usize = 256;
         const SPAN: std::time::Duration = std::time::Duration::from_millis(15);
@@ -1098,6 +1110,9 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        if crate::watch::skip_d3d12_host() {
+            return 0;
+        }
         let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -1138,7 +1153,7 @@ impl HostHeap {
             Ok("count") => 1,
             _ => 2,
         });
-        if mode == 0 || self.sampler {
+        if mode == 0 || self.sampler || crate::watch::skip_d3d12_host() {
             return;
         }
         let now = crate::host::now_ms();
@@ -1662,6 +1677,9 @@ impl HostHeap {
     /// views are made only for draws (`for_draw`), which also copy their
     /// data: a host copy of a buffer is made on first use.
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<View> {
+        if crate::watch::skip_d3d12_host() {
+            return None;
+        }
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the
             // host heap seen so far.

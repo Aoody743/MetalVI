@@ -500,6 +500,32 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Moves `block`'s terminator (if already terminated) to `after`, updating any
+    /// already-populated `phi` nodes in its successor blocks so `after` becomes the
+    /// incoming block. Used when inserting a multi-block sync loop at `block`.
+    pub fn move_term(&mut self, block: usize, after: usize) {
+        let Some(term) = self.blocks[block].term.take() else {
+            return;
+        };
+        self.blocks[after].term = Some(term);
+        let succs: Vec<usize> = match term {
+            Term::Br(t) => vec![t],
+            Term::CondBr(_, t, f) => vec![t, f],
+            Term::Ret => Vec::new(),
+        };
+        for succ in succs {
+            for &pi in &self.blocks[succ].phis {
+                if let Op::Phi(ref mut incoming) = self.insts[pi as usize].op {
+                    for (_, b) in incoming.iter_mut() {
+                        if *b == block {
+                            *b = after;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)

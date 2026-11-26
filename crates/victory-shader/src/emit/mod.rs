@@ -383,12 +383,13 @@ pub fn emit(
                 }
             }
         }
-        // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
-        // waves: this form puts group barriers inside branches and loops, and runs 121-124
-        // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // With per-console-wave bounded `half_sync` enabled (default on wave32 hosts),
+        // widening per-wave branches around cross-lane/LDS code is safe across any
+        // multiple of 64 threads without risking hardware barrier hangs.
+        // (`VICTORY_WAVE_WIDE=0` or `VICTORY_WAVE_HALF_SYNC=0` disables it.)
+        let half_sync = lower::half_sync_on();
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE")
+            .map_or(half_sync, |v| v == "1");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -525,7 +526,9 @@ fn widen(
     match native.io {
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
-        crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs)
+            if cs.threads.iter().product::<u32>() == 64
+                || lower::half_sync_on() && cs.threads.iter().product::<u32>().is_multiple_of(64) => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -1713,15 +1716,168 @@ mod atomic_tests {
     }
 
     #[test]
-    fn compute_image_atomic64_keeps_native_atomic_when_pixel_fallback_enabled() {
+    fn compute_image_atomic64_uav_fallback_when_unsupported() {
         let _g = HostImageAtomic64Guard::set(false);
         let native = synthetic_atomic64_program(HwStage::Cs, 0x17, 3, true);
         let shader = emit_synthetic(&native);
         let features = sfi0(&shader);
-        assert_ne!(features & 0x40_0000, 0);
-        assert_ne!(features & 0x1000_0000, 0);
-        assert!(dxil_has_symbol(&shader, "dx.op.atomicBinOp.i64"));
-        assert!(!dxil_has_symbol(&shader, "dx.op.textureLoad.i32"));
+        assert_eq!(features & (0x40_0000 | 0x1000_0000), 0);
+        assert_ne!(features & 0x800, 0);
+        assert_ne!(features & 0x8000, 0);
+        assert!(dxil_has_symbol(&shader, "dx.op.textureLoad.i32"));
+        assert!(dxil_has_symbol(&shader, "dx.op.textureStore.i32"));
+        assert!(!dxil_has_symbol(&shader, "dx.op.atomicBinOp.i64"));
+
+        let _g2 = HostImageAtomic64Guard::set(true);
+        let native_ok = emit_synthetic(&native);
+        assert!(dxil_has_symbol(&native_ok, "dx.op.atomicBinOp.i64"));
+    }
+}
+
+#[cfg(test)]
+mod wave64_lower_tests {
+    use super::*;
+    use crate::native::{ComputeIo, RootParam, StageIo, UsedResource, ResourceType};
+
+    fn wave64_cs(body: &[u32], threads: u32, lds_blocks_64b: u32) -> NativeProgram {
+        let mut words = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+        ];
+        words.extend_from_slice(body);
+        words.push(0xBF81_0000); // s_endpgm
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: (5 << 1) | (lds_blocks_64b << 15),
+                threads: [threads, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    fn psv_wave_range(shader: &HostShader) -> (u32, u32) {
+        let parsed = Container::parse(&shader.dxil).unwrap();
+        let psv = parsed.part(FourCC::PSV0).unwrap().data;
+        let min = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+        let max = u32::from_le_bytes(psv[24..28].try_into().unwrap());
+        (min, max)
+    }
+
+    fn emit_wave32(native: &NativeProgram, half_sync: bool) -> Result<HostShader, ShaderError> {
+        let p = ir::build(&native.code, native.wave64, native.vgprs)?;
+        let st = structure::structure(&p)?;
+        let io = io::raise(&p, native)?;
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let empty = crate::dxbc::build(&[]);
+        let c = Container::parse(&empty).unwrap();
+        let was_w = lower::TEST_HOST_WAVE.replace(Some(32));
+        let was_h = lower::TEST_HALF_SYNC.replace(Some(half_sync));
+        let out = emit(&c, native, &p, &st, &io, &res);
+        lower::TEST_HALF_SYNC.set(was_h);
+        lower::TEST_HOST_WAVE.set(was_w);
+        out
+    }
+
+    #[test]
+    fn multi_wave_divergent_wave_or_lowers_to_wave32_with_half_sync() {
+        let mut words = vec![
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+            0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0017, // s_cbranch_execz +23
+        ];
+        words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+        words.extend_from_slice(&[
+            0x7E00_0207, // v_mov_b32 v0, s7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        ]);
+        let native = wave64_cs(&words, 128, 0);
+        let shader = emit_wave32(&native, true).expect("emit with half_sync");
+        assert_eq!(psv_wave_range(&shader), (32, 32));
+    }
+
+    #[test]
+    fn lds_read_write_in_lane_branch_lowers_to_wave32() {
+        let words = [
+            0x7D04_0080, // v_cmp_eq_u32 vcc, 0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0008, // s_cbranch_execz +8 dwords -> s_mov_b64 exec, s[12:13]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_02AA, // v_mov_b32 v2, 42
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xD8D8_0000, 0x0300_0001, // ds_read_b32 v3, v1
+            0xD834_0000, 0x0000_0301, // ds_write_b32 v1, v3
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xD8D8_0000, 0x0000_0001, // ds_read_b32 v0, v1
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ];
+        let native = wave64_cs(&words, 64, 2);
+        let shader = emit_wave32(&native, true).expect("emit with half_sync");
+        assert_eq!(psv_wave_range(&shader), (32, 32));
+    }
+
+    #[test]
+    fn full_32k_lds_does_not_overflow_8192_dwords() {
+        let mut words = vec![
+            0x7E0A_0281, // v_mov_b32 v5, 1
+            0x2C0C_0081, // v_lshrrev_b32 v6, 1, v0
+            0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
+        ];
+        words.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
+        words.extend_from_slice(&[
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E04_0207, // v_mov_b32 v2, s7
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            0xD8D8_0000, 0x0000_0001, // ds_read_b32 v0, v1
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]);
+        let native = wave64_cs(&words, 1024, 64);
+        let shader = emit_wave32(&native, true).expect("emit");
+        let range = psv_wave_range(&shader);
+        assert!(range == (32, 32) || range == (64, 64), "unexpected wave range {range:?}");
+        // Verify @lds array length in the emitted DXIL bitcode does not exceed 8192 dwords.
+        let parsed = Container::parse(&shader.dxil).unwrap();
+        let bitcode = parsed.part(FourCC::DXIL).unwrap().data;
+        assert!(!bitcode.is_empty());
     }
 }
 

@@ -14,6 +14,7 @@
 
 pub mod blit;
 pub mod chunks;
+pub mod clear_resolve;
 pub mod msc;
 pub mod events;
 pub mod indirect;
@@ -366,7 +367,9 @@ impl Queue {
 pub enum Compute<'a> {
     Pipeline { pipeline: &'a ComputePipeline, threads_per_group: [u64; 3] },
     Buffer { buffer: &'a Buffer, offset: u64, index: u8 },
+    Texture { texture: &'a texture::Texture, index: u8 },
     Dispatch { groups: [u64; 3] },
+    DispatchThreads { threads: [u64; 3] },
     /// Runs the current pipeline with three GPU-supplied u32 group counts.
     DispatchIndirect { arguments: &'a Buffer, offset: u64 },
     /// Bytes copied into the command (Metal's `setBytes`, at most 4 KiB):
@@ -412,6 +415,13 @@ impl CommandBuffer {
                     offset,
                     index,
                 }),
+                Compute::Texture { texture, index } => Box::new(sys::wmtcmd_compute_settexture {
+                    type_: sys::WMTComputeCommandType::WMTComputeCommandSetTexture,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    texture: texture.handle(),
+                    index,
+                }),
                 Compute::Bytes { bytes, index } => Box::new(sys::wmtcmd_compute_setbytes {
                     type_: sys::WMTComputeCommandType::WMTComputeCommandSetBytes,
                     reserved: [0; 3],
@@ -428,6 +438,12 @@ impl CommandBuffer {
                 }),
                 Compute::Dispatch { groups: [w, h, d] } => Box::new(sys::wmtcmd_compute_dispatch {
                     type_: sys::WMTComputeCommandType::WMTComputeCommandDispatch,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    size: sys::WMTSize { width: w, height: h, depth: d },
+                }),
+                Compute::DispatchThreads { threads: [w, h, d] } => Box::new(sys::wmtcmd_compute_dispatch {
+                    type_: sys::WMTComputeCommandType::WMTComputeCommandDispatchThreads,
                     reserved: [0; 3],
                     next: null_next(),
                     size: sys::WMTSize { width: w, height: h, depth: d },
@@ -499,6 +515,14 @@ macro_rules! chain_link {
         }
     )*};
 }
-chain_link!(sys::wmtcmd_compute_setpso, sys::wmtcmd_compute_setbuffer, sys::wmtcmd_compute_dispatch, sys::wmtcmd_compute_dispatch_indirect, sys::wmtcmd_compute_setbytes, sys::wmtcmd_compute_memory_barrier);
+chain_link!(
+    sys::wmtcmd_compute_setpso,
+    sys::wmtcmd_compute_setbuffer,
+    sys::wmtcmd_compute_settexture,
+    sys::wmtcmd_compute_dispatch,
+    sys::wmtcmd_compute_dispatch_indirect,
+    sys::wmtcmd_compute_setbytes,
+    sys::wmtcmd_compute_memory_barrier
+);
 pub mod render;
 pub mod present;

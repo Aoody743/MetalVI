@@ -34,3 +34,5 @@ pub mod metal_copy;
 // P2: graphics pipeline state → Metal descriptions (F7).
 #[allow(dead_code)]
 pub mod metal_render_map;
+#[cfg(windows)]
+pub mod metal_warm;
