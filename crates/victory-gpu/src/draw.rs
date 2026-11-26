@@ -2028,6 +2028,16 @@ impl State {
     /// A draw on Metal too (`VICTORY_METAL_DRAW=1`): recorded into the
     /// list as [`crate::backend::metal::MetalOp::Draw`], counted.
     #[cfg(windows)]
+    /// The final-draw dossier's view of the heap slots the stages just bound
+    /// read (index, handle, why it has no Metal entry), when capturing.
+    #[cfg(windows)]
+    fn note_slot(index: u32, handle: u64, missing: Option<crate::backend::metal_heap::Missing>) {
+        if crate::backend::metal_draw::capture_every() == 0 {
+            return;
+        }
+        SLOTS.with(|s| s.borrow_mut().push((index, handle, missing)));
+    }
+
     /// Notes, for the captures, a draw at the bound colour targets
     /// (`kind`: an index into `metal_draw::WRITE_NAMES`).
     #[cfg(windows)]
@@ -2138,6 +2148,7 @@ impl State {
             }
             Some(Box::new(crate::backend::metal_draw::VertexFetch { table: vertex_table_bytes(&entries), _buffers: buffers }))
         };
+        SLOTS.with(|s| s.borrow_mut().clear());
         let mut stages = Vec::with_capacity(p.stages.len());
         for (stage, (top, bind)) in p.stages.iter().zip(&g.stages) {
             match self.metal_stage(m, p, stage, false, top.clone(), 0) {
@@ -2302,8 +2313,33 @@ impl State {
             primitive,
             kind,
         }));
-        if let crate::backend::metal::MetalOp::Draw(d) = &*op {
-            crate::backend::metal_draw::final_draw_dossier(d);
+        if let crate::backend::metal::MetalOp::Draw(d) = &*op
+            && crate::backend::metal_draw::final_draw_dossier(d)
+        {
+            // What the draw into the presented texture reads, and those
+            // textures as Metal has them right after it ran.
+            let slots = SLOTS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+            let mut reads = Vec::new();
+            let mut after = crate::backend::metal_draw::CAPTURE_AFTER.lock().unwrap_or_else(|e| e.into_inner());
+            let n = after.last().map(|(_, name)| name.clone()).unwrap_or_default();
+            for (k, (index, handle, missing)) in slots.into_iter().enumerate() {
+                let view = crate::descriptor::view(handle);
+                let what = match &view {
+                    Some(crate::descriptor::View::Shader(r, w)) => {
+                        let t = m.texture_for(*r as This);
+                        after.push((*r, format!("{n}-read{k}")));
+                        format!("srv res {r} words {w:?} metal {:?}", t.map(|t| (t.pixel.0, t.desc.width, t.desc.height, t.desc.flags)))
+                    }
+                    Some(crate::descriptor::View::Unordered(r, _, _)) => format!("uav res {r}"),
+                    Some(crate::descriptor::View::Placed(u, d, _)) => format!("placed uav={u} desc {:?}", &d[..6]),
+                    Some(crate::descriptor::View::Constant(a, z)) => format!("cbv {a:#x}+{z}"),
+                    Some(v) => format!("{v:?}").chars().take(60).collect(),
+                    None => "no view".into(),
+                };
+                reads.push(format!("slot {index}: {what} missing {missing:?}"));
+            }
+            drop(after);
+            tracing::info!(reads = ?reads, "Metal final-draw dossier: what the draw reads from the heap");
         }
         self.metal.push(op);
     }
@@ -2518,6 +2554,7 @@ impl State {
             let Some(index) = heap.index(handle) else { continue };
             let key = std::ptr::from_ref(heap) as usize;
             if let Some((buffer, missing)) = m.refresh_slot(key, heap.count(), index, handle) {
+                Self::note_slot(index, handle, missing);
                 worst = worst.or(missing);
                 if heap.samplers() {
                     sampler_buffer = Some(buffer);
@@ -2537,6 +2574,7 @@ impl State {
             let Some(i) = heap.index(handle) else { continue };
             let key = std::ptr::from_ref(heap) as usize;
             if let Some((buffer, missing)) = m.refresh_slot(key, heap.count(), i, handle) {
+                Self::note_slot(i, handle, missing);
                 worst = worst.or(missing);
                 if heap.samplers() {
                     sampler_buffer = Some(buffer);
@@ -3671,4 +3709,11 @@ pub(crate) struct MetalStage {
     heap: Option<victory_metal::Buffer>,
     sampler_heap: Option<victory_metal::Buffer>,
     outcome: crate::backend::metal::Drop,
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Heap slots read by the stages of the draw being recorded (the
+    /// final-draw dossier).
+    static SLOTS: std::cell::RefCell<Vec<(u32, u64, Option<crate::backend::metal_heap::Missing>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }

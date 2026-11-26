@@ -669,6 +669,8 @@ impl MetalBackend {
         // RGBA8 70/71, BGRA8 80/81, RGB10A2 90, RG11B10F 92, RGBA16F 115,
         // RGBA32F 125.
         let bpp: u32 = match t.pixel.0 {
+            10 => 1,      // R8Unorm (video planes, masks): grey
+            25 | 30 => 2, // R16Float: grey; RG8Unorm: red, green
             70 | 71 | 80 | 81 | 90 | 92 => 4,
             115 => 8,
             125 => 16,
@@ -930,6 +932,12 @@ fn rgb8(format: u32, p: &[u8]) -> [u8; 3] {
     let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
     let word = || u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
     match format {
+        10 => [p[0], p[0], p[0]],
+        25 => {
+            let g = u(half_to_f32(u16::from_le_bytes([p[0], p[1]])));
+            [g, g, g]
+        }
+        30 => [p[0], p[1], 0],
         80 | 81 => [p[2], p[1], p[0]],
         90 => {
             let w = word();
@@ -995,16 +1003,16 @@ pub(crate) static CAPTURE_AFTER: std::sync::Mutex<Vec<(usize, String)>> = std::s
 
 /// Logs (the first times) and marks for a capture a draw into a presented
 /// texture.
-pub(crate) fn final_draw_dossier(d: &MetalDraw) {
+pub(crate) fn final_draw_dossier(d: &MetalDraw) -> bool {
     if capture_every() == 0 {
-        return;
+        return false;
     }
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let presented = PRESENTED.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some(target) = d.targets.colors.iter().flatten().find(|a| presented.contains(&a.resource)) else { return };
+    let Some(target) = d.targets.colors.iter().flatten().find(|a| presented.contains(&a.resource)) else { return false };
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if n >= 6 && !n.is_power_of_two() {
-        return;
+        return false;
     }
     let (args, index_type) = draw_params(&d.kind);
     let others: Vec<String> = d
@@ -1036,6 +1044,7 @@ pub(crate) fn final_draw_dossier(d: &MetalDraw) {
         "Metal final-draw dossier: a draw into the presented texture"
     );
     CAPTURE_AFTER.lock().unwrap_or_else(|e| e.into_inner()).push((target.resource, format!("final-draw{n:03}")));
+    true
 }
 
 /// What wrote each title texture since the last capture (only when
