@@ -506,13 +506,10 @@ impl State {
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
         self.topology_set = true;
+        // Console lists the host lacks draw from expanded indices (F57).
         let host = match topology {
             RECTANGLES => 4,
-            TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
-                once!(topology, "console topology drawn as a triangle list");
-                4
-            }
-            t => t,
+            t => crate::primitive::ListExpansion::from_topology(t).map_or(t, crate::primitive::ListExpansion::host_topology),
         };
         // SAFETY: an open list.
         unsafe {
@@ -2902,7 +2899,14 @@ impl State {
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
-        let ran = ready && (!rects || self.rectangles(list, vertices, first));
+        // Fans, line loops, quads and quad strips: drawn from expanded
+        // indices here (F57), so the plain draw below is skipped.
+        let expansion = crate::primitive::ListExpansion::from_topology(self.topology);
+        let ran = ready
+            && (!rects || self.rectangles(list, vertices, first))
+            && expansion.is_none_or(|kind| {
+                i32::try_from(first).is_ok_and(|base| self.host_console_list(list, kind, vertices, instances, base, first_instance, None))
+            });
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -2916,11 +2920,13 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
+            if expansion.is_none() {
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawInstanced(count, instances, from, first_instance)
+                };
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -2928,6 +2934,44 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A console list (fan, line loop, quads, quad strip) drawn on the host
+    /// from expanded indices: generated for a plain draw, made from the
+    /// title's indices for an indexed one (F57). False if it cannot be.
+    #[allow(clippy::too_many_arguments)]
+    fn host_console_list(
+        &self,
+        list: &HostList,
+        expansion: crate::primitive::ListExpansion,
+        count: u32,
+        instances: u32,
+        base: i32,
+        first_instance: u32,
+        indexed_first: Option<u32>,
+    ) -> bool {
+        let Some(expanded) = expansion.index_count(count) else {
+            return false;
+        };
+        if expanded == 0 || instances == 0 {
+            return true;
+        }
+        let view = if let Some(first) = indexed_first {
+            let v = self.index;
+            expansion.title_view(list, v.address, v.size, v.format, first, count)
+        } else {
+            expansion.generated_view(list, count)
+        };
+        let Some(view) = view else {
+            return false;
+        };
+        // SAFETY: prepare set the pipeline and vertex buffers; the list keeps
+        // the generated index upload until its submission is done.
+        unsafe {
+            list.list.IASetIndexBuffer(Some(&view));
+            list.list.DrawIndexedInstanced(expanded, instances, 0, base, first_instance);
+        }
+        true
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -3013,7 +3057,10 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
-        let ran = !lost && self.prepare(list, true);
+        let expansion = crate::primitive::ListExpansion::from_topology(self.topology);
+        let ran = !lost
+            && self.prepare(list, expansion.is_none())
+            && expansion.is_none_or(|kind| self.host_console_list(list, kind, indices, instances, base, first_instance, Some(first)));
         if ran {
             #[cfg(windows)]
             if crate::backend::metal_draw::draws_on() {
@@ -3021,11 +3068,13 @@ impl State {
             }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
-            // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
+            if expansion.is_none() {
+                // SAFETY: an open list with everything set.
+                unsafe {
+                    list.list
+                        .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+                };
+            }
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
