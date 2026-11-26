@@ -1078,7 +1078,7 @@ pub(crate) fn final_draw_dossier(d: &MetalDraw) -> bool {
         scissor = format_args!("{},{} {}x{}", s.x, s.y, s.width, s.height),
         targets = ?others,
         stages = d.stages.len(),
-        tables = ?d.stages.iter().map(|b| (b.bind, b.tables.len(), b.heap.is_some())).collect::<Vec<_>>(),
+        tables = ?d.stages.iter().map(|b| (b.bind, b.tables.len(), b.heap.is_some(), b.sampler_heap.is_some())).collect::<Vec<_>>(),
         vertex_fetch = d.vertex.is_some(),
         followed = target.resource,
         "Metal final-draw dossier: a draw into a followed texture"
