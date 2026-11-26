@@ -243,6 +243,76 @@ fn pixel_format_name(fmt: victory_metal::sys::WMTPixelFormat) -> &'static str {
 }
 
 #[cfg(windows)]
+fn texture_copy_probe(
+    device: &victory_metal::Device,
+    queue: &victory_metal::Queue,
+) -> Result<(victory_metal::present::PresentBlit, victory_metal::texture::Texture), Box<dyn std::error::Error>> {
+    use victory_metal::present::PresentBlit;
+    use victory_metal::sys::*;
+    use victory_metal::texture::TextureDescriptor;
+
+    const W: u32 = 320;
+    const H: u32 = 160;
+    let mut rgba = Vec::<u8>::with_capacity((W * H * 4) as usize);
+    for y in 0..H {
+        for x in 0..W {
+            rgba.extend_from_slice(&if x % 2 == 0 || y % 2 == 0 {
+                [255, 255, 255, 64]
+            } else if x < W / 2 {
+                [255, 0, 0, 64]
+            } else {
+                [0, 0, 255, 64]
+            });
+        }
+    }
+    let src = device.new_texture(&TextureDescriptor {
+        pixel_format: WMTPixelFormat::WMTPixelFormatRGBA8Unorm,
+        width: W,
+        height: H,
+        ..Default::default()
+    })?;
+    let zero = WMTOrigin { x: 0, y: 0, z: 0 };
+    // SAFETY: the upload has exactly W * H tightly packed RGBA pixels.
+    unsafe {
+        MTLTexture_replaceRegion(
+            src.handle(), zero, WMTSize { width: W.into(), height: H.into(), depth: 1 }, 0, 0,
+            WMTMemoryPointer { ptr: rgba.as_mut_ptr().cast() }, u64::from(W * 4), u64::from(W * H * 4),
+        )
+    };
+
+    const DW: u32 = 160;
+    const DH: u32 = 180;
+    let dst = device.new_texture(&TextureDescriptor {
+        pixel_format: WMTPixelFormat::WMTPixelFormatBGRA8Unorm,
+        width: DW,
+        height: DH,
+        usage: WMTTextureUsage::WMTTextureUsageRenderTarget,
+        ..Default::default()
+    })?;
+    let blit = PresentBlit::new(device)?;
+    let cb = queue.command_buffer()?;
+    blit.draw(&cb, &src, &dst)?;
+    cb.commit();
+    cb.wait()?;
+    let mut bgra = vec![0u8; (DW * DH * 4) as usize];
+    // SAFETY: the command is complete and the destination has room for the entire texture.
+    unsafe {
+        MTLTexture_getBytes(
+            dst.handle(), zero, WMTSize { width: DW.into(), height: DH.into(), depth: 1 }, 0, 0,
+            WMTMemoryPointer { ptr: bgra.as_mut_ptr().cast() }, u64::from(DW * 4), bgra.len() as u64,
+        )
+    };
+    for (x, y, expected) in [(40, 49, [0, 0, 0, 255]), (40, 50, [0, 0, 255, 255]), (120, 129, [255, 0, 0, 255]), (120, 130, [0, 0, 0, 255])] {
+        let i = ((y * DW + x) * 4) as usize;
+        if bgra[i..i + 4] != expected {
+            return Err(format!("present texture: ({x}, {y}) is {:?}, expected {expected:?}", &bgra[i..i + 4]).into());
+        }
+    }
+    println!("PASS: texture presentation pass: point sampling, BGRA conversion, opaque black borders (4/4 pixels)");
+    Ok((blit, src))
+}
+
+#[cfg(windows)]
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     use victory_metal::present::MetalLayer;
     use victory_metal::sys;
@@ -280,6 +350,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("layer drawable size (getProps): {dw} x {dh}");
 
     let queue = device.new_queue(4)?;
+    let copy = std::env::args().any(|arg| arg == "--texture-copy").then(|| texture_copy_probe(&device, &queue)).transpose()?;
 
     let mut frame_times: Vec<std::time::Duration> = Vec::with_capacity(FRAMES);
     let mut tex_w = 0u64;
@@ -303,6 +374,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tex_fmt.0,
                 pixel_format_name(tex_fmt)
             );
+        }
+
+        if let Some((blit, src)) = &copy {
+            blit.draw_to_window(&cb, src, &drawable)?;
+            cb.commit();
+            cb.wait()?;
+            frame_times.push(t0.elapsed());
+            win32::pump(&u32, hwnd);
+            continue;
         }
 
         let t = i as f64 / (FRAMES - 1) as f64;

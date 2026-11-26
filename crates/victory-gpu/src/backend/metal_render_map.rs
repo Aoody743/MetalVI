@@ -778,6 +778,27 @@ pub fn map_color_attachment(
     }
 }
 
+/// Metal cannot blend with a signed or unsigned integer color attachment.
+pub(crate) fn check_integer_blending(color: &[Option<ColorAttachmentMap>; 8]) -> Result<(), String> {
+    use f1::MtlPixelFormat::*;
+    for (slot, attachment) in color.iter().enumerate() {
+        let Some(attachment) = attachment else { continue };
+        let Some(format) = attachment.pixel_format else { continue };
+        if attachment.blending_enabled
+            && matches!(
+                format,
+                R8Uint | R8Sint | RG8Uint | RG8Sint | RGBA8Uint | RGBA8Sint
+                    | R16Uint | R16Sint | RG16Uint | RG16Sint | RGBA16Uint | RGBA16Sint
+                    | R32Uint | R32Sint | RG32Uint | RG32Sint | RGBA32Uint | RGBA32Sint
+                    | RGB10A2Uint
+            )
+        {
+            return Err(format!("render target {slot} uses integer Metal format {format:?} with blending enabled"));
+        }
+    }
+    Ok(())
+}
+
 /// Translate the whole graphics-pipeline state into the Metal render pipeline
 /// description. All lossy cases land in [`RenderPipelineMap::notes`].
 pub fn map_pipeline_state(input: &PipelineStateInput) -> RenderPipelineMap {
@@ -831,5 +852,45 @@ pub fn map_pipeline_state(input: &PipelineStateInput) -> RenderPipelineMap {
         depth_stencil,
         raster,
         notes,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_blend_reports_the_offending_target() {
+        use f1::{d3d12_blend, d3d12_blend_op, d3d12_color_write, dxgi_format};
+        let mut rt = RtBlend {
+            blend_enable: true,
+            logic_op_enable: false,
+            src_blend: d3d12_blend::ONE,
+            dest_blend: d3d12_blend::ZERO,
+            blend_op: d3d12_blend_op::ADD,
+            src_blend_alpha: d3d12_blend::ONE,
+            dest_blend_alpha: d3d12_blend::ZERO,
+            blend_op_alpha: d3d12_blend_op::ADD,
+            logic_op: d3d12_logic_op::NOOP,
+            render_target_write_mask: d3d12_color_write::ALL,
+        };
+        let mut notes = Vec::new();
+        let mut colors = [None; 8];
+        colors[0] = Some(map_color_attachment(&rt, dxgi_format::R8G8B8A8_UNORM, &mut notes));
+        colors[2] = Some(map_color_attachment(&rt, dxgi_format::R8_UINT, &mut notes));
+        assert_eq!(
+            check_integer_blending(&colors).unwrap_err(),
+            "render target 2 uses integer Metal format R8Uint with blending enabled"
+        );
+
+        colors[2] = Some(map_color_attachment(&rt, dxgi_format::R32G32_SINT, &mut notes));
+        assert_eq!(
+            check_integer_blending(&colors).unwrap_err(),
+            "render target 2 uses integer Metal format RG32Sint with blending enabled"
+        );
+
+        rt.blend_enable = false;
+        colors[2] = Some(map_color_attachment(&rt, dxgi_format::R8_UINT, &mut notes));
+        assert_eq!(check_integer_blending(&colors), Ok(()));
     }
 }

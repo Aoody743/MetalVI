@@ -204,6 +204,26 @@ impl Device {
         Ok(Buffer { object: buffer, gpu_address: info.gpu_address, len })
     }
 
+    /// Creates a Metal-owned shared buffer initialized with a copy of `bytes`.
+    pub fn shared_buffer(&self, bytes: &[u8]) -> Result<Buffer> {
+        let len = bytes.len() as u64;
+        let mut info = sys::WMTBufferInfo {
+            length: len,
+            options: sys::WMTResourceOptions::WMTResourceStorageModeShared,
+            memory: sys::WMTMemoryPointer { ptr: std::ptr::null_mut() },
+            gpu_address: 0,
+        };
+        // SAFETY: a null input pointer requests a new owned allocation.
+        let object = Object::adopt(unsafe { sys::MTLDevice_newBuffer(self.handle(), &mut info) })
+            .ok_or_else(|| Error("newBuffer (shared)".into()))?;
+        if info.memory.ptr.is_null() {
+            return Err(Error("shared buffer has no CPU address".into()));
+        }
+        // SAFETY: the owned buffer has len bytes and cannot alias the input slice.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), info.memory.ptr.cast(), bytes.len()) };
+        Ok(Buffer { object, gpu_address: info.gpu_address, len })
+    }
+
     /// A compute pipeline from MSL source (runtime compiled: tests and our
     /// own helper kernels; title shaders come as metallibs).
     pub fn compute_pipeline_msl(&self, source: &str, function: &str) -> Result<ComputePipeline> {
@@ -253,7 +273,7 @@ impl Device {
     }
 }
 
-/// A buffer over memory we did not allocate (see [`Device::wrap`]).
+/// An owned handle to a Metal buffer, which may wrap externally owned memory.
 #[derive(Clone, Debug)]
 pub struct Buffer {
     object: Object,

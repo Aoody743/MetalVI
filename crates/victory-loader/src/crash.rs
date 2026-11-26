@@ -588,10 +588,11 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
     let mut aligned = Aligned16(context);
     let context = &mut aligned.0;
     frames.push(context.Rip);
-    while frames.len() < MAX_FRAMES {
+    let limit = frames.capacity().min(64);
+    while frames.len() < limit {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
-        if rsp < low || rsp + 8 > high {
+        if rsp < low || rsp.checked_add(8).is_none_or(|end| end > high) {
             break;
         }
         let mut image = 0;
@@ -617,7 +618,7 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
                 )
             };
         }
-        if context.Rip == 0 {
+        if context.Rip == 0 || context.Rsp as usize <= rsp {
             break;
         }
         frames.push(context.Rip);

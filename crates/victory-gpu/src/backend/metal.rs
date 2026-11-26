@@ -61,60 +61,22 @@ pub(crate) fn texture_fill_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_METAL_TEXTURES").map_or(true, |v| v != "nofill"))
 }
 
-/// Submissions run on Metal so far (the fence for retired wrappers).
-static SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// The runtime remapped title memory `[at, at + len)`: the no-copy buffers
-/// over it show the pages that were there (F26). They are retired, and let
-/// go once the next submission has run (lists recorded before hold them);
-/// the next use wraps the new pages.
+/// Counts mapping changes. Recorded Metal lists can still contain old GPU
+/// addresses, so the post-map notification cannot safely re-wrap memory.
 pub(crate) fn title_memory_remapped(at: u64, len: u64) {
-    // Off unless VICTORY_METAL_REWRAP=1: re-wrapping left the old no-copy
-    // buffer resident (until its fence) while a new one over the same pages
-    // was added, and that panicked the kernel (IOGPUGroupMemory.cpp:220,
-    // 2026-11-26). Until the old wrapper is gone before the new one is made,
-    // wrappers keep showing the pages they were made over.
-    // Counted either way, for the log: how often the title remaps.
     static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n == 1 && std::env::var("VICTORY_METAL_REWRAP").is_ok_and(|v| v == "1") {
+        tracing::warn!("VICTORY_METAL_REWRAP is disabled; pre-remap GPU quiescence is not wired up");
+    }
     if n.is_power_of_two() {
         tracing::info!(calls = n, at = format_args!("{at:#x}"), len, "Metal: title memory remapped");
     }
-    static ON: OnceLock<bool> = OnceLock::new();
-    if mode() != Mode::Compute || !*ON.get_or_init(|| std::env::var("VICTORY_METAL_REWRAP").is_ok_and(|v| v == "1")) {
-        return;
-    }
-    // Only noted here: callers hold their own locks (xmem's while it maps
-    // and unmaps), and the chunks lock is held around calls that take
-    // others, so taking it here could deadlock. `MetalBackend::chunks`
-    // applies what is noted before anyone uses a wrapper.
-    REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((at, len));
-    REMAPS_PENDING.store(true, std::sync::atomic::Ordering::Release);
 }
 
-static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
-static REMAPS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 impl MetalBackend {
-    /// The no-copy wrappers, with remaps noted since the last look applied
-    /// (their wrappers retired until the next submission has run).
+    /// The no-copy wrappers of title memory.
     pub(crate) fn chunks(&self) -> std::sync::MutexGuard<'_, Chunks> {
-        if REMAPS_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
-            let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-            if !ranges.is_empty() {
-                // Typed buffer views made over the old wrappers.
-                self.typed
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .retain(|&(va, bytes, _), _| ranges.iter().all(|&(at, len)| va + bytes <= at || at + len <= va));
-                let fence = SUBMITTED.load(std::sync::atomic::Ordering::Acquire) + 1;
-                let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
-                for (at, len) in ranges {
-                    chunks.remapped(at, len, fence);
-                }
-                return chunks;
-            }
-        }
         self.chunks.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -266,9 +228,19 @@ pub(crate) struct MetalHeap {
 // The entries are only written under the heaps lock.
 unsafe impl Send for MetalHeap {}
 
+static BACKEND: OnceLock<Option<MetalBackend>> = OnceLock::new();
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stall_locks() -> impl Iterator<Item = (&'static str, usize)> {
+    // A stall may occur while the backend is starting. Do not wait for it.
+    BACKEND.get().and_then(Option::as_ref).into_iter().flat_map(|b| [
+        ("metal.chunks", std::ptr::from_ref(&b.chunks) as usize),
+        ("metal.typed", std::ptr::from_ref(&b.typed) as usize),
+    ])
+}
+
 /// The backend, made on first use when [`mode`] is not `Off`.
 pub(crate) fn backend() -> Option<&'static MetalBackend> {
-    static BACKEND: OnceLock<Option<MetalBackend>> = OnceLock::new();
     BACKEND
         .get_or_init(|| {
             if mode() == Mode::Off {
@@ -526,6 +498,9 @@ impl MetalBackend {
                                 // MSC's draw arguments and index type (IRRuntimeDrawPrimitives).
                                 steps.push(stage_buffer(s.bind, &r.buffer, *args, 4));
                                 steps.push(stage_buffer(s.bind, &r.buffer, *uniforms, 5));
+                                if let Some(fetch) = &d.vertex {
+                                    steps.push(Render::VertexBytes { bytes: &fetch.table, index: msc::VERTEX_TABLE_BIND_POINT });
+                                }
                             }
                         }
                         let primitive = sys::WMTPrimitiveType(d.primitive);
@@ -537,12 +512,12 @@ impl MetalBackend {
                                 instance_count: *instances,
                                 base_instance: *first_instance,
                             },
-                            DrawKind::Indexed { count, instances, first, base, first_instance, buffer, offset, index_type } => Render::DrawIndexed {
+                            DrawKind::Indexed { count, instances, base, first_instance, buffer, offset, index_type } => Render::DrawIndexed {
                                 primitive_type: primitive,
                                 index_type: *index_type,
                                 index_count: u64::from(*count),
                                 index_buffer: buffer,
-                                index_offset: offset + u64::from(*first) * if *index_type == 0 { 2 } else { 4 },
+                                index_offset: u64::from(*offset),
                                 instance_count: *instances,
                                 base_vertex: *base,
                                 base_instance: *first_instance,
@@ -595,11 +570,7 @@ impl MetalBackend {
             return false;
         }
         cb.commit();
-        let waited = cb.wait();
-        // This submission is done: wrappers retired before it can go.
-        let done = SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
-        self.chunks().retire(done);
-        match waited {
+        match cb.wait() {
             Ok(()) => true,
             Err(e) => {
                 let (mut dispatches, mut draws, mut clears) = (0, 0, 0);
@@ -1000,11 +971,11 @@ pub(crate) fn static_samplers(t: &HostShader) -> Vec<StaticSampler> {
         .collect()
 }
 
-/// P2 census: the title's graphics pipelines made on Metal too, on a thread
-/// of their own, and only counted (nothing draws with them yet). Each stage
-/// goes through Metal Shader Converter (with the disk cache) and the pair
-/// becomes a render pipeline in the state F7's map gives.
-/// Off unless `VICTORY_METAL_CENSUS=1` (not yet run in the game).
+/// P2 census of vertex/pixel pipelines already accepted by the legacy host.
+/// Each stage gets standard MSC conversion on a background thread; only
+/// pipelines without a vertex input layout are tested for PSO creation.
+/// This does not exercise the draw path's synthesized stage-in or mesh PSOs.
+/// Off unless `VICTORY_METAL_CENSUS=1`.
 pub(crate) fn census_graphics(
     shaders: Vec<std::sync::Arc<crate::pipeline::Shader>>,
     input: super::metal_render_map::PipelineStateInput,
@@ -1049,7 +1020,8 @@ impl Census {
         let Some(m) = backend() else { return };
         let _pool = victory_metal::Pool::new();
         self.pipelines += 1;
-        if !input.elements.is_empty() {
+        let needs_stage_in = !input.elements.is_empty();
+        if needs_stage_in {
             self.with_inputs += 1;
         }
         let mut vertex = None;
@@ -1059,9 +1031,19 @@ impl Census {
             let stage = match s.stage {
                 "vertex" => victory_metal::msc::Stage::Vertex,
                 "pixel" => victory_metal::msc::Stage::Fragment,
-                _ => continue,
+                other => {
+                    self.stage_failed += 1;
+                    failed = true;
+                    self.reason(format!("{other} stage outside vertex/pixel census"));
+                    continue;
+                }
             };
-            let Some(t) = s.translated() else { continue };
+            let Some(t) = s.translated() else {
+                self.stage_failed += 1;
+                failed = true;
+                self.reason(format!("{} stage: no host translation", s.stage));
+                continue;
+            };
             match convert_cached(&t.host, stage).and_then(|c| m.device.library(&c.metallib).map(|l| (l, c.entry)).map_err(|e| e.to_string())) {
                 Ok(lib) => {
                     self.stage_ok += 1;
@@ -1078,9 +1060,16 @@ impl Census {
                 }
             }
         }
-        if !failed && let Some((vlib, vname)) = &vertex {
-            let desc = render_desc(&super::metal_render_map::map_pipeline_state(input));
-            match m.device.render_pipeline_desc((vlib, vname), fragment.as_ref().map(|(l, n)| (l, n.as_str())), &desc) {
+        if !needs_stage_in && !failed && let Some((vlib, vname)) = &vertex {
+            use super::metal_render_map as map;
+            let mapped = map::map_pipeline_state(input);
+            let result = map::check_integer_blending(&mapped.color).and_then(|()| {
+                let desc = render_desc(&mapped);
+                m.device
+                    .render_pipeline_desc((vlib, vname), fragment.as_ref().map(|(l, n)| (l, n.as_str())), &desc)
+                    .map_err(|e| e.to_string())
+            });
+            match result {
                 Ok(_) => self.made += 1,
                 Err(e) => {
                     self.pipeline_failed += 1;
@@ -1089,6 +1078,7 @@ impl Census {
             }
         }
         if self.pipelines.is_power_of_two() || self.pipelines % 256 == 0 {
+            let pipeline_attempts = self.made + self.pipeline_failed;
             tracing::info!(
                 pipelines = self.pipelines,
                 made = self.made,
@@ -1096,6 +1086,9 @@ impl Census {
                 stages_failed = self.stage_failed,
                 pipelines_refused = self.pipeline_failed,
                 with_vertex_inputs = self.with_inputs,
+                pipeline_attempts,
+                pipelines_not_attempted = self.pipelines - pipeline_attempts,
+                scope = "legacy-accepted vertex/pixel; no stage-in or mesh PSOs",
                 "Metal census of graphics pipelines"
             );
         }

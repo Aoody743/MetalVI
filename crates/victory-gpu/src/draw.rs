@@ -2063,6 +2063,31 @@ impl State {
             count_draw(DrawDrop::Targets);
             return;
         }
+        let vertex = if g.vertex_slots == 0 {
+            None
+        } else {
+            use victory_metal::msc::{VERTEX_TABLE_SLOTS, VertexBufferEntry, vertex_table_bytes};
+            let mut entries = [VertexBufferEntry::default(); VERTEX_TABLE_SLOTS];
+            let mut buffers = Vec::new();
+            let chunks = m.chunks();
+            for (i, entry) in entries.iter_mut().enumerate() {
+                if g.vertex_slots & (1u32 << i) == 0 {
+                    continue;
+                }
+                let view = self.vertex[i];
+                if view.stride == 0 {
+                    count_draw(DrawDrop::VertexFetch);
+                    return;
+                }
+                let Some((buffer, offset)) = chunks.resident_window(view.address, u64::from(view.size)) else {
+                    count_draw(DrawDrop::VertexFetch);
+                    return;
+                };
+                *entry = VertexBufferEntry { address: buffer.gpu_address + offset, length: view.size, stride: view.stride };
+                buffers.push(buffer);
+            }
+            Some(Box::new(crate::backend::metal_draw::VertexFetch { table: vertex_table_bytes(&entries), _buffers: buffers }))
+        };
         let mut stages = Vec::with_capacity(p.stages.len());
         for (stage, (top, bind)) in p.stages.iter().zip(&g.stages) {
             match self.metal_stage(m, p, stage, false, top.clone(), 0) {
@@ -2077,22 +2102,28 @@ impl State {
             DrawKindIn::Vertices { count, instances, first, first_instance } => DrawKind::Vertices { count, instances, first, first_instance },
             DrawKindIn::Indexed { count, instances, first, base, first_instance } => {
                 let v = self.index;
-                let index_type = match v.format {
-                    57 => 0, // R16_UINT
-                    42 => 1, // R32_UINT
+                let (index_type, index_width) = match v.format {
+                    57 => (0, 2u64), // R16_UINT
+                    42 => (1, 4),    // R32_UINT
                     _ => {
                         count_draw(DrawDrop::IndexBuffer);
                         return;
                     }
                 };
-                let Some((buffer, offset)) = (v.address != 0 && v.size != 0)
-                    .then(|| m.chunks().window_buffer(v.address, u64::from(v.size)))
-                    .flatten()
-                else {
+                let first_byte = u64::from(first) * index_width;
+                if v.address == 0 || v.address % index_width != 0 || first_byte + u64::from(count) * index_width > u64::from(v.size) {
+                    count_draw(DrawDrop::IndexBuffer);
+                    return;
+                }
+                let Some((buffer, view_offset)) = m.chunks().window_buffer(v.address, u64::from(v.size)) else {
                     count_draw(DrawDrop::IndexBuffer);
                     return;
                 };
-                DrawKind::Indexed { count, instances, first, base, first_instance, buffer, offset, index_type }
+                let Ok(offset) = u32::try_from(view_offset + first_byte) else {
+                    count_draw(DrawDrop::IndexBuffer);
+                    return;
+                };
+                DrawKind::Indexed { count, instances, base, first_instance, buffer, offset, index_type }
             }
             DrawKindIn::Mesh { groups } => DrawKind::Mesh { groups: [u64::from(groups), 1, 1] },
         };
@@ -2120,6 +2151,7 @@ impl State {
             pso: g,
             targets,
             stages,
+            vertex,
             viewport,
             scissor,
             blend: self.blend.unwrap_or([1.0; 4]),
@@ -2230,6 +2262,10 @@ impl State {
                 };
                 let gpu = if extent == 0 { 0 } else { chunks.window(va, extent) };
                 match r {
+                    RootSlot::Cbv(_) if !compute && va != 0 && gpu == 0 => {
+                        once!(pipeline = %p.name, slot, "Metal: graphics root constant buffer has no mapped GPU address");
+                        return Err(Drop::SlotUnmapped);
+                    }
                     RootSlot::TableSrv(_) | RootSlot::TableUav(_) => {
                         let entry = if gpu == 0 { victory_metal::ir::DescriptorEntry::NULL } else { victory_metal::ir::DescriptorEntry::buffer(gpu, extent) };
                         if let Some(at) = top.offset_of(i) {

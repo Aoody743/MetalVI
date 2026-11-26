@@ -10,10 +10,8 @@
 //!   `va` into `table[(va - base) >> 16] + (va & 0xFFFF)`.
 //! - A remap (xmem changed which physical pages are behind some addresses)
 //!   makes the buffers there stale: a buffer keeps the pages it saw when it
-//!   was made (spike `remap.m`). [`Chunks::remapped`] wraps again at once
-//!   and updates the table; the old buffers are kept until the GPU work that
-//!   may use them is done ([`Chunks::retire`]), then released (T4 §3.5: a new
-//!   wrap sees the new pages even while the old buffer lives).
+//!   was made. Callers must quiesce, invalidate and release wrappers
+//!   before any mapping change, then wrap the new mapping separately.
 //!
 //! Every live buffer (and the table) is in one residency set ([`Chunks::residency`]),
 //! which the queues that run title work must have ([`crate::Queue::add_residency_set`]):
@@ -24,6 +22,8 @@ use std::collections::BTreeMap;
 use core::ffi::c_void;
 
 use crate::{Buffer, Device, Error, ResidencySet, Result};
+
+mod evict;
 
 pub const PAGE: u64 = 64 << 10;
 pub const CHUNK: u64 = 2 << 20;
@@ -54,9 +54,6 @@ pub struct Chunks {
     /// Sparse mode ([`Chunks::sparse`]): page → GPU address, CPU side only.
     sparse: Option<std::collections::HashMap<u64, u64>>,
     residency: ResidencySet,
-    /// Buffers replaced by a remap, with the fence value after which no
-    /// GPU work can use them any more.
-    retired: Vec<(u64, Buffer)>,
     /// Counters (wraps of whole chunks, of single pages, rewraps).
     pub stats: Stats,
 }
@@ -140,7 +137,6 @@ impl Chunks {
             table_buffer,
             sparse: None,
             residency,
-            retired: Vec::new(),
             stats: Stats::default(),
         })
     }
@@ -169,7 +165,6 @@ impl Chunks {
             table_buffer: None,
             sparse: Some(std::collections::HashMap::new()),
             residency,
-            retired: Vec::new(),
             stats: Stats::default(),
         })
     }
@@ -202,14 +197,14 @@ impl Chunks {
         self.window_buffer(va, len).map_or(0, |(b, off)| b.gpu_address + off)
     }
 
-    /// The buffer holding `[va, va+len)` contiguously and the range's offset
-    /// in it (see [`Chunks::window`]); `None` if not wrapped/mapped.
-    pub fn window_buffer(&mut self, va: u64, len: u64) -> Option<(Buffer, u64)> {
-        if len == 0 || va < self.base || va + len > self.base + self.size {
+    /// A contiguous range in a buffer already in this residency set.
+    pub fn resident_window(&self, va: u64, len: u64) -> Option<(Buffer, u64)> {
+        let end = va.checked_add(len)?;
+        if len == 0 || va < self.base || end > self.base + self.size {
             return None;
         }
         let first = (va - self.base) / CHUNK;
-        let last = (va + len - 1 - self.base) / CHUNK;
+        let last = (end - 1 - self.base) / CHUNK;
         if first == last {
             let chunk_va = self.base + first * CHUNK;
             match self.chunks.get(&first) {
@@ -224,10 +219,23 @@ impl Chunks {
             }
         }
         let start = va & !(PAGE - 1);
-        let end = (va + len).next_multiple_of(PAGE);
-        if let Some((&(s, _), b)) = self.spans.range(..=(start, u64::MAX)).next_back().filter(|((s, e), _)| *s <= start && end <= *e) {
-            return Some((b.clone(), va - s));
+        self.spans.range(..=(start, u64::MAX)).next_back()
+            .filter(|((s, e), _)| *s <= start && end <= *e)
+            .map(|(&(s, _), b)| (b.clone(), va - s))
+    }
+
+    /// The buffer holding `[va, va+len)` contiguously and the range's offset
+    /// in it (see [`Chunks::window`]); `None` if not wrapped/mapped.
+    pub fn window_buffer(&mut self, va: u64, len: u64) -> Option<(Buffer, u64)> {
+        let end = va.checked_add(len)?;
+        if len == 0 || va < self.base || end > self.base + self.size {
+            return None;
         }
+        if let Some(window) = self.resident_window(va, len) {
+            return Some(window);
+        }
+        let start = va & !(PAGE - 1);
+        let end = end.next_multiple_of(PAGE);
         if !mapped(start, end - start) {
             return None;
         }
@@ -257,48 +265,49 @@ impl Chunks {
         self.residency.commit();
     }
 
-    /// Memory under `[at, at+len)` was remapped: the chunks there are
-    /// wrapped again now; their old buffers are retired behind `fence`, the
-    /// value the GPU's fence reaches once work submitted so far is done.
-    pub fn remapped(&mut self, at: u64, len: u64, fence: u64) {
-        let stale: Vec<(u64, u64)> = self.spans.keys().copied().filter(|&(s, e)| s < at + len && at < e).collect();
+    /// Removes the resident wrappers for every touched chunk and clears
+    /// their GPU-address entries. Call `wrap` only after the mapping changed.
+    ///
+    /// # Safety
+    /// No submitted or recorded work may still use these addresses, and
+    /// callers must release external copies of the buffers and derived
+    /// views. Exclude new users through the entire mapping change.
+    pub unsafe fn invalidate_quiesced(&mut self, at: u64, len: u64) -> usize {
+        let chunks = self.chunk_range(at, len);
+        if chunks.is_empty() {
+            return 0;
+        }
+        let lo = self.base + chunks.start * CHUNK;
+        let hi = self.base + chunks.end * CHUNK;
+        let mut old_buffers = Vec::new();
+        let stale: Vec<(u64, u64)> = self.spans.keys().copied().filter(|&(s, e)| s < hi && lo < e).collect();
         for key in stale {
             if let Some(b) = self.spans.remove(&key) {
-                self.retired.push((fence, b));
+                old_buffers.push(b);
             }
         }
-        for chunk in self.chunk_range(at, len) {
+        for chunk in chunks {
             if let Some(old) = self.chunks.remove(&chunk) {
                 match old {
-                    Wrapped::Whole(b) => self.retired.push((fence, b)),
-                    Wrapped::Pages(m) => self.retired.extend(m.into_values().map(|b| (fence, b))),
+                    Wrapped::Whole(b) => old_buffers.push(b),
+                    Wrapped::Pages(m) => old_buffers.extend(m.into_values()),
                 }
                 self.stats.rewrapped_chunks += 1;
             }
-            self.wrap_chunk(chunk);
+            for p in chunk * PAGES_PER_CHUNK..(chunk + 1) * PAGES_PER_CHUNK {
+                self.set(p as usize, 0);
+            }
         }
-        self.residency.commit();
+        evict::remove_then_release(
+            old_buffers,
+            |buffers| self.residency.remove(&buffers.iter().map(Buffer::handle).collect::<Vec<_>>()),
+            || self.residency.commit(),
+        )
     }
 
-    /// Releases retired buffers whose fence value `completed` has reached.
-    pub fn retire(&mut self, completed: u64) -> usize {
-        let (done, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retired).into_iter().partition(|(fence, _)| *fence <= completed);
-        self.retired = kept;
-        if !done.is_empty() {
-            let handles: Vec<_> = done.iter().map(|(_, b)| b.handle()).collect();
-            self.residency.remove(&handles);
-            self.residency.commit();
-        }
-        done.len()
-    }
-
-    pub fn retired_pending(&self) -> usize {
-        self.retired.len()
-    }
-
-    fn chunk_range(&self, at: u64, len: u64) -> impl Iterator<Item = u64> + use<> {
-        let lo = at.max(self.base);
-        let hi = (at + len).min(self.base + self.size);
+    fn chunk_range(&self, at: u64, len: u64) -> std::ops::Range<u64> {
+        let lo = at.max(self.base).min(self.base + self.size);
+        let hi = at.saturating_add(len).min(self.base + self.size);
         let first = (lo - self.base) / CHUNK;
         let last = if hi > lo { (hi - self.base).div_ceil(CHUNK) } else { first };
         first..last

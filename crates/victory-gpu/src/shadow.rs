@@ -3497,6 +3497,11 @@ struct Entry {
 /// Title buffers by (start address, resource), with their copy once made.
 static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn buffers_lock_address() -> usize {
+    (&raw const BUFFERS) as usize
+}
+
 fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }

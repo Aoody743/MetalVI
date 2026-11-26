@@ -495,6 +495,11 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     aliased: BTreeSet::new(),
 });
 
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guards_lock_address() -> usize {
+    (&raw const GUARDS) as usize
+}
+
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }

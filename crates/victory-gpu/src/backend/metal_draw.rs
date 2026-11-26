@@ -28,7 +28,7 @@ use victory_metal::render::{DepthStencilDesc, DepthStencilState, RenderPipeline,
 use victory_metal::sys;
 use victory_metal::texture::Texture;
 
-use super::metal::{MetalBackend, convert_cached, render_desc};
+use super::metal::{MetalBackend, convert_cached, render_desc, root_params, static_samplers};
 use super::metal_render_map as map;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -58,6 +58,8 @@ pub(crate) struct MetalGraphics {
     /// Per stage (in the host pipeline's order): its empty top level and
     /// where it binds (0 vertex, 1 fragment, 2 mesh).
     pub(crate) stages: Vec<(TopLevel, u8)>,
+    /// Resident vertex-buffer slots required by the synthesized stage-in.
+    pub(crate) vertex_slots: u32,
     pub(crate) mesh: bool,
     pub(crate) mesh_threads: [u64; 3],
     /// What its targets must be (Metal pixel formats; 0 none) and their
@@ -107,13 +109,17 @@ impl MetalBackend {
     }
 
     fn make_graphics(&self, p: &HostPipeline) -> Result<MetalGraphics, String> {
-        use victory_metal::msc::Stage;
+        use victory_metal::msc::{Stage, VERTEX_TABLE_SLOTS, VertexInput, convert_vertex_with_stage_in};
         let input = p.metal_input.as_ref().ok_or("no graphics state kept")?;
+        let m = map::map_pipeline_state(input);
+        map::check_integer_blending(&m.color)?;
         let _pool = victory_metal::Pool::new();
         let mut stages = Vec::new();
         let mut vertex = None;
         let mut fragment = None;
         let mut mesh = None;
+        let mut stage_in = None;
+        let mut vertex_slots = 0;
         let mut mesh_threads = [1u64; 3];
         for s in &p.stages {
             let (stage, bind) = match s.shader.stage {
@@ -122,7 +128,38 @@ impl MetalBackend {
                 "mesh" => (Stage::Mesh, STAGE_MESH),
                 other => return Err(format!("{other} stage")),
             };
-            let c = convert_cached(&s.translated().host, stage)?;
+            let host = &s.translated().host;
+            let c = if stage == Stage::Vertex && !input.elements.is_empty() {
+                if input.elements.len() != p.inputs.len() {
+                    return Err("Metal vertex layout disagrees with resolved host layout".into());
+                }
+                let mut elements = Vec::with_capacity(input.elements.len());
+                for (source, resolved) in input.elements.iter().zip(&p.inputs) {
+                    if source.input_slot as usize >= VERTEX_TABLE_SLOTS
+                        || !matches!(source.slot_class, 0 | 1)
+                        || crate::resource::element(resolved.format).is_none()
+                    {
+                        return Err("unsupported Metal vertex input".into());
+                    }
+                    vertex_slots |= 1u32 << source.input_slot;
+                    elements.push(VertexInput {
+                        semantic: &source.semantic_name,
+                        semantic_index: source.semantic_index,
+                        format: resolved.format,
+                        slot: source.input_slot,
+                        offset: resolved.offset,
+                        instance_step_rate: resolved.per_instance.then_some(source.instance_step_rate),
+                    });
+                }
+                // Kept with this graphics pipeline's layout, never in the
+                // cache for ordinary vertex shaders.
+                let compiled = convert_vertex_with_stage_in(&host.dxil, &root_params(host), &static_samplers(host), &elements)
+                    .map_err(|e| e.to_string())?;
+                stage_in = Some(self.device.library(&compiled.stage_in).map_err(|e| e.to_string())?);
+                compiled.shader
+            } else {
+                convert_cached(host, stage)?
+            };
             let lib = self.device.library(&c.metallib).map_err(|e| e.to_string())?;
             stages.push((c.top_level.clone(), bind));
             match bind {
@@ -134,12 +171,12 @@ impl MetalBackend {
                 }
             }
         }
-        let m = map::map_pipeline_state(input);
         let mut desc = render_desc(&m);
         let frag = fragment.as_ref().map(|(l, n)| (l, n.as_str()));
-        let make = |desc: &victory_metal::render::RenderPipelineDesc| match (&vertex, &mesh) {
-            (Some((l, n)), _) => self.device.render_pipeline_desc((l, n), frag, desc),
-            (None, Some((l, n))) => self.device.mesh_render_pipeline_desc((l, n), frag, desc),
+        let make = |desc: &victory_metal::render::RenderPipelineDesc| match (&vertex, &mesh, &stage_in) {
+            (Some((l, n)), _, Some(stage_in)) => self.device.render_pipeline_stage_in((l, n), frag, desc, stage_in),
+            (Some((l, n)), _, None) => self.device.render_pipeline_desc((l, n), frag, desc),
+            (None, Some((l, n)), None) => self.device.mesh_render_pipeline_desc((l, n), frag, desc),
             _ => Err(victory_metal::Error("no vertex or mesh stage".into())),
         };
         let pso = match make(&desc) {
@@ -178,6 +215,7 @@ impl MetalBackend {
             name: p.name.clone(),
             pso,
             dss,
+            vertex_slots,
             raster: [
                 r.fill.map_or(0, |v| v as u64 as u8),
                 r.cull.map_or(0, |v| v as u64 as u8),
@@ -352,7 +390,7 @@ pub(crate) enum DrawKindIn {
 
 pub(crate) enum DrawKind {
     Vertices { count: u32, instances: u32, first: u32, first_instance: u32 },
-    Indexed { count: u32, instances: u32, first: u32, base: i32, first_instance: u32, buffer: Buffer, offset: u64, index_type: u8 },
+    Indexed { count: u32, instances: u32, base: i32, first_instance: u32, buffer: Buffer, offset: u32, index_type: u8 },
     Mesh { groups: [u64; 3] },
 }
 
@@ -361,6 +399,7 @@ pub(crate) struct MetalDraw {
     pub(crate) pso: Arc<MetalGraphics>,
     pub(crate) targets: Arc<Targets>,
     pub(crate) stages: Vec<StageBind>,
+    pub(crate) vertex: Option<Box<VertexFetch>>,
     pub(crate) viewport: sys::WMTViewport,
     pub(crate) scissor: sys::WMTScissorRect,
     pub(crate) blend: [f32; 4],
@@ -368,6 +407,12 @@ pub(crate) struct MetalDraw {
     /// MTLPrimitiveType.
     pub(crate) primitive: u8,
     pub(crate) kind: DrawKind,
+}
+
+pub(crate) struct VertexFetch {
+    pub(crate) table: [u8; victory_metal::msc::VERTEX_TABLE_SLOTS * 16],
+    /// Keep the addresses in `table` alive until replay completes.
+    pub(crate) _buffers: Vec<Buffer>,
 }
 
 /// One clear as recorded into a title list.
@@ -391,9 +436,10 @@ pub(crate) enum DrawDrop {
     Bind,
     IndexBuffer,
     Scissor,
+    VertexFetch,
 }
 
-static DRAW_COUNTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+static DRAW_COUNTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 pub(crate) fn count_draw(d: DrawDrop) {
     let n = DRAW_COUNTS[d as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -409,6 +455,7 @@ pub(crate) fn count_draw(d: DrawDrop) {
             bind = c[4],
             index_buffer = c[5],
             scissor = c[6],
+            vertex_fetch = c[7],
             "Metal draws: outcomes"
         );
     }
@@ -471,8 +518,9 @@ pub(crate) fn scissor(r: &windows::Win32::Foundation::RECT, width: u32, height: 
 pub(crate) fn draw_params(kind: &DrawKind) -> ([u32; 5], u16) {
     match *kind {
         DrawKind::Vertices { count, instances, first, first_instance } => ([count, instances, first, first_instance, 0], 0),
-        DrawKind::Indexed { count, instances, first, base, first_instance, index_type, .. } => {
-            ([count, instances, first, base as u32, first_instance], u16::from(index_type) + 1)
+        DrawKind::Indexed { count, instances, base, first_instance, offset, index_type, .. } => {
+            // The direct Metal IR helper uses the buffer byte offset, not the D3D index number.
+            ([count, instances, offset, base as u32, first_instance], u16::from(index_type) + 1)
         }
         DrawKind::Mesh { .. } => ([0; 5], 0),
     }

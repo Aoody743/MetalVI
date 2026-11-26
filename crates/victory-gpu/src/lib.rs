@@ -64,6 +64,21 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn present_count() -> u64 {
+    queue::presented()
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn stall_locks() -> Vec<(&'static str, usize)> {
+    let mut locks = vec![
+        ("shadow.BUFFERS", shadow::buffers_lock_address()),
+        ("watch.GUARDS", watch::guards_lock_address()),
+    ];
+    locks.extend(backend::metal::stall_locks());
+    locks
+}
+
 /// Set by the runtime: notes our own writes into title memory (address,
 /// bytes, kind: 1 a bottom-of-pipe write) for its crash reports
 /// (`victory_loader::writelog`).

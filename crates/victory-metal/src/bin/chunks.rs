@@ -127,8 +127,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = scratch as *mut u64;
     let out = (scratch + PAGE) as *mut u32;
 
-    let fence = std::cell::Cell::new(0u64);
     let probe = |chunks: &Chunks, pages: &[usize]| -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+        let _pool = Pool::new();
         // SAFETY: our scratch memory; the GPU is idle between probes.
         unsafe {
             *args = chunks.base;
@@ -147,7 +147,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ])?;
         cb.commit();
         cb.wait()?;
-        fence.set(fence.get() + 1);
         // SAFETY: written by the GPU, which is done.
         Ok((0..pages.len()).map(|i| unsafe { *out.add(i) }).collect())
     };
@@ -167,9 +166,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. Remap page 3 to spare section page PAGES+2 (xmem's XMemMapPhysicalPages).
+    // SAFETY: probe waited, dropped its command buffer, and no other queue
+    // or retained view uses these chunks.
+    unsafe { chunks.invalidate_quiesced((base + 3 * PAGE) as u64, PAGE as u64) };
     unmap(base + 3 * PAGE);
     map(s, PAGES + 2, 1, base + 3 * PAGE)?;
-    chunks.remapped((base + 3 * PAGE) as u64, PAGE as u64, fence.get());
+    chunks.wrap((base + 3 * PAGE) as u64, PAGE as u64);
     let got = probe(&chunks, &[3, 4])?;
     println!("2. after remapping page 3: read {:#x} (want {:#x}), page 4 {:#x} (want {:#x}); {:?}", got[0], marker(PAGES + 2), got[1], marker(4) + 1, chunks.stats);
     if got[0] != marker(PAGES + 2) || got[1] != marker(4) + 1 {
@@ -177,8 +179,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Unmap page 5 (a hole): the chunk falls back to per-page buffers.
+    // SAFETY: same quiescence as step 2.
+    unsafe { chunks.invalidate_quiesced((base + 5 * PAGE) as u64, PAGE as u64) };
     unmap(base + 5 * PAGE);
-    chunks.remapped((base + 5 * PAGE) as u64, PAGE as u64, fence.get());
+    chunks.wrap((base + 5 * PAGE) as u64, PAGE as u64);
     let got = probe(&chunks, &[5, 6])?;
     println!("3. after unmapping page 5: page 5 {:#x} (want 0xdead), page 6 {:#x} (want {:#x}); {:?}", got[0], got[1], marker(6) + 1, chunks.stats);
     if got[0] != 0xDEAD || got[1] != marker(6) + 1 {
@@ -218,9 +222,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("step 5".into());
     }
 
-    // 4. Old buffers go once the fence has passed.
-    let freed = chunks.retire(fence.get());
-    println!("4. retired {freed} buffers, {} still pending", chunks.retired_pending());
     Ok(())
 }
 
