@@ -980,6 +980,28 @@ pub(crate) fn host_has_f64() -> bool {
     HOST_F64.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the host supports `dx.op.attributeAtVertex` (PC D3D12 does;
+/// Metal / MSC 4.0.3 does not).
+static HOST_ATTR_AT_VERTEX: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Configures whether per-vertex pixel shader reads emit
+/// `dx.op.attributeAtVertex` directly (`true`, PC D3D12) or lower through
+/// `SV_PrimitiveID` + mirrored index/attribute root tables (`false`, Metal).
+pub fn set_host_attribute_at_vertex(supported: bool) {
+    HOST_ATTR_AT_VERTEX.store(supported, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `dx.op.attributeAtVertex` is emitted natively (`true`) or lowered
+/// via Plan B root tables (`false`).
+pub fn host_attribute_at_vertex() -> bool {
+    #[cfg(test)]
+    if let Some(supported) = TEST_HOST_ATTR_AT_VERTEX.get() {
+        return supported;
+    }
+    HOST_ATTR_AT_VERTEX.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the host GPU supports native 64-bit integer image atomics.
 static HOST_IMAGE_ATOMIC64: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -1085,6 +1107,8 @@ pub fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`host_attribute_at_vertex`], for its thread only.
+    pub(super) static TEST_HOST_ATTR_AT_VERTEX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// A test's host 64-bit image atomic support, for its thread only.
     pub(super) static TEST_HOST_IMAGE_ATOMIC64: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
@@ -2414,6 +2438,7 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            Input::PrimitiveId if self.s.pixel => return Val::I32(self.pixel_primitive_id()),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -2509,6 +2534,112 @@ impl<'a> Lower<'a> {
             self.s
                 .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
         )
+    }
+
+    /// Reads `SV_PrimitiveID` in a pixel shader via `ISG1` + `dx.op.loadInput.i32`.
+    fn pixel_primitive_id(&mut self) -> V {
+        let free = self
+            .s
+            .inputs
+            .iter()
+            .filter_map(|e| e.row)
+            .map(|r| r + 1)
+            .max()
+            .unwrap_or(0);
+        let id = match self.s.inputs.iter().position(|e| e.kind == 10) {
+            Some(id) => {
+                self.s.inputs[id].row.get_or_insert(free);
+                id
+            }
+            None => {
+                self.s.inputs.push(SigElement {
+                    name: "SV_PrimitiveID".into(),
+                    index: 0,
+                    kind: 10,
+                    comp: 5,
+                    interp: 1,
+                    row: Some(free),
+                    col: 0,
+                    cols: 1,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        match self.load_input(id, 0) {
+            Val::I32(v) => v,
+            _ => unreachable!("primitive id is an i32"),
+        }
+    }
+
+    /// Loads one 32-bit word from a raw root SRV (`dx.op.rawBufferLoad.f32`) as `f32`.
+    fn raw_srv_load_f32(&mut self, block: usize, handle: V, byte_offset: V) -> V {
+        let u = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let res = self.s.t.res_ret;
+        let ret = self.s.op(
+            block,
+            "rawBufferLoad.f32",
+            Attr::ReadOnly,
+            res,
+            139,
+            &[handle, byte_offset, u, mask, align],
+        );
+        self.s.m.extract(block, ret, 0)
+    }
+
+    /// Loads one 32-bit word from a raw root SRV as `i32`.
+    fn raw_srv_load_i32(&mut self, block: usize, handle: V, byte_offset: V) -> V {
+        let f = self.raw_srv_load_f32(block, handle, byte_offset);
+        self.s.m.cast(block, Cast::Bitcast, f, self.s.t.i32)
+    }
+
+    /// Byte offset in [`super::shader::SLOT_ATTR_TABLE`] / [`super::shader::SLOT_ATTR_SCRATCH`]:
+    /// `(((vertex_index << 5) + row) << 4) + (chan << 2)`.
+    fn attr_table_byte_offset(&mut self, block: usize, vertex_index: V, row: u32, chan: u32) -> V {
+        let k5 = self.s.m.i32(5);
+        let k_row = self.s.m.i32(row);
+        let k4 = self.s.m.i32(4);
+        let k_chan_bytes = self.s.m.i32(chan << 2);
+        let v_rows = self.s.m.bin(block, Bin::Shl, vertex_index, k5);
+        let slot = self.s.m.bin(block, Bin::Add, v_rows, k_row);
+        let row_bytes = self.s.m.bin(block, Bin::Shl, slot, k4);
+        self.s.m.bin(block, Bin::Add, row_bytes, k_chan_bytes)
+    }
+
+    /// B2 fallback (F41): mirrors one exported `Target::Param` channel into
+    /// [`super::shader::SLOT_ATTR_SCRATCH`] indexed by `SV_VertexID`.
+    fn vs_scratch_store(&mut self, id: usize, col: u8, bits: V) {
+        let Some(row) = self.s.outputs[id].row else {
+            return;
+        };
+        if row >= super::shader::ATTR_TABLE_ROWS {
+            return;
+        }
+        let chan = u32::from(self.s.outputs[id].col + col);
+        if chan >= 4 {
+            return;
+        }
+        let Val::I32(vid) = self.input(Input::VertexId) else {
+            return;
+        };
+        let uav = self.s.root_uav_handle(super::shader::SLOT_ATTR_SCRATCH);
+        let c = self.cur;
+        let byte_off = self.attr_table_byte_offset(c, vid, row, chan);
+        let u = self.s.m.undef(self.s.t.i32);
+        let mask = self.s.m.i8(1);
+        let align = self.s.m.i32(4);
+        let void = self.s.t.void;
+        self.s.op(
+            c,
+            "rawBufferStore.i32",
+            Attr::NoUnwind,
+            void,
+            140,
+            &[uav, byte_off, u, bits, u, u, u, mask, align],
+        );
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -9685,7 +9816,34 @@ impl<'a> Lower<'a> {
 
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
+    ///
+    /// When [`host_attribute_at_vertex`] is false (Metal/MSC 4.0.3), lowers
+    /// via `SV_PrimitiveID` → [`super::shader::SLOT_PRIM_IBO`] → vertex index →
+    /// [`super::shader::SLOT_ATTR_TABLE`] instead of `dx.op.attributeAtVertex`.
     fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+        if !host_attribute_at_vertex() {
+            let (row, chan) = {
+                let e = &mut self.s.inputs[id];
+                e.usage |= 1 << col;
+                (
+                    e.row.expect("attribute row for Plan B vertex_input"),
+                    u32::from(e.col + col),
+                )
+            };
+            let pid = self.pixel_primitive_id();
+            let entry = self.s.entry;
+            let k3 = self.s.m.i32(3);
+            let k_k = self.s.m.i32(u32::from(k));
+            let k2 = self.s.m.i32(2);
+            let prim_base = self.s.m.bin(entry, Bin::Mul, pid, k3);
+            let idx = self.s.m.bin(entry, Bin::Add, prim_base, k_k);
+            let ibo_byte = self.s.m.bin(entry, Bin::Shl, idx, k2);
+            let ibo = self.s.root_srv_handle(super::shader::SLOT_PRIM_IBO);
+            let vi = self.raw_srv_load_i32(entry, ibo, ibo_byte);
+            let attr_byte = self.attr_table_byte_offset(entry, vi, row, chan);
+            let attr = self.s.root_srv_handle(super::shader::SLOT_ATTR_TABLE);
+            return self.raw_srv_load_f32(entry, attr, attr_byte);
+        }
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -11301,6 +11459,12 @@ impl<'a> Lower<'a> {
         // not notice and the GPU's compiler crashes on. Compilers emit the
         // stores of an element together, so hosts are only tested with that.
         let mut ready = Vec::with_capacity(stores.len());
+        let mirror_scratch = !mesh
+            && !primitive
+            && !self.s.pixel
+            && self.s.geometry.is_none()
+            && !host_attribute_at_vertex();
+        let mut scratch = Vec::new();
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -11318,6 +11482,9 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
+            if mirror_scratch && el.kind == 0 {
+                scratch.push((id, col, x));
+            }
             let (suffix, x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
@@ -11351,6 +11518,9 @@ impl<'a> Lower<'a> {
                 opcode,
                 &args,
             );
+        }
+        for (id, col, bits) in scratch {
+            self.vs_scratch_store(id, col, bits);
         }
         self.end_guarded(at, &[]);
         Ok(())

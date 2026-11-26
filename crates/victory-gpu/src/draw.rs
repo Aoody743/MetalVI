@@ -2058,6 +2058,10 @@ impl State {
             match crate::backend::metal_map::map_topology(self.topology as i32) {
                 Some(t) => t.primitive_type as u64 as u8,
                 None => {
+                    crate::backend::metal_draw::note_once(format!("topology unmapped: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
+                    crate::backend::metal_draw::note_once(format!("geometry draw refused: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
+                    crate::backend::metal_draw::note_once(format!("geometry indexed draw refused: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
+                    crate::backend::metal_draw::note_once(format!("mesh draw with a geometry pipeline: topology {} mesh {} geometry {}", self.topology, g.mesh, g.geometry.is_some()));
                     count_draw(DrawDrop::Topology);
                     return;
                 }
@@ -2074,6 +2078,13 @@ impl State {
         if targets.width == 0 || !targets.fit(&g) {
             if targets.width != 0 {
                 crate::backend::metal_draw::note_mismatch(&targets, &g);
+            } else {
+                crate::backend::metal_draw::note_once(format!(
+                    "no attachments: {} target handles, depth handle {}, {}",
+                    self.target_handles.len(),
+                    self.depth_handle != 0,
+                    self.target_reasons(m)
+                ));
             }
             count_draw(DrawDrop::Targets);
             return;
@@ -2268,6 +2279,41 @@ impl State {
             }
             DrawKindIn::Mesh { .. } => None,
         }
+    }
+
+    /// Why the bound targets gave no attachments (diagnostics).
+    #[cfg(windows)]
+    fn target_reasons(&self, m: &crate::backend::metal::MetalBackend) -> String {
+        use crate::backend::metal_draw::level_slice;
+        let mut out = Vec::new();
+        for &h in &self.target_handles {
+            out.push(match crate::descriptor::rtv_record(h) {
+                None => "rtv: no record".to_string(),
+                Some(r) => match r.target_words() {
+                    None => "rtv: no words".to_string(),
+                    Some(w) => match level_slice(&w, false) {
+                        None => format!("rtv: dimension {}", w[1]),
+                        Some((l, sl)) => match m.texture_for(r.resource) {
+                            None => format!("rtv: no Metal texture (format {})", w[0]),
+                            Some(t) => format!("rtv: format {} level {l} slice {sl} texture {} mips {} slices {}", w[0], t.pixel.0, t.mips, t.slices),
+                        },
+                    },
+                },
+            });
+        }
+        if self.depth_handle != 0 {
+            out.push(match crate::descriptor::dsv_record(self.depth_handle) {
+                None => "dsv: no record".to_string(),
+                Some(r) => match r.depth_words() {
+                    None => "dsv: no words".to_string(),
+                    Some(w) => match m.texture_for(r.resource) {
+                        None => format!("dsv: no Metal texture (format {})", w[0]),
+                        Some(t) => format!("dsv: format {} dim {} texture {}", w[0], w[1], t.pixel.0),
+                    },
+                },
+            });
+        }
+        out.join("; ")
     }
 
     /// The bound render targets and depth view as Metal attachments.

@@ -55,6 +55,20 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 pub const SLOT_MEMORY: u8 = 254;
 /// See [`SLOT_MEMORY`].
 pub const SLOT_FAULTS: u8 = 253;
+/// Plan B (F20/F41): PS root SRV mirroring the draw's triangle index buffer
+/// (`u32` vertex index at `pid * 3 + k`, `k = 0, 1, 2`).
+pub const SLOT_PRIM_IBO: u8 = 252;
+/// Plan B (F20/F41): PS root SRV holding per-vertex attribute values; vertex
+/// `vi`, signature row `row` (0..31), channel `chan` (0..3) sits at byte
+/// offset `(((vi << 5) + row) << 4) + (chan << 2)`.
+pub const SLOT_ATTR_TABLE: u8 = 251;
+/// Plan B (F20/F41): VS root UAV scratch table mirroring `Target::Param`
+/// outputs by `SV_VertexID` with the same [`ATTR_TABLE_VERTEX_STRIDE`] layout.
+pub const SLOT_ATTR_SCRATCH: u8 = 250;
+/// Signature rows reserved per vertex in [`SLOT_ATTR_TABLE`] / [`SLOT_ATTR_SCRATCH`].
+pub const ATTR_TABLE_ROWS: u32 = 32;
+/// Bytes per vertex in [`SLOT_ATTR_TABLE`] / [`SLOT_ATTR_SCRATCH`] (`32 * 4 * 4`).
+pub const ATTR_TABLE_VERTEX_STRIDE: u32 = ATTR_TABLE_ROWS * 16;
 /// Entries of the [`SLOT_MEMORY`] directory: title addresses below 128 GiB.
 pub const MEMORY_PAGES: u32 = 1 << 21;
 /// Dwords of the [`SLOT_FAULTS`] buffer.

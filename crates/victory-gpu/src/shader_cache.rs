@@ -69,6 +69,8 @@ fn build() -> &'static [u8; 32] {
             victory_shader::emit::shader_opt(),
             // And whether pixel-stage 64-bit image atomics became ROV code.
             u32::from(victory_shader::emit::host_has_image_atomic64()),
+            // And whether per-vertex attribute reads use the table (F41).
+            u32::from(victory_shader::emit::host_attribute_at_vertex()),
         ] {
             hash.update(&n.to_le_bytes());
         }

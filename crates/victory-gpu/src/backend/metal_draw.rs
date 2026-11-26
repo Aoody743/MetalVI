@@ -819,3 +819,13 @@ mod console_topology_tests {
         assert!(console_indices(ConsoleTopology::TriangleFan, &[1, 2]).is_empty());
     }
 }
+
+/// Logs `what` once per distinct text (first 32), for drop diagnostics.
+pub(crate) fn note_once(what: String) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 32 && !seen.contains(&what) {
+        tracing::info!(what = %what, "Metal draws: a drop reason (first of its kind)");
+        seen.push(what);
+    }
+}

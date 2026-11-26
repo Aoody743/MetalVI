@@ -23,6 +23,14 @@ pub mod metal_detile;
 pub mod metal_draw;
 #[cfg(windows)]
 pub mod metal_present;
+// F44: texture write-back, not wired yet.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub mod metal_writeback;
+// F50: copies on the Metal path, not wired yet.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub mod metal_copy;
 // P2: graphics pipeline state → Metal descriptions (F7).
 #[allow(dead_code)]
 pub mod metal_render_map;

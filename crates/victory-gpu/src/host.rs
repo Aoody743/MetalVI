@@ -699,6 +699,9 @@ fn create() -> windows::core::Result<Host> {
             // pixel-stage ones become rasterizer-ordered loads and stores
             // (F38; the pipelines Metal refused as "float atomic").
             victory_shader::emit::set_host_image_atomic64(false);
+            // Metal Shader Converter refuses attributeAtVertex: per-vertex
+            // reads go through the primitive id and a table (F41).
+            victory_shader::emit::set_host_attribute_at_vertex(false);
         }
         let mut o0 = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
         if device

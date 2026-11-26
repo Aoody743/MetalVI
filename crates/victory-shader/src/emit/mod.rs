@@ -114,12 +114,17 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_has_image_atomic64, host_max_wave, set_host_f64, set_host_image_atomic64, set_host_max_wave};
+pub use lower::{
+    host_attribute_at_vertex, host_has_image_atomic64, host_max_wave, set_host_attribute_at_vertex, set_host_f64,
+    set_host_image_atomic64, set_host_max_wave,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, set_view_heap_limit, view_heap_limit,
+    ATTR_TABLE_ROWS, ATTR_TABLE_VERTEX_STRIDE, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, SLOT_ATTR_SCRATCH, SLOT_ATTR_TABLE, SLOT_FAULTS, SLOT_MEMORY, SLOT_PRIM_IBO,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_GROUP_BASE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_INTEGER, VIEW_SIGNED,
+    VIEW_STRIDE_BITS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -2035,5 +2040,185 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    fn with_attr_at_vertex<R>(supported: bool, f: impl FnOnce() -> R) -> R {
+        let prev = lower::TEST_HOST_ATTR_AT_VERTEX.replace(Some(supported));
+        let r = f();
+        lower::TEST_HOST_ATTR_AT_VERTEX.set(prev);
+        r
+    }
+
+    fn dxil_has_op(dxil: &[u8], op: &str) -> bool {
+        let c = Container::parse(dxil).unwrap();
+        let part = c.part(FourCC::DXIL).unwrap();
+        let bits: Vec<_> = part
+            .data
+            .iter()
+            .flat_map(|&b| (0..8).map(move |k| (b >> k) & 1))
+            .collect();
+        let name: Vec<_> = op
+            .bytes()
+            .flat_map(|b| {
+                let word = u16::from(b & 31) | 32 | (u16::from(b >> 5) << 6);
+                (0..12).map(move |k| ((word >> k) & 1) as u8)
+            })
+            .collect();
+        bits.windows(name.len()).any(|s| s == name)
+    }
+
+    #[test]
+    fn lowered_computed_barycentrics_uses_plan_b_tables() {
+        with_attr_at_vertex(false, || {
+            let [e0, e1] = exp_mrt0(2);
+            let words = [
+                0x1006_00F0, // v_mul_f32 v3, 0.5, v0
+                0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let shader = pixel(&words, PERSP_CENTER).unwrap();
+            let (features, inputs) = parts(&shader);
+            assert_ne!(features & 0x2_0000, 0, "SV_Barycentrics still used for i/j");
+            assert!(inputs.iter().any(|e| e.kind == 10 && e.name == "SV_PrimitiveID"));
+            assert!(inputs.iter().any(|e| e.kind == 28));
+            assert!(shader.root_srvs.contains(&SLOT_PRIM_IBO));
+            assert!(shader.root_srvs.contains(&SLOT_ATTR_TABLE));
+            assert!(!dxil_has_op(&shader.dxil, "dx.op.attributeAtVertex"));
+            assert!(dxil_has_op(&shader.dxil, "dx.op.rawBufferLoad.f32"));
+            assert_eq!(texcoord_mode(&shader), 1);
+            validate(&shader);
+        });
+    }
+
+    #[test]
+    fn lowered_constant_weights_has_no_barycentrics_flag() {
+        with_attr_at_vertex(false, || {
+            let [e0, e1] = exp_mrt0(2);
+            let words = [
+                0x7E06_02F0, // v_mov_b32 v3, 0.5
+                0xC808_0003, // v_interp_p1_f32 v2, v3, attr0.x
+                0xC809_0003, // v_interp_p2_f32 v2, v3, attr0.x
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let shader = pixel(&words, PERSP_CENTER).unwrap();
+            let (features, inputs) = parts(&shader);
+            assert_eq!(features & 0x2_0000, 0, "no Barycentrics needed with constant weights");
+            assert!(inputs.iter().any(|e| e.kind == 10 && e.name == "SV_PrimitiveID"));
+            assert!(inputs.iter().all(|e| e.kind != 28));
+            assert!(shader.root_srvs.contains(&SLOT_PRIM_IBO));
+            assert!(shader.root_srvs.contains(&SLOT_ATTR_TABLE));
+            assert!(!dxil_has_op(&shader.dxil, "dx.op.attributeAtVertex"));
+            validate(&shader);
+        });
+    }
+
+    #[test]
+    fn lowered_p10_and_p20_use_plan_b_tables() {
+        with_attr_at_vertex(false, || {
+            let [e0, e1] = exp_mrt0(2);
+            let words = [
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                0xC812_0000, // v_interp_mov_f32 v4, p10, attr0.x
+                0xC812_0100, // v_interp_mov_f32 v5, p20, attr0.x
+                v_add_f32(4, 4, 5),
+                v_add_f32(2, 2, 4),
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let shader = pixel(&words, PERSP_CENTER).unwrap();
+            let (_, inputs) = parts(&shader);
+            assert!(inputs.iter().any(|e| e.kind == 10));
+            assert!(shader.root_srvs.contains(&SLOT_PRIM_IBO));
+            assert!(shader.root_srvs.contains(&SLOT_ATTR_TABLE));
+            assert!(!dxil_has_op(&shader.dxil, "dx.op.attributeAtVertex"));
+            validate(&shader);
+        });
+    }
+
+    #[test]
+    fn lowered_vs_mirrors_param_outputs_to_scratch_uav() {
+        use crate::native::VsOutput;
+        with_attr_at_vertex(false, || {
+            let words = [
+                0x7E02_02F2, // v_mov_b32 v1, 1.0
+                // exp pos0, v1, v1, v1, v1
+                0xF800_00CF,
+                0x0101_0101,
+                // exp param0, v0, v1, v1, v1 done
+                0xF800_0A0F,
+                0x0101_0100,
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Vs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Vs {
+                    inputs: vec![],
+                    outputs: vec![VsOutput {
+                        usage: Usage::Generic,
+                        row: 1,
+                        param: 0,
+                        fp16: false,
+                        pack2: false,
+                    }],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let pos = SigElement { kind: 3, ..element("SV_Position", 3, 0) };
+            let tex = element("TEXCOORD", 0, 1);
+            let osg1 = container::signature(&[pos, tex], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            assert!(shader.root_uavs.contains(&SLOT_ATTR_SCRATCH));
+            let (features, inputs) = parts(&shader);
+            assert_ne!(features & 0x4, 0, "SFI0 UAVS_EVERY_STAGE flag");
+            assert!(inputs.iter().any(|e| e.kind == 1 && e.name == "SV_VertexID"));
+            assert!(dxil_has_op(&shader.dxil, "dx.op.rawBufferStore.i32"));
+            validate(&shader);
+        });
+    }
+
+    #[test]
+    fn lowered_packed_row_uses_element_col_plus_channel() {
+        with_attr_at_vertex(false, || {
+            let [e0, e1] = exp_mrt0(2);
+            // v_interp_mov_f32 v4, p10, attr0.w (chan 3 -> NORMAL.y at row 0, col 2 + 1 = 3)
+            let words = [
+                0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+                0xC812_0300 | (3 << 8), // v_interp_mov_f32 v4, p10, attr0.w? Wait: attr0.w = chan 3
+                v_add_f32(2, 2, 4),
+                e0,
+                e1,
+                S_ENDPGM,
+            ];
+            let xy = container::SigElement { cols: 2, ..element("TEXCOORD", 0, 0) };
+            let zw = container::SigElement { col: 2, cols: 2, ..element("NORMAL", 0, 0) };
+            let shader = pixel_with_inputs(&words, PERSP_CENTER, &[xy.clone(), zw.clone()]).unwrap();
+            assert!(shader.root_srvs.contains(&SLOT_PRIM_IBO));
+            assert!(shader.root_srvs.contains(&SLOT_ATTR_TABLE));
+            assert!(!dxil_has_op(&shader.dxil, "dx.op.attributeAtVertex"));
+            // Toggle back to true still emits attributeAtVertex.
+            with_attr_at_vertex(true, || {
+                let native_shader = pixel_with_inputs(&words, PERSP_CENTER, &[xy, zw]).unwrap();
+                assert!(dxil_has_op(&native_shader.dxil, "dx.op.attributeAtVertex"));
+            });
+            validate(&shader);
+        });
     }
 }

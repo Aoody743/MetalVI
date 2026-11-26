@@ -683,8 +683,8 @@ const FORMAT_TABLE: &[(i32, Option<MtlPixelFormat>, FormatProps, &str)] = &[
     (dxgi_format::D32_FLOAT_S8X24_UINT, Some(MtlPixelFormat::Depth32Float_Stencil8), FormatProps::depth_stencil(8), ""),
     (dxgi_format::R32_FLOAT_X8X24_TYPELESS, Some(MtlPixelFormat::X32_Stencil8), FormatProps::depth_stencil(8),
      "depth-only view: stencil channel discarded; maps to X32_Stencil8 paired format"),
-    (dxgi_format::X32_TYPELESS_G8X24_UINT, None, FormatProps::none(),
-     "stencil-only view of a 32-bit depth+stencil texture; Metal has no 32-bit-depth stencil-only format"),
+    (dxgi_format::X32_TYPELESS_G8X24_UINT, Some(MtlPixelFormat::X32_Stencil8), FormatProps::depth_stencil(8),
+     "stencil-only view of a 32-bit depth+stencil texture; Apple7 maps to X32_Stencil8 (F39)"),
 
     // --- Packed 32 bit ------------------------------------------------------
     (dxgi_format::R10G10B10A2_TYPELESS, Some(MtlPixelFormat::RGB10A2Unorm), FormatProps::uncompressed(4),
@@ -720,12 +720,14 @@ const FORMAT_TABLE: &[(i32, Option<MtlPixelFormat>, FormatProps, &str)] = &[
     (dxgi_format::R32_SINT, Some(MtlPixelFormat::R32Sint), FormatProps::uncompressed(4), ""),
 
     // --- Depth/stencil, 24+8 -------------------------------------------------
-    (dxgi_format::R24G8_TYPELESS, Some(MtlPixelFormat::Depth24Unorm_Stencil8), FormatProps::depth_stencil(4),
-     "typeless twin of D24_UNORM_S8_UINT"),
-    (dxgi_format::D24_UNORM_S8_UINT, Some(MtlPixelFormat::Depth24Unorm_Stencil8), FormatProps::depth_stencil(4), ""),
-    (dxgi_format::R24_UNORM_X8_TYPELESS, Some(MtlPixelFormat::Depth24Unorm_Stencil8), FormatProps::depth_stencil(4),
-     "depth-only view: stencil bits ignored when sampled; paired 24/8 format reused"),
-    (dxgi_format::X24_TYPELESS_G8_UINT, Some(MtlPixelFormat::X24_Stencil8), FormatProps::depth_stencil(4), ""),
+    (dxgi_format::R24G8_TYPELESS, Some(MtlPixelFormat::Depth32Float_Stencil8), FormatProps::depth_stencil(8),
+     "typeless twin of D24_UNORM_S8_UINT; Depth24Unorm_Stencil8 unsupported on Apple7, upconvert to Depth32Float_Stencil8 (F39)"),
+    (dxgi_format::D24_UNORM_S8_UINT, Some(MtlPixelFormat::Depth32Float_Stencil8), FormatProps::depth_stencil(8),
+     "Depth24Unorm_Stencil8 invalid on Apple7; upconvert to Depth32Float_Stencil8 (F39)"),
+    (dxgi_format::R24_UNORM_X8_TYPELESS, Some(MtlPixelFormat::Depth32Float_Stencil8), FormatProps::depth_stencil(8),
+     "depth-only view of the upconverted Depth32Float_Stencil8 parent; stencil bits ignored (F39)"),
+    (dxgi_format::X24_TYPELESS_G8_UINT, Some(MtlPixelFormat::X32_Stencil8), FormatProps::depth_stencil(8),
+     "X24_Stencil8 invalid on Apple7; stencil-only view maps to X32_Stencil8 (F39)"),
 
     // --- 16 bit, two channels (8×2) ----------------------------------------
     (dxgi_format::R8G8_TYPELESS, Some(MtlPixelFormat::RG8Unorm), FormatProps::uncompressed(2),

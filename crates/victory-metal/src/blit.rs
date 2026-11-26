@@ -1,4 +1,4 @@
-//! Blit encoder: GPU-side buffer↔buffer and buffer→texture copies.
+//! Blit encoder: GPU-side buffer↔buffer, buffer↔texture, and texture↔texture copies.
 //!
 //! Like [`crate::CommandBuffer::compute`], the commands are built here and
 //! handed to the unix side as a linked chain in one `encodeCommands` call.
@@ -11,6 +11,11 @@ use crate::sys;
 use crate::texture::Texture;
 use crate::{Buffer, CommandBuffer, Error, Result};
 use sys::obj_handle_t;
+
+/// `MTLBlitOption` values from Metal `MTLBlitCommandEncoder.h`.
+pub const BLIT_OPTION_NONE: u16 = 0;
+pub const BLIT_OPTION_DEPTH: u16 = 1 << 0;
+pub const BLIT_OPTION_STENCIL: u16 = 1 << 1;
 
 /// A blit encoder for one command buffer; commands accumulate until
 /// [`BlitEncoder::finish`] (also runs on drop).
@@ -41,7 +46,12 @@ macro_rules! blit_cmd {
 blit_cmd!(
     sys::wmtcmd_blit_copy_from_buffer_to_buffer,
     sys::wmtcmd_blit_copy_from_buffer_to_texture,
-    sys::wmtcmd_blit_copy_from_texture_to_buffer
+    sys::wmtcmd_blit_copy_from_buffer_to_texture_withblitoption,
+    sys::wmtcmd_blit_copy_from_texture_to_buffer,
+    sys::wmtcmd_blit_copy_from_texture_to_buffer_withblitoption,
+    sys::wmtcmd_blit_copy_from_texture_to_texture,
+    sys::wmtcmd_blit_copy_texture,
+    sys::wmtcmd_blit_fillbuffer
 );
 
 fn null_next() -> sys::WMTMemoryPointer {
@@ -139,6 +149,127 @@ impl BlitEncoder {
             offset: dst_offset,
             bytes_per_row,
             bytes_per_image,
+        }));
+    }
+
+    /// `copyFromBuffer:sourceOffset:sourceBytesPerRow:sourceBytesPerImage:
+    /// sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options:`
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_from_buffer_to_texture_with_options(
+        &mut self,
+        src: &Buffer,
+        src_offset: u64,
+        bytes_per_row: u32,
+        bytes_per_image: u32,
+        size: [u64; 3],
+        dst: &Texture,
+        slice: u32,
+        level: u16,
+        origin: [u64; 3],
+        options: u16,
+    ) {
+        self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_buffer_to_texture_withblitoption {
+            type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromBufferToTextureWithBlitOption,
+            reserved: [0; 3],
+            next: null_next(),
+            src: src.handle(),
+            src_offset,
+            bytes_per_row,
+            bytes_per_image,
+            size: sys::WMTSize { width: size[0], height: size[1], depth: size[2] },
+            dst: dst.handle(),
+            slice,
+            level,
+            options,
+            origin: sys::WMTOrigin { x: origin[0], y: origin[1], z: origin[2] },
+        }));
+    }
+
+    /// `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:
+    /// toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:options:`
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_from_texture_to_buffer_with_options(
+        &mut self,
+        src: &Texture,
+        slice: u32,
+        level: u16,
+        origin: [u64; 3],
+        size: [u64; 3],
+        dst: &Buffer,
+        dst_offset: u64,
+        bytes_per_row: u32,
+        bytes_per_image: u32,
+        options: u16,
+    ) {
+        self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_texture_to_buffer_withblitoption {
+            type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromTextureToBufferWithBlitOption,
+            reserved: [0; 3],
+            next: null_next(),
+            src: src.handle(),
+            slice,
+            level,
+            options,
+            origin: sys::WMTOrigin { x: origin[0], y: origin[1], z: origin[2] },
+            size: sys::WMTSize { width: size[0], height: size[1], depth: size[2] },
+            dst: dst.handle(),
+            offset: dst_offset,
+            bytes_per_row,
+            bytes_per_image,
+        }));
+    }
+
+    /// `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:
+    /// toTexture:destinationSlice:destinationLevel:destinationOrigin:`
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_from_texture_to_texture(
+        &mut self,
+        src: &Texture,
+        src_slice: u32,
+        src_level: u32,
+        src_origin: [u64; 3],
+        src_size: [u64; 3],
+        dst: &Texture,
+        dst_slice: u32,
+        dst_level: u32,
+        dst_origin: [u64; 3],
+    ) {
+        self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_texture_to_texture {
+            type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromTextureToTexture,
+            reserved: [0; 3],
+            next: null_next(),
+            src: src.handle(),
+            src_slice,
+            src_level,
+            src_origin: sys::WMTOrigin { x: src_origin[0], y: src_origin[1], z: src_origin[2] },
+            src_size: sys::WMTSize { width: src_size[0], height: src_size[1], depth: src_size[2] },
+            dst: dst.handle(),
+            dst_slice,
+            dst_level,
+            dst_origin: sys::WMTOrigin { x: dst_origin[0], y: dst_origin[1], z: dst_origin[2] },
+        }));
+    }
+
+    /// `copyFromTexture:toTexture:` (whole resource, identical dimensions & format).
+    pub fn copy_texture(&mut self, src: &Texture, dst: &Texture) {
+        self.commands.push(Box::new(sys::wmtcmd_blit_copy_texture {
+            type_: sys::WMTBlitCommandType::WMTBlitCommandCopyTexture,
+            reserved: [0; 3],
+            next: null_next(),
+            src: src.handle(),
+            dst: dst.handle(),
+        }));
+    }
+
+    /// `fillBuffer:range:value:`
+    pub fn fill_buffer(&mut self, buffer: &Buffer, offset: u64, length: u64, value: u8) {
+        self.commands.push(Box::new(sys::wmtcmd_blit_fillbuffer {
+            type_: sys::WMTBlitCommandType::WMTBlitCommandFillBuffer,
+            reserved: [0; 3],
+            next: null_next(),
+            buffer: buffer.handle(),
+            offset,
+            length,
+            value,
         }));
     }
 
