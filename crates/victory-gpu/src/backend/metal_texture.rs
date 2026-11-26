@@ -293,6 +293,9 @@ impl MetalBackend {
             }
         }
         let key = (r as usize, key_words, unordered);
+        if unordered {
+            super::metal_draw::note_write(r as usize, 5);
+        }
         if let Some((_, e)) = self.views.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Some(*e);
         }

@@ -932,9 +932,9 @@ pub(crate) static DRAWN_TARGETS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync
 /// What wrote each title texture since the last capture (only when
 /// capturing): draws, clears, copies on Metal; resolves and buffer copies
 /// that run on D3D12 only.
-pub(crate) static WRITES: std::sync::Mutex<Vec<(usize, [u32; 5])>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static WRITES: std::sync::Mutex<Vec<(usize, [u32; 6])>> = std::sync::Mutex::new(Vec::new());
 
-pub(crate) const WRITE_NAMES: [&str; 5] = ["draw", "clear", "copy", "resolve_d3d_only", "buffer_copy_d3d_only"];
+pub(crate) const WRITE_NAMES: [&str; 6] = ["draw", "clear", "copy", "resolve_d3d_only", "buffer_copy_d3d_only", "uav_view"];
 
 /// Notes a write of kind `kind` (an index into [`WRITE_NAMES`]) to `resource`.
 pub(crate) fn note_write(resource: usize, kind: usize) {
@@ -945,7 +945,7 @@ pub(crate) fn note_write(resource: usize, kind: usize) {
     match w.iter_mut().find(|(r, _)| *r == resource) {
         Some((_, n)) => n[kind] += 1,
         None => {
-            let mut n = [0; 5];
+            let mut n = [0; 6];
             n[kind] = 1;
             w.push((resource, n));
         }
