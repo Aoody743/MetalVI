@@ -319,6 +319,8 @@ impl MetalBackend {
         let levels = (levels.0.min(t.mips - 1), levels.1.min(t.mips - levels.0.min(t.mips - 1)).max(1));
         let slices = (slices.0.min(t.slices - 1), slices.1.min(t.slices - slices.0.min(t.slices - 1)).max(1));
         let type_ = view_type(&t, type_, slices.1);
+        // No swizzle on depth formats (not something to risk an assertion on).
+        let swizzle = if is_depth_pixel(format.0) { identity() } else { swizzle };
         let mut id = 0u64;
         let _pool = victory_metal::Pool::new();
         // SAFETY: a live texture; the view is kept below.
@@ -450,7 +452,9 @@ pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
     let own = format_props(crate::resource::pc_format(t.desc.format) as i32);
     let want = format_props(crate::resource::pc_format(wanted) as i32);
     let (Some(own), Some(want)) = (own, want) else { return t.pixel };
-    if own.depth_stencil {
+    // A depth texture by its Metal format (a typeless title format made a
+    // depth one, `depth_pixel`): depth formats cast to nothing else.
+    if own.depth_stencil || is_depth_pixel(t.pixel.0) {
         // R8_UINT (62), X24_TYPELESS_G8_UINT (47), X32_TYPELESS_G8X24_UINT (21)
         let stencil = matches!(wanted, 62 | 47 | 21);
         return match (stencil, t.pixel) {
