@@ -940,6 +940,11 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The Metal copy, when there is one, changed too.
+        #[cfg(windows)]
+        if let Some(m) = crate::backend::metal::backend() {
+            m.refill_memory(self.memory);
+        }
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(

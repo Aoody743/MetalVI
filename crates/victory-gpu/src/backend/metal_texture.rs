@@ -85,6 +85,9 @@ pub(crate) fn pixel_format(dxgi: u32) -> Option<WMTPixelFormat> {
     })
 }
 
+/// Title memory of title-filled Metal textures: address to resource.
+static FILLED: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 impl MetalBackend {
     /// The Metal texture of title texture `r`, made (and for title-filled
     /// textures, filled) on first use.
@@ -165,8 +168,27 @@ impl MetalBackend {
         let t = MetalTexture { texture, pixel, desc: d, mips, slices };
         if d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0 && super::metal::texture_fill_on() {
             self.fill(&t, memory);
+            FILLED.lock().unwrap_or_else(|e| e.into_inner()).insert(memory as usize, r as usize);
         }
         Some(t)
+    }
+
+    /// The title rewrote the memory of a title-filled texture (the D3D12
+    /// path found it changed when a list sampled it): fills its Metal copy
+    /// again. `VICTORY_METAL_REFILL=0` turns it off.
+    pub(crate) fn refill_memory(&self, memory: *const u8) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var("VICTORY_METAL_REFILL").map_or(true, |v| v != "0")) {
+            return;
+        }
+        let Some(r) = FILLED.lock().unwrap_or_else(|e| e.into_inner()).get(&(memory as usize)).copied() else { return };
+        let Some(Some(t)) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&r).cloned() else { return };
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(refills = n, "Metal textures filled again from title memory");
+        }
+        self.fill(&t, memory);
     }
 
     /// Detiles a title-filled texture's console memory into it (all mips
