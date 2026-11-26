@@ -49,10 +49,38 @@ enum Held {
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
-    /// (which it may reset meanwhile), and the order they run in.
-    Run(Vec<crate::list::Detached>, Vec<usize>),
+    /// (which it may reset meanwhile), the order they run in, and what they
+    /// recorded for Metal (run with them, after the same waits).
+    Run(Vec<crate::list::Detached>, Vec<usize>, MetalOps),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+}
+
+/// What a submission's lists recorded for Metal (`VICTORY_METAL`).
+#[cfg(windows)]
+type MetalOps = Vec<std::sync::Arc<crate::backend::metal::MetalOp>>;
+#[cfg(not(windows))]
+type MetalOps = Vec<()>;
+
+/// The Metal ops recorded into `lists`, in order.
+#[allow(unused_variables)]
+fn metal_ops(lists: &[This]) -> MetalOps {
+    #[cfg(windows)]
+    if crate::backend::metal::backend().is_some() {
+        return lists.iter().flat_map(|&l| crate::list::metal_commands(l)).collect();
+    }
+    Vec::new()
+}
+
+/// Runs a submission's Metal ops (waited for before returning).
+#[allow(unused_variables)]
+fn run_metal(ops: &MetalOps) {
+    #[cfg(windows)]
+    if !ops.is_empty()
+        && let Some(m) = crate::backend::metal::backend()
+    {
+        m.run(ops);
+    }
 }
 
 /// The queues that hold something (their addresses).
@@ -154,6 +182,10 @@ fn submit_cut(this: This, lists: &[This]) {
             first < lists.len()
         )
     });
+    // Metal: the lists run at once run their ops now; the rest go with the
+    // last part (after every wait of this submission).
+    run_metal(&metal_ops(&lists[..first]));
+    let mut rest_ops = Some(metal_ops(&lists[first..]));
     if first > 0 && crate::host::late() {
         // Sent to the card and not waited for: their host sides are taken
         // from the title's lists (which it may reset before they have run)
@@ -188,9 +220,11 @@ fn submit_cut(this: This, lists: &[This]) {
         }
         {
             let mut held = lock(&queue(this).held);
-            for (waits, taken, order) in parts {
+            let n = parts.len();
+            for (k, (waits, taken, order)) in parts.into_iter().enumerate() {
                 held.extend(waits.into_iter().map(Held::Value));
-                held.push(Held::Run(taken, order));
+                let ops = if k + 1 == n { rest_ops.take().unwrap_or_default() } else { Vec::new() };
+                held.push(Held::Run(taken, order, ops));
             }
         }
         let mut waiting = lock(&WAITING);
@@ -271,7 +305,7 @@ fn submit_split(this: This, lists: &[This]) {
             let waits: Vec<crate::list::ValueWait> = by[from..to].concat();
             pieces.extend(waits.into_iter().map(Held::Value));
             let (taken, order) = crate::list::detach(&lists[from..to]);
-            pieces.push(Held::Run(taken, order));
+            pieces.push(Held::Run(taken, order, metal_ops(&lists[from..to])));
             from = to;
         }
         lock(&queue(this).held).extend(pieces);
@@ -347,7 +381,8 @@ pub(crate) fn release_held(all: bool) {
                             }
                         }
                     }
-                    Held::Run(lists, order) => {
+                    Held::Run(lists, order, ops) => {
+                        run_metal(&ops);
                         #[cfg(feature = "diagnostics")]
                         crate::capture::op(q, || {
                             format!(
@@ -517,12 +552,13 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
+    // Metal ops run with their lists, after the same waits (held below, or
+    // at once when nothing holds the submission). Without a host GPU they
+    // run now.
     #[cfg(windows)]
-    if let Some(m) = crate::backend::metal::backend() {
+    if crate::host::host().is_none() {
         // SAFETY: the title passes `count` lists.
-        let titles = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let cmds: Vec<_> = titles.iter().flat_map(|&l| crate::list::metal_commands(l)).collect();
-        m.run(&cmds);
+        run_metal(&metal_ops(unsafe { std::slice::from_raw_parts(lists, count as usize) }));
     }
     #[cfg(windows)]
     if let Some(host) = crate::host::host() {
@@ -552,10 +588,15 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
                 }
             }
         }
+        let ops = metal_ops(lists);
+        let mut pending = Some(ops);
         let kept = hold(this, || {
             let (taken, order) = crate::list::detach(lists);
-            Held::Run(taken, order)
+            Held::Run(taken, order, pending.take().unwrap_or_default())
         });
+        if !kept && let Some(ops) = pending.take() {
+            run_metal(&ops);
+        }
         // Diagnostics: the order submissions are made in, next to the
         // commands of the frame's `ops` file (which are in recording order).
         #[cfg(feature = "diagnostics")]
