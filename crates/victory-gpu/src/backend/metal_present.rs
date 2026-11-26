@@ -40,6 +40,9 @@ fragment float4 present_fs(V in [[stage_in]], texture2d<float> t [[texture(0)]])
 
 struct Presenter {
     layer: MetalLayer,
+    /// F55's colour conversion (sRGB, scRGB tone map); the plain blit below
+    /// is the fallback when it refuses a source.
+    converter: Option<victory_metal::present::convert::PresentConverter>,
     library: Object,
     /// The blit pipeline for the drawable's pixel format.
     pipeline: Option<(u32, RenderPipeline)>,
@@ -73,8 +76,12 @@ impl MetalBackend {
                     return false;
                 }
             };
-            tracing::info!("Metal present: drawing into the window's layer");
-            *guard = Some(Presenter { layer, library, pipeline: None, size: (0, 0) });
+            let converter = victory_metal::present::convert::PresentConverter::new(&self.device).ok();
+            if converter.is_some() {
+                let _ = victory_metal::present::convert::PresentConverter::configure_sdr_layer(&layer);
+            }
+            tracing::info!(converter = converter.is_some(), "Metal present: drawing into the window's layer");
+            *guard = Some(Presenter { layer, converter, library, pipeline: None, size: (0, 0) });
         }
         let p = guard.as_mut().expect("made above");
         // The drawable follows the window's client area.
@@ -86,6 +93,20 @@ impl MetalBackend {
         let Ok(drawable) = p.layer.next_drawable() else { return false };
         let Ok(target) = drawable.texture() else { return false };
         let target = Texture::from_object(target);
+        // F55 first: the source's typed format decides the transfer.
+        if let Some(conv) = p.converter.as_mut() {
+            let dxgi = crate::resource::pc_format(source.desc.format);
+            if let Ok(cb) = self.queue.command_buffer() {
+                match conv.draw(&cb, &source.texture, dxgi, &target, Default::default()) {
+                    Ok(()) => {
+                        cb.present(&drawable);
+                        cb.commit();
+                        return true;
+                    }
+                    Err(e) => warn_once("colour conversion refused the source, plain blit instead", &e),
+                }
+            }
+        }
         // SAFETY: a live texture.
         let format = unsafe { sys::MTLTexture_pixelFormat(target.handle()) }.0;
         if p.pipeline.as_ref().is_none_or(|(f, _)| *f != format) {
