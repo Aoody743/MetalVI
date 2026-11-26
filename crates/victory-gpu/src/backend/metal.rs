@@ -453,7 +453,7 @@ impl MetalBackend {
                         steps.push(Compute::Dispatch { groups: c.groups });
                         i += 1;
                     }
-                    ok = cb.compute(&steps).is_ok();
+                    ok = encoded("compute pass", cb.compute(&steps), || String::new());
                 }
                 MetalOp::Copy(c) => {
                     if let Err(e) = super::metal_copy::encode_texture_to_texture(
@@ -521,7 +521,7 @@ impl MetalBackend {
                             pass.stencil = Some(PassDepth { load: if c.stencil.is_some() { clear } else { load }, ..d });
                         }
                     }
-                    ok = cb.render_pass_with(&pass, &[]).is_ok();
+                    ok = encoded("clear pass", cb.render_pass_with(&pass, &[]), || format!("{}x{} format {} level {} slice {}", c.target.width, c.target.height, c.target.pixel, c.target.level, c.target.slice));
                     i += 1;
                 }
                 MetalOp::Draw(first) => {
@@ -691,7 +691,10 @@ impl MetalBackend {
                         });
                         i += 1;
                     }
-                    ok = cb.render_pass_with(&pass, &steps).is_ok();
+                    ok = encoded("render pass", cb.render_pass_with(&pass, &steps), || {
+                        let colors: Vec<u32> = t.colors.iter().map(|c| c.as_ref().map_or(0, |c| c.pixel)).collect();
+                        format!("{}x{} samples {} colors {:?} depth {:?} stencil {}", t.width, t.height, t.samples, colors, t.depth.as_ref().map(|d| d.pixel), t.stencil)
+                    });
                 }
             }
             if split && ok {
@@ -1323,4 +1326,19 @@ pub(crate) fn render_desc(map: &super::metal_render_map::RenderPipelineMap) -> v
 /// Integer (uint/sint) Metal pixel formats: never blendable.
 pub(crate) fn integer_format(f: u32) -> bool {
     matches!(f, 13 | 14 | 23 | 24 | 33 | 34 | 53 | 54 | 63 | 64 | 73 | 74 | 91 | 103 | 104 | 113 | 114 | 123 | 124)
+}
+
+/// Whether a pass encoded; a failure (the whole submission is then dropped)
+/// logged the first times with what the pass was.
+fn encoded(what: &str, r: victory_metal::Result<()>, detail: impl FnOnce() -> String) -> bool {
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                tracing::warn!(error = %e, detail = %detail(), "Metal: a {what} did not encode; the submission is dropped");
+            }
+            false
+        }
+    }
 }
