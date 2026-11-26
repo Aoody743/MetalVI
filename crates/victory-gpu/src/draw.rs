@@ -2266,6 +2266,7 @@ impl State {
             None => victory_metal::sys::WMTScissorRect { x: 0, y: 0, width: u64::from(targets.width), height: u64::from(targets.height) },
         };
         count_draw(DrawDrop::Ran);
+        crate::backend::metal_draw::note_targets(&targets);
         self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Draw(MetalDraw {
             pso: g,
             targets,

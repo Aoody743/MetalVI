@@ -353,13 +353,15 @@ impl MetalBackend {
         };
         let width = (t.desc.width as u32 >> level).max(1);
         let height = (t.desc.height.max(1) >> level).max(1);
-        Some(Attachment { texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8 })
+        Some(Attachment { resource: resource as usize, texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8 })
     }
 }
 
 /// One render target or depth attachment.
 #[derive(Clone)]
 pub(crate) struct Attachment {
+    /// The title resource it is a view of (for captures).
+    pub(crate) resource: usize,
     pub(crate) texture: Texture,
     /// Its Metal pixel format.
     pub(crate) pixel: u32,
@@ -626,14 +628,18 @@ impl MetalBackend {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         let Some(dir) = std::env::var_os("VICTORY_METAL_CAPTURE_DIR") else { return };
         let Some(t) = self.texture_for(resource) else { return };
-        // RGBA8 (70..=71), BGRA8 (80..=81); others not written.
-        let bgra = match t.pixel.0 {
-            70 | 71 => false,
-            80 | 81 => true,
+        // Bytes per pixel of the formats written (others are skipped):
+        // RGBA8 70/71, BGRA8 80/81, RGB10A2 90, RG11B10F 92, RGBA16F 115,
+        // RGBA32F 125.
+        let bpp: u32 = match t.pixel.0 {
+            70 | 71 | 80 | 81 | 90 | 92 => 4,
+            115 => 8,
+            125 => 16,
             _ => return,
         };
+        let format = t.pixel.0;
         let (w, h) = (t.desc.width as u32, t.desc.height.max(1));
-        let row = (w * 4).next_multiple_of(256);
+        let row = (w * bpp).next_multiple_of(256);
         let bytes = (row * h) as usize;
         let _pool = victory_metal::Pool::new();
         // SAFETY: a fresh allocation, freed after the GPU is done.
@@ -655,12 +661,8 @@ impl MetalBackend {
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
                 for y in 0..h as usize {
                     for x in 0..w as usize {
-                        let p = &data[y * row as usize + x * 4..][..4];
-                        if bgra {
-                            out.extend_from_slice(&[p[2], p[1], p[0]]);
-                        } else {
-                            out.extend_from_slice(&p[..3]);
-                        }
+                        let p = &data[y * row as usize + x * bpp as usize..][..bpp as usize];
+                        out.extend_from_slice(&rgb8(format, p));
                     }
                 }
                 let path = std::path::Path::new(&dir).join(format!("{name}.ppm"));
@@ -870,4 +872,68 @@ pub(crate) struct MetalTexCopy {
     pub(crate) dst_slice: u32,
     pub(crate) dst_level: u32,
     pub(crate) dst_origin: [u64; 3],
+}
+
+/// One pixel of a captured format as 8-bit RGB (floats clamped to 0..1).
+fn rgb8(format: u32, p: &[u8]) -> [u8; 3] {
+    let u = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    let word = || u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+    match format {
+        80 | 81 => [p[2], p[1], p[0]],
+        90 => {
+            let w = word();
+            [((w & 1023) >> 2) as u8, (((w >> 10) & 1023) >> 2) as u8, (((w >> 20) & 1023) >> 2) as u8]
+        }
+        92 => {
+            // R11 G11 B10 floats: 5-bit exponent, 6/6/5-bit mantissas
+            let w = word();
+            let f = |bits: u32, mant: u32| -> f32 {
+                let e = (bits >> mant) & 31;
+                let m = bits & ((1 << mant) - 1);
+                if e == 0 {
+                    m as f32 / (1 << mant) as f32 * 2f32.powi(-14)
+                } else {
+                    (1.0 + m as f32 / (1 << mant) as f32) * 2f32.powi(e as i32 - 15)
+                }
+            };
+            [u(f(w & 2047, 6)), u(f((w >> 11) & 2047, 6)), u(f((w >> 22) & 1023, 5))]
+        }
+        115 => {
+            let h = |i: usize| half_to_f32(u16::from_le_bytes([p[i], p[i + 1]]));
+            [u(h(0)), u(h(2)), u(h(4))]
+        }
+        125 => {
+            let f = |i: usize| f32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+            [u(f(0)), u(f(4)), u(f(8))]
+        }
+        _ => [p[0], p[1], p[2]],
+    }
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = i32::from((h >> 10) & 31);
+    let m = f32::from(h & 1023);
+    s * match e {
+        0 => m / 1024.0 * 2f32.powi(-14),
+        31 => f32::INFINITY,
+        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
+/// The colour targets Metal drew into since the last capture: resource →
+/// pixel area (for captures of intermediate targets).
+pub(crate) static DRAWN_TARGETS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes the colour targets of a recorded draw (only when capturing).
+pub(crate) fn note_targets(t: &Targets) {
+    if capture_every() == 0 {
+        return;
+    }
+    let mut d = DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    for a in t.colors.iter().flatten() {
+        if !d.iter().any(|(r, _)| *r == a.resource) {
+            d.push((a.resource, u64::from(a.width) * u64::from(a.height)));
+        }
+    }
 }

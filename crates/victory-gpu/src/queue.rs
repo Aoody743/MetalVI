@@ -898,6 +898,12 @@ extern "system" fn present(
         // SAFETY: the plane lists `count` resources.
         let resource = unsafe { *plane.resources };
         m.capture(resource, &format!("frame{frame:06}"));
+        // And the largest targets Metal drew into since the last capture.
+        let mut drawn = std::mem::take(&mut *crate::backend::metal_draw::DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+        drawn.sort_by_key(|&(_, area)| std::cmp::Reverse(area));
+        for (k, (r, _)) in drawn.into_iter().take(6).enumerate() {
+            m.capture(r as This, &format!("frame{frame:06}-rt{k}"));
+        }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
