@@ -2328,6 +2328,8 @@ impl State {
                     Some(crate::descriptor::View::Shader(r, w)) => {
                         let t = m.texture_for(*r as This);
                         after.push((*r, format!("{n}-read{k}")));
+                        // Followed from now on: who draws into it is next.
+                        crate::backend::metal_draw::note_presented(*r);
                         format!("srv res {r} words {w:?} metal {:?}", t.map(|t| (t.pixel.0, t.desc.width, t.desc.height, t.desc.flags)))
                     }
                     Some(crate::descriptor::View::Unordered(r, _, _)) => format!("uav res {r}"),

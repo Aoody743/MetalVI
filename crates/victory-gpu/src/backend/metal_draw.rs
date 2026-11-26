@@ -1007,13 +1007,30 @@ pub(crate) fn final_draw_dossier(d: &MetalDraw) -> bool {
     if capture_every() == 0 {
         return false;
     }
+    // Followed: the presented textures, and every texture a followed draw
+    // reads (added by the caller), so the dossier walks the chain back.
+    static PER_TARGET: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let presented = PRESENTED.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let Some(target) = d.targets.colors.iter().flatten().find(|a| presented.contains(&a.resource)) else { return false };
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if n >= 6 && !n.is_power_of_two() {
+    let seen = {
+        let mut per = PER_TARGET.lock().unwrap_or_else(|e| e.into_inner());
+        match per.iter_mut().find(|(r, _)| *r == target.resource) {
+            Some((_, k)) => {
+                *k += 1;
+                *k
+            }
+            None => {
+                per.push((target.resource, 1));
+                1
+            }
+        }
+    };
+    // The first three draws into each followed texture, then every 256th.
+    if seen > 3 && seen % 256 != 0 {
         return false;
     }
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (args, index_type) = draw_params(&d.kind);
     let others: Vec<String> = d
         .targets
@@ -1041,7 +1058,8 @@ pub(crate) fn final_draw_dossier(d: &MetalDraw) -> bool {
         stages = d.stages.len(),
         tables = ?d.stages.iter().map(|b| (b.bind, b.tables.len(), b.heap.is_some())).collect::<Vec<_>>(),
         vertex_fetch = d.vertex.is_some(),
-        "Metal final-draw dossier: a draw into the presented texture"
+        followed = target.resource,
+        "Metal final-draw dossier: a draw into a followed texture"
     );
     CAPTURE_AFTER.lock().unwrap_or_else(|e| e.into_inner()).push((target.resource, format!("final-draw{n:03}")));
     true

@@ -922,6 +922,18 @@ extern "system" fn present(
             textures_written = writes.len(),
             "Metal capture: writes to the presented texture"
         );
+        // And to every texture the final-draw dossier follows back.
+        let followed = crate::backend::metal_draw::PRESENTED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        for r in followed.into_iter().filter(|&r| r != resource as usize) {
+            let n = writes.iter().find(|(w, _)| *w == r).map_or([0; 9], |(_, n)| *n);
+            tracing::info!(
+                frame,
+                resource = r,
+                pixel = m.texture_for(r as This).map_or(0, |t| t.pixel.0),
+                writes = %names.iter().zip(n).map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" "),
+                "Metal capture: writes to a followed texture"
+            );
+        }
         // And the largest targets Metal drew into since the last capture.
         let mut drawn = std::mem::take(&mut *crate::backend::metal_draw::DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
         drawn.sort_by_key(|&(_, area)| std::cmp::Reverse(area));
