@@ -357,6 +357,18 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
 }
 
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+    // a site being patched (console_insn::patch): its int3 or a stale trap runs it again
+    // SAFETY: the system passes valid exception pointers.
+    unsafe {
+        let code = (*(*info).ExceptionRecord).ExceptionCode;
+        if code == EXCEPTION_BREAKPOINT || code == EXCEPTION_ILLEGAL_INSTRUCTION {
+            let ctx = &mut *(*info).ContextRecord;
+            if let Some(at) = crate::console_insn::patch::retry_at(ctx.Rip as usize, code == EXCEPTION_BREAKPOINT) {
+                ctx.Rip = at as u64;
+                return -1;
+            }
+        }
+    }
     // an instruction of the console's CPU this one lacks: emulated, the title goes on
     // SAFETY: the system passes valid exception pointers.
     if unsafe { (*(*info).ExceptionRecord).ExceptionCode } == EXCEPTION_ILLEGAL_INSTRUCTION {
@@ -508,6 +520,28 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    // What we wrote into, handed out or took back of the 16 KiB blocks the
+    // registers point into (title heap blocks), newest first.
+    if code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_BREAKPOINT {
+        let regs = [
+            context.Rax, context.Rbx, context.Rcx, context.Rdx, context.Rsi, context.Rdi, context.Rbp,
+            context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15,
+        ];
+        let mut blocks: Vec<u64> = regs
+            .iter()
+            .copied()
+            .filter(|v| (1u64 << 32..1u64 << 40).contains(v))
+            .map(|v| v & !0x3fff)
+            .collect();
+        blocks.sort_unstable();
+        blocks.dedup();
+        line(format!("  write log: {} notes; blocks {:x?}", crate::writelog::total(), blocks));
+        for b in blocks.into_iter().take(8) {
+            for l in crate::writelog::near(b, b + 0x4000, 12) {
+                line(format!("    [{b:#x}] {l}"));
+            }
+        }
     }
     if to_file {
         let said = title_output();

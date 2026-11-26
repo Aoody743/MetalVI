@@ -532,6 +532,7 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    victory_loader::writelog::note(buffer as usize, len as usize, victory_loader::writelog::Source::ReadFile);
     host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     )
@@ -553,6 +554,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
     }
     if !victory_gpu::fault_tracking() {
         victory_gpu::kernel_will_write(buffer as usize, total);
+        victory_loader::writelog::note(buffer as usize, total, victory_loader::writelog::Source::Fread);
         return read(buffer, size, count, stream);
     }
     const CHUNK: usize = 1 << 20;
@@ -563,6 +565,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let n = read(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
             victory_gpu::kernel_will_write(buffer as usize + done, n);
+            victory_loader::writelog::note(buffer as usize + done, n, victory_loader::writelog::Source::Fread);
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };

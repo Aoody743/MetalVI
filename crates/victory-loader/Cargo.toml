@@ -30,6 +30,8 @@ windows-sys = { workspace = true, features = [
 
 [dev-dependencies]
 tempfile.workspace = true
+# F3: disassemble the generated trampoline bytes in the patch encoders' unit tests.
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
 
 [features]
 # Debugging switches (scheduled stack dumps and the like).

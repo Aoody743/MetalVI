@@ -84,6 +84,7 @@ pub(crate) struct Shadow {
 
 const VM_READABLE: u8 = 1;
 const VM_WRITABLE: u8 = 2;
+type VmRegion = (usize, usize, u8);
 
 #[derive(Default)]
 struct DiffState {
@@ -91,8 +92,8 @@ struct DiffState {
     par_buf: Vec<[u64; 2]>,
     vm_epoch: u64,
     /// `[start, end, flags]` covering `[self.start, self.start + self.len)`,
-    /// refreshed only when `vm_epoch != crate::watch::remap_epoch()`.
-    vm_regions: Vec<(usize, usize, u8)>,
+    /// refreshed when the shadow's range epoch changes.
+    vm_regions: Arc<[VmRegion]>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -341,7 +342,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 }
 
 /// Ranges in order, those that overlap or touch as one.
-fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     ranges.sort_unstable();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
     for (from, to) in ranges {
@@ -1362,48 +1363,13 @@ pub(crate) fn merged_stats() -> [u64; 3] {
 
 /// Fast 128-bit non-cryptographic chunk fingerprint (`[0, 0]` reserved for uninitialized/invalidated,
 /// `[u64::MAX, u64::MAX]` reserved for uncommitted zero holes).
-/// Processes 64-byte blocks with 4 parallel lanes and 1 multiply per lane per 64 B.
 #[inline]
 fn hash_chunk_128(data: &[u8]) -> [u64; 2] {
-    const K1: u64 = 0x9e37_79b9_7f4a_7c15;
-    const K2: u64 = 0xbf58_476d_1ce4_e5b9;
-    const K3: u64 = 0x94d0_49bb_1331_11eb;
-    const K4: u64 = 0xd6e8_feb8_6659_fd93;
-    let mut a = (data.len() as u64).wrapping_mul(K1) ^ 0x243f_6a88_85a3_08d3;
-    let mut b = (data.len() as u64).wrapping_mul(K2) ^ 0x1319_8a2e_0370_7344;
-    let mut c = 0xa409_3822_299f_31d0u64;
-    let mut d = 0x082e_fa98_ec4e_6c89u64;
-    let (blocks, rest) = data.as_chunks::<64>();
-    for blk in blocks {
-        let w0 = u64::from_le_bytes(blk[0..8].try_into().unwrap());
-        let w1 = u64::from_le_bytes(blk[8..16].try_into().unwrap());
-        let w2 = u64::from_le_bytes(blk[16..24].try_into().unwrap());
-        let w3 = u64::from_le_bytes(blk[24..32].try_into().unwrap());
-        let w4 = u64::from_le_bytes(blk[32..40].try_into().unwrap());
-        let w5 = u64::from_le_bytes(blk[40..48].try_into().unwrap());
-        let w6 = u64::from_le_bytes(blk[48..56].try_into().unwrap());
-        let w7 = u64::from_le_bytes(blk[56..64].try_into().unwrap());
-        a = (a ^ w0).wrapping_add(w4).rotate_left(13).wrapping_mul(K1);
-        b = (b ^ w1).wrapping_add(w5).rotate_left(17).wrapping_mul(K2);
-        c = (c ^ w2).wrapping_add(w6).rotate_left(23).wrapping_mul(K3);
-        d = (d ^ w3).wrapping_add(w7).rotate_left(29).wrapping_mul(K4);
+    match xxhash_rust::xxh3::xxh3_128(data) {
+        0 => [1, 0],
+        u128::MAX => [u64::MAX, u64::MAX - 1],
+        hash => [hash as u64, (hash >> 64) as u64],
     }
-    for chunk in rest.chunks(8) {
-        let mut buf = [0u8; 8];
-        buf[..chunk.len()].copy_from_slice(chunk);
-        a = (a ^ u64::from_le_bytes(buf)).wrapping_mul(K1);
-        b = b.rotate_left(11) ^ a;
-    }
-    a ^= a >> 30;
-    b ^= b >> 29;
-    c ^= c >> 31;
-    d ^= d >> 27;
-    let h0 = (a ^ c).wrapping_mul(K3) | 1;
-    let mut h1 = (b ^ d).wrapping_mul(K4);
-    if h0 == u64::MAX && h1 == u64::MAX {
-        h1 = 0;
-    }
-    [h0, h1]
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1591,7 +1557,23 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::changed_runs;
+    use super::{Shadow, VM_READABLE, VM_WRITABLE, changed_runs};
+
+    #[test]
+    fn vm_access_checks_every_region_in_the_requested_range() {
+        let regions = [
+            (0, 32, VM_READABLE),
+            (32, 48, VM_READABLE | VM_WRITABLE),
+            (48, 64, VM_READABLE),
+            (80, 96, VM_READABLE | VM_WRITABLE),
+        ];
+        assert!(Shadow::check_vm_access(&regions, 32, 16, VM_WRITABLE));
+        assert!(Shadow::check_vm_access(&regions, 16, 48, VM_READABLE));
+        assert!(!Shadow::check_vm_access(&regions, 16, 32, VM_WRITABLE));
+        assert!(!Shadow::check_vm_access(&regions, 60, 24, VM_READABLE));
+        assert!(!Shadow::check_vm_access(&regions, 72, 16, VM_READABLE));
+        assert!(!Shadow::check_vm_access(&regions, usize::MAX, 2, VM_READABLE));
+    }
 
     /// The runs hold exactly the bytes that differ: putting them into the
     /// old bytes gives the new ones, and no run holds an equal byte.
@@ -2040,6 +2022,8 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    const WARM_IDLE_MS: u64 = 30_000;
+    static WARM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.
@@ -2048,16 +2032,34 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
+        let mut extra = if *WARM.get_or_init(|| std::env::var_os("VICTORY_WARM_WINDOWS").is_none_or(|v| v != "0")) {
+            (crate::host::mac_cache_headroom() / 2).min(3 * crate::host::GIB)
+        } else {
+            0
+        };
+        let mut idle: Vec<_> = map
             .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+            .filter_map(|(&key, s)| {
+                let last_used = s.used.load(Ordering::Relaxed);
+                (Arc::strong_count(s) == 1
+                    && crate::host::long_ago(last_used, idle_ms, IDLE_FRAMES)
+                    && crate::host::references(&s.buffer) == 1)
+                    .then_some((key, s.len, last_used))
             })
-            .map(|(key, _)| *key)
             .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        if extra != 0 {
+            idle.sort_unstable_by_key(|&(_, _, last_used)| std::cmp::Reverse(last_used));
+        }
+        idle.into_iter()
+            .filter_map(|(key, len, last_used)| {
+                if len <= extra && !crate::host::long_ago(last_used, WARM_IDLE_MS, IDLE_FRAMES) {
+                    extra -= len;
+                    None
+                } else {
+                    map.remove(&key)
+                }
+            })
+            .collect()
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -2987,9 +2989,9 @@ impl Shadow {
     }
 
     /// Scans `[self.start, self.start + self.len)` with `VirtualQuery` WITHOUT holding
-    /// `MAPPING.read()` (`title_memory_reading`) or `self.diff`, so Wine's `_virtual_mutex`
-    /// never nests inside `MAPPING`. Returns `None` if `REMAP_EPOCH` changed mid-scan.
-    fn scan_vm_regions(&self) -> Option<(u64, Vec<(usize, usize, u8)>)> {
+    /// the mapping lock or `self.diff`, so Wine's `_virtual_mutex` never
+    /// nests inside them. Rejects scans that overlap a change to this range.
+    fn scan_vm_regions(&self) -> Option<(u64, Arc<[VmRegion]>)> {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
             PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
@@ -3003,13 +3005,11 @@ impl Shadow {
             | PAGE_EXECUTE_WRITECOPY;
         const WRITABLE: u32 = PAGE_READWRITE | PAGE_EXECUTE_READWRITE;
 
-        let seq = crate::watch::remap_active_seq();
-        if seq & 1 != 0 {
-            return None;
-        }
-        let epoch = crate::watch::range_epoch(self.start as usize, self.len as usize);
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let mut regions: Vec<(usize, usize, u8)> = Vec::new();
+        let len = end - start;
+        let seq = crate::watch::mapping_snapshot(start, len)?;
+        let epoch = crate::watch::range_epoch(start, len);
+        let mut regions: Vec<VmRegion> = Vec::new();
         let mut at = start;
         while at < end {
             // SAFETY: inspects process VM region attributes into a zeroed local struct.
@@ -3041,20 +3041,19 @@ impl Shadow {
             }
             at = r_end;
         }
-        if crate::watch::remap_active_seq() != seq
-            || crate::watch::range_epoch(self.start as usize, self.len as usize) != epoch
+        if crate::watch::mapping_snapshot(start, len).as_ref() != Some(&seq)
+            || crate::watch::range_epoch(start, len) != epoch
             || regions.is_empty()
         {
             return None;
         }
-        Some((epoch, regions))
+        Some((epoch, regions.into()))
     }
 
-    /// Acquires `title_memory_reading()` together with up-to-date `vm_regions` matching
-    /// `range_epoch`, releasing `MAPPING.read()` before calling `VirtualQuery`.
-    fn pin_with_vm_regions(&self) -> Option<(crate::watch::Reading, Vec<(usize, usize, u8)>)> {
+    /// Pins cached VM regions, releasing the mapping lock before `VirtualQuery`.
+    fn pin_with_vm_regions(&self) -> Option<(crate::watch::Reading, Arc<[VmRegion]>)> {
         for _ in 0..4 {
-            let mapped = crate::watch::title_memory_reading();
+            let mapped = crate::watch::title_memory_reading_range(self.start as usize, self.len as usize);
             let epoch = crate::watch::range_epoch(self.start as usize, self.len as usize);
             {
                 let state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
@@ -3075,7 +3074,7 @@ impl Shadow {
         None
     }
 
-    /// Ensures `diff.vm_regions` matches the current `epoch` under `title_memory_reading()`,
+    /// Ensures `diff.vm_regions` matches the current `epoch` under the mapping lock,
     /// dropping locks and `_mapped` first if a `VirtualQuery` rescan is needed.
     fn lock_diff_copy(
         &self,
@@ -3085,7 +3084,7 @@ impl Shadow {
         std::sync::MutexGuard<'_, DiffState>,
     )> {
         for _ in 0..4 {
-            let mapped = crate::watch::title_memory_reading();
+            let mapped = crate::watch::title_memory_reading_range(self.start as usize, self.len as usize);
             let epoch = crate::watch::range_epoch(self.start as usize, self.len as usize);
             let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             let state = self.diff.lock().unwrap_or_else(|e| e.into_inner());
@@ -3107,15 +3106,13 @@ impl Shadow {
         None
     }
 
-    fn check_vm_access(regions: &[(usize, usize, u8)], addr: usize, len: usize, need_flag: u8) -> bool {
+    fn check_vm_access(regions: &[VmRegion], addr: usize, len: usize, need_flag: u8) -> bool {
         let Some(end) = addr.checked_add(len) else {
             return false;
         };
         let mut cur = addr;
-        for &(r_start, r_end, flags) in regions {
-            if r_end <= cur {
-                continue;
-            }
+        let first = regions.partition_point(|r| r.1 <= addr);
+        for &(r_start, r_end, flags) in &regions[first..] {
             if r_start > cur || (flags & need_flag) == 0 {
                 return false;
             }
@@ -3206,10 +3203,8 @@ impl Shadow {
             }
         };
 
-        for &(r_start, r_end, flags) in vm_regions.iter() {
-            if r_end <= from {
-                continue;
-            }
+        let first = vm_regions.partition_point(|r| r.1 <= from);
+        for &(r_start, r_end, flags) in &vm_regions[first..] {
             if r_start >= to {
                 break;
             }
@@ -3576,6 +3571,14 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     spans
 }
 
+/// The title buffer object holding `address`, as (start, end), without
+/// making its host copy (the Metal backend bounds root views with it, as
+/// the D3D12 path's one-view tables do).
+pub(crate) fn buffer_extent(address: u64) -> Option<(u64, u64)> {
+    let map = buffers();
+    map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end > address).map(|(k, e)| (k.0, e.end))
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
@@ -3600,11 +3603,6 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// against 120 MB, 7,087 write-watch askings against 2,600, and 5,263
 /// windows (4.5 GB) let go in two minutes against 393 in a whole run.
 pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    // With whole windows (the default) there is one window to a cell and
-    // nothing to choose: exactly `find`.
-    if !fine() {
-        return find(address, len);
-    }
     lookup(address, len, true)
 }
 
@@ -3775,10 +3773,11 @@ fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> 
         .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
 
-/// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
-/// tails): only then is there more than one window to choose from.
-fn fine() -> bool {
-    tails() || window() < WINDOW
+/// The cells to search for a transient binding's window, including the
+/// previous cell in case its window extends over the entire binding.
+fn transient_cells(address: u64) -> std::ops::RangeInclusive<(u64, u64)> {
+    let cell = address & !(WINDOW - 1);
+    (cell.saturating_sub(WINDOW), 0)..=(address, u64::MAX)
 }
 
 /// For the memory line: the bytes of title memory the windows alive lie
@@ -3827,12 +3826,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     let (start, len) = if unsized_ask && tails() {
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
+    } else if any && !unsized_ask && (tails() || window() < WINDOW || !map.contains_key(&named)) {
+        let candidates = map.range(transient_cells(address)).map(|(key, _)| *key);
+        holder(candidates, address, end).unwrap_or(named)
     } else {
         named
     };
@@ -3896,7 +3892,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 #[cfg(test)]
 mod window_tests {
-    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};
+    use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, transient_cells, window_of};
 
     /// An ask that may take any window takes the longest that holds all of
     /// it, and none that holds only a part.
@@ -3916,6 +3912,16 @@ mod window_tests {
         // Of two as long, the one that begins lower.
         let two = [(cell + 0x8_0000, 0x8_0000), (cell + 0x4_0000, 0x8_0000)];
         assert_eq!(holder(two.into_iter(), ask, end), Some((cell + 0x4_0000, 0x8_0000)));
+    }
+
+    #[test]
+    fn a_transient_binding_can_use_a_window_from_the_previous_cell() {
+        let start = 3 * WINDOW;
+        let address = start + WINDOW + 4096;
+        let windows = std::collections::BTreeSet::from([(start, 2 * WINDOW), (address, 4096)]);
+        let find = |end| holder(windows.range(transient_cells(address)).copied(), address, end);
+        assert_eq!(find(address + 8192), Some((start, 2 * WINDOW)));
+        assert_eq!(find(start + 2 * WINDOW + 1), None);
     }
 
     /// What windows lie over counts each byte once.

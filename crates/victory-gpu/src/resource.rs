@@ -79,23 +79,23 @@ pub(crate) struct HeapDesc {
     size: u64,
     properties: HeapProperties,
     alignment: u64,
-    flags: u32,
+    pub(crate) flags: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResourceDesc {
-    dimension: u32,
+    pub(crate) dimension: u32,
     alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
+    pub(crate) width: u64,
+    pub(crate) height: u32,
+    pub(crate) depth_or_array_size: u16,
+    pub(crate) mip_levels: u16,
+    pub(crate) format: u32,
+    pub(crate) sample_count: u32,
     sample_quality: u32,
     layout: u32,
-    flags: u32,
+    pub(crate) flags: u32,
 }
 
 #[repr(C)]
@@ -804,7 +804,7 @@ pub(crate) extern "system" fn copyable_footprints(
 /// gives the documented size `u64::MAX`.
 pub(crate) extern "system" fn allocation_info(
     out: *mut AllocationInfo,
-    _: This,
+    second: This,
     _visible: u32,
     count: u32,
     descs: *const ResourceDesc,
@@ -815,9 +815,25 @@ pub(crate) extern "system" fn allocation_info(
         // SAFETY: the title passes `count` descriptions.
         unsafe { std::slice::from_raw_parts(descs, count as usize) }
     };
+    let out = return_buffer(out, second);
     // SAFETY: the caller passes room for the value.
     unsafe { out.write(place(descs.iter(), |_, _| ())) };
     out
+}
+
+/// The hidden return buffer of a struct-returning device method: titles
+/// call these both as C (buffer, device) and as C++ members (device,
+/// buffer) (seen by xcl on a GDK title); whichever argument is not the
+/// device is the buffer. (The device is a read-only static: writing the
+/// value over it would fault.)
+fn return_buffer(first: *mut AllocationInfo, second: This) -> *mut AllocationInfo {
+    if first as usize == crate::device::device() as usize {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::info!("a struct-returning device method was called with the device first"));
+        second as *mut AllocationInfo
+    } else {
+        first
+    }
 }
 
 /// The newer description: the plain one, then a sampler feedback mip
@@ -841,7 +857,7 @@ pub(crate) struct AllocationInfo1 {
 /// descriptions, also telling where each resource goes.
 pub(crate) extern "system" fn allocation_info2(
     out: *mut AllocationInfo,
-    _: This,
+    second: This,
     _visible: u32,
     count: u32,
     descs: *const ResourceDesc1,
@@ -859,6 +875,7 @@ pub(crate) extern "system" fn allocation_info2(
             unsafe { each.add(i).write(info) };
         }
     });
+    let out = return_buffer(out, second);
     // SAFETY: the caller passes room for the value.
     unsafe { out.write(total) };
     out
@@ -1368,16 +1385,22 @@ pub(crate) fn room() -> bool {
     const WITHOUT_BUDGET: u64 = 4 << 30;
     static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
-        if let Ok(mb) = std::env::var("VICTORY_TEXTURE_BUDGET_MB") {
-            return mb.trim().parse::<u64>().ok().map(|mb| mb << 20);
-        }
-        // D3DMetal on macOS reports an inflated local budget via QueryVideoMemoryInfo,
-        // so cap placed textures to 6 GiB unless explicitly overridden.
-        (!crate::watch::fault_tracking()).then_some(6144 << 20)
+        std::env::var("VICTORY_TEXTURE_BUDGET_MB")
+            .ok()
+            .and_then(|mb| mb.trim().parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1 << 20))
     });
     let filled = KINDS[1].load(Relaxed);
     if let Some(limit) = limit {
         return filled < limit;
+    }
+    if crate::watch::on_wine_darwin() || !crate::watch::fault_tracking() {
+        use crate::host::GIB;
+        // Leave room for the render targets that arrive at world entry.
+        // A cap hit defers new uploads; it does not evict live textures.
+        let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(filled);
+        let extra = (crate::host::mac_cache_headroom() / 3).min(2 * GIB).min(targets.saturating_sub(GIB));
+        return filled < 6 * GIB + extra;
     }
     if filled < FLOOR {
         return true;

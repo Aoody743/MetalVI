@@ -10,6 +10,11 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 /// `GetModuleHandle(NULL)` and friends to return this, not our own exe.
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
+    // The GPU side's writes into title memory go to the crash reports' log.
+    let _ = victory_gpu::WRITE_NOTE.set(|at, len, kind| {
+        use victory_loader::writelog::{Source, note};
+        note(at, len, if kind == 1 { Source::BottomOfPipe } else { Source::Other });
+    });
 }
 
 pub fn main_image() -> Option<usize> {

@@ -15,6 +15,9 @@ const MAX_ENCODED_RUN: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    // The Metal unixlib (native/victorymetal) and macOS helpers: our C and
+    // Objective-C sources and dxmt's/Wine's LGPL ones, and build scripts.
+    "c", "h", "m", "py",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
@@ -25,6 +28,7 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE",
     "LICENSE-MIT",
     "LICENSE-APACHE",
+    "LICENSE.dxmt",
 ];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.

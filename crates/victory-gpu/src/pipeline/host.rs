@@ -526,7 +526,7 @@ impl HostPipeline {
                 ..Default::default()
             };
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
-            let made = super::library::pipeline(
+            let made = super::library::compute_pipeline(
                 &name,
                 // SAFETY: the description points at live data.
                 |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
@@ -575,7 +575,17 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
-        if mesh.is_some() {
+        if let Some(ms) = mesh {
+            // Ported from Ahmet-Dedeler/VIctory 48e1aba (mac-crossover 434187b,
+            // 11298ac): D3DMetal accepts a mesh pipeline over Metal's output
+            // limit without an error, then never finishes compiling it.
+            let bytes = ms.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil));
+            if let (Some(limit), Some(bytes)) = (mesh_output_limit(), bytes)
+                && bytes > limit
+            {
+                tracing::warn!(?shaders, bytes, limit, "no host pipeline: mesh outputs over the host's limit");
+                return refuse("the mesh shader's outputs take more than the host GPU allows", shaders);
+            }
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
             // new name keeps such entries, stored before, from being
@@ -839,6 +849,78 @@ fn graphics_depth_bounds_pipeline(
         };
         stream_pipeline(device, &mut stream, name)
     }
+}
+
+/// The most bytes of outputs a mesh pipeline may have on the host: Metal's
+/// 32,768 when Wine runs on macOS (D3DMetal), else no known limit.
+/// `VICTORY_MESH_OUTPUT_LIMIT=0` turns the check off.
+fn mesh_output_limit() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let off = std::env::var_os("VICTORY_MESH_OUTPUT_LIMIT").is_some_and(|v| v == "0");
+        let limit = (!off && crate::watch::on_wine_darwin()).then_some(32_768);
+        tracing::info!(?limit, "mesh output limit of the host");
+        limit
+    })
+}
+
+/// The bytes Apple's Metal counts for a translated mesh shader's outputs
+/// (measured on its own pipelines, 43 of this title's and synthetic ones):
+/// per vertex, the clip and cull distances as floats, the position, then
+/// every other output in signature order, each placed at the next multiple
+/// of its own size (4 bytes a component) with nothing after the last;
+/// per primitive, its outputs the same way; each times the declared
+/// maximum. `None` if the container does not read as ours.
+/// Ported from Ahmet-Dedeler/VIctory 48e1aba.
+pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let part = |name: &[u8; 4]| {
+        (0..u32_at(dxil, 28)?).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == name)
+                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+                .flatten()
+        })
+    };
+    // Signature elements: (system value, components) in order.
+    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u32)>> {
+        let Some(data) = part(name) else {
+            return Some(Vec::new());
+        };
+        (0..u32_at(data, 0)?)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let mask = *data.get(at + 24)?;
+                Some((u32_at(data, at + 12)?, mask.count_ones()))
+            })
+            .collect()
+    };
+    const POSITION: usize = 1;
+    const DISTANCES: [usize; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u32, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(b"OSG1")?;
+    let distances = vertex
+        .iter()
+        .filter(|(kind, _)| DISTANCES.contains(kind))
+        .map(|&(_, n)| n)
+        .sum::<u32>();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
+    );
+    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
+    // `PSV0`: the runtime information's size, then the information.
+    let info = part(b"PSV0")?.get(4..)?;
+    let maximum = |at: usize| Some(u32::from(u16::from_le_bytes(info.get(at..at + 2)?.try_into().ok()?)));
+    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
 /// A mesh pipeline from the title's graphics state: the pipeline-state

@@ -12,8 +12,8 @@
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
 //!
-//! The default budget is half a second per title frame. A pass the title
-//! runs only once and whose pipeline takes longer is lost.
+//! A pass the title runs only once and whose pipeline takes longer than
+//! its budget is lost.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -186,7 +186,17 @@ fn slow(p: &Pending) -> bool {
 /// the hundred then, and a pass the title runs once is lost if its
 /// pipeline is not there. All such waits of a run together are bounded;
 /// the title's GPU watchdog bounds one frame's (30 s).
-const LOADING_FRAME: Duration = Duration::from_secs(4);
+fn graphics_loading_frame() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let default = if crate::watch::fault_tracking() { 4000 } else { 250 };
+        let millis = std::env::var("VICTORY_PIPELINE_GRAPHICS_GATE_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(default);
+        Duration::from_millis(millis)
+    })
+}
 /// The same for compute pipelines, waited for apart: the passes that unpack
 /// a world's models are dispatched once, and in a run whose pipelines were
 /// all still to be loaded 130 of them were dropped, and with them walls,
@@ -286,7 +296,7 @@ fn wait(p: &Pending, frame: u64) {
     let compute = p.computes();
     let past_total = &LOADINGS[usize::from(compute)];
     let loading = loading_left(Duration::from_millis(past_total.load(Ordering::Relaxed)));
-    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading));
+    let budget = budget.max((if compute { LOADING_FRAME_COMPUTE } else { graphics_loading_frame() }).min(loading));
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
@@ -294,6 +304,10 @@ fn wait(p: &Pending, frame: u64) {
     let shared = shared_budget();
     let left = {
         let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
+        if spent.0 != u64::MAX && spent.0 > frame {
+            // A late recording thread must not reopen a spent frame budget.
+            return;
+        }
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
@@ -345,9 +359,21 @@ const EARLY: u8 = 1;
 const REQUESTED: u8 = 2;
 const MAKING: u8 = 3;
 
+/// Long mesh compiles can occupy all of D3DMetal's graphics workers.
+pub(crate) fn split_compute() -> bool {
+    static SPLIT: OnceLock<bool> = OnceLock::new();
+    *SPLIT.get_or_init(|| match std::env::var_os("VICTORY_SPLIT_COMPUTE").as_deref() {
+        Some(v) if v == "0" => false,
+        Some(v) if v == "1" => true,
+        _ => crate::watch::on_wine_darwin(),
+    })
+}
+
 struct Queue {
     early: VecDeque<Arc<Pending>>,
     requested: VecDeque<Arc<Pending>>,
+    early_compute: VecDeque<Arc<Pending>>,
+    requested_compute: VecDeque<Arc<Pending>>,
 }
 
 impl Queue {
@@ -355,31 +381,38 @@ impl Queue {
         Self {
             early: VecDeque::new(),
             requested: VecDeque::new(),
+            early_compute: VecDeque::new(),
+            requested_compute: VecDeque::new(),
         }
     }
 
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
-    fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
+    fn push(&mut self, p: &Arc<Pending>, priority: u8, compute_lane: bool) -> Option<bool> {
         let prev = p.queue_state.load(Ordering::Relaxed);
         if prev >= priority {
             return None;
         }
         p.queue_state.store(priority, Ordering::Relaxed);
-        if priority == REQUESTED {
-            self.requested.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
-        }
+        let lane = match (compute_lane, priority) {
+            (true, REQUESTED) => &mut self.requested_compute,
+            (true, _) => &mut self.early_compute,
+            (false, REQUESTED) => &mut self.requested,
+            (false, _) => &mut self.early,
+        };
+        lane.push_back(p.clone());
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+    fn pop(&mut self, compute_only: bool) -> Option<Arc<Pending>> {
+        fn early(lane: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
+            std::iter::from_fn(|| lane.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+        }
+        let p = self.requested_compute.pop_front()
+            .or_else(|| if compute_only { None } else { self.requested.pop_front() })
+            .or_else(|| early(&mut self.early_compute))
+            .or_else(|| if compute_only { None } else { early(&mut self.early) })?;
         p.queue_state.store(MAKING, Ordering::Relaxed);
         Some(p)
     }
@@ -387,6 +420,7 @@ impl Queue {
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
 static AVAILABLE: Condvar = Condvar::new();
+static COMPUTE_AVAILABLE: Condvar = Condvar::new();
 
 /// Start or promote work for a draw without waiting behind the entire early
 /// list. Queue changes and worker claims happen under the same lock.
@@ -401,21 +435,26 @@ fn start(p: &Arc<Pending>, priority: u8) {
         return;
     }
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(new) = queue.push(p, priority) {
+    let compute_lane = split_compute() && p.computes();
+    if let Some(new) = queue.push(p, priority, compute_lane) {
         if new {
             PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
         }
         AVAILABLE.notify_one();
+        if compute_lane {
+            COMPUTE_AVAILABLE.notify_one();
+        }
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next(compute_only: bool) -> Arc<Pending> {
+    let available = if compute_only { &COMPUTE_AVAILABLE } else { &AVAILABLE };
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
+        if let Some(p) = queue.pop(compute_only) {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        queue = available.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
 
@@ -425,10 +464,15 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
-        for i in 0..workers {
+        let split = split_compute();
+        if split {
+            tracing::info!("using a reserved compute pipeline worker and a separate library");
+        }
+        for i in 0..workers + usize::from(split) {
+            let compute_only = i == workers && running;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -436,12 +480,12 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let pipeline = next(compute_only);
+                        pipeline.make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
-                        } else {
-                            super::library::save(false);
                         }
+                        super::library::save_worker(pipeline.computes());
                     }
                 });
             if let Err(e) = spawned {
@@ -469,7 +513,6 @@ fn drained() {
             "host pipelines all made"
         );
     }
-    super::library::save(false);
 }
 
 #[cfg(test)]
@@ -511,16 +554,33 @@ mod tests {
         let requested = Arc::new(Pending::new(Vec::new(), None));
         let mut queue = Queue::new();
 
-        assert_eq!(queue.push(&earlier, EARLY), Some(true));
-        assert_eq!(queue.push(&promoted, EARLY), Some(true));
-        assert_eq!(queue.push(&requested, REQUESTED), Some(true));
-        assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
+        assert_eq!(queue.push(&earlier, EARLY, false), Some(true));
+        assert_eq!(queue.push(&promoted, EARLY, false), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), Some(false));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
-        assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &promoted));
+        assert_eq!(queue.push(&promoted, REQUESTED, false), None);
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &earlier));
+        assert!(queue.pop(false).is_none());
+    }
+
+    #[test]
+    fn compute_worker_leaves_graphics_jobs_for_general_workers() {
+        let graphics = Arc::new(Pending::new(Vec::new(), None));
+        let prewarm = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        assert_eq!(queue.push(&graphics, REQUESTED, false), Some(true));
+        assert_eq!(queue.push(&prewarm, EARLY, true), Some(true));
+        assert_eq!(queue.push(&requested, EARLY, true), Some(true));
+        assert_eq!(queue.push(&requested, REQUESTED, true), Some(false));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &requested));
+        assert!(Arc::ptr_eq(&queue.pop(true).unwrap(), &prewarm));
+        assert!(queue.pop(true).is_none());
+        assert!(Arc::ptr_eq(&queue.pop(false).unwrap(), &graphics));
+        assert!(queue.pop(false).is_none());
     }
 }

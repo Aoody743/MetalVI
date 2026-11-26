@@ -153,6 +153,17 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// The Metal dispatches recorded into a title list (`VICTORY_METAL`).
+#[cfg(windows)]
+pub(crate) fn metal_commands(this: This) -> Vec<std::sync::Arc<crate::backend::metal::MetalCmd>> {
+    if this.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).metal.clone()
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.

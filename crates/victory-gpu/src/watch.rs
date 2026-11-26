@@ -26,7 +26,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, c_char};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+
+use smallvec::SmallVec;
 
 /// Monotonic generation bumped whenever global heap allocations/frees occur
 /// (`note_memory_changed`). Range-scoped physical mappings update [`RANGE_EPOCHS`].
@@ -35,22 +37,6 @@ static REMAP_EPOCH: AtomicU64 = AtomicU64::new(1);
 const RANGE_BUCKET_SHIFT: u32 = 22; // 4 MiB buckets
 const RANGE_BUCKETS: usize = 512;
 static RANGE_EPOCHS: [AtomicU64; RANGE_BUCKETS] = [const { AtomicU64::new(1) }; RANGE_BUCKETS];
-
-/// Sequence counter incremented upon entering and leaving `title_memory_remapping()`.
-/// Odd while a remapping guard is active; even otherwise.
-static REMAP_ACTIVE_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// Set by [`title_memory_remapped`] while [`Remapping`] is held; if a caller
-/// held `title_memory_remapping()` for a free/decommit without reporting a range,
-/// [`Remapping::drop`] falls back to [`note_memory_changed`].
-static REMAP_NOTED_RANGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Returns a monotonic sequence number that is even when idle and changes across
-/// any `title_memory_remapping()` section.
-#[inline]
-pub(crate) fn remap_active_seq() -> u64 {
-    REMAP_ACTIVE_SEQ.load(Ordering::Acquire)
-}
 
 /// Combined epoch covering `[start, start + len)` for VM-region cache validation.
 #[inline]
@@ -92,7 +78,12 @@ pub fn note_memory_changed() {
 }
 
 /// Whether `ntdll.dll!wine_get_host_version` reports macOS (`Darwin`).
-fn on_wine_darwin() -> bool {
+pub(crate) fn on_wine_darwin() -> bool {
+    static DARWIN: LazyLock<bool> = LazyLock::new(probe_wine_darwin);
+    *DARWIN
+}
+
+fn probe_wine_darwin() -> bool {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
     // SAFETY: plain lookup in `ntdll.dll` (always loaded) with `wine_get_host_version`
     // signature `void wine_get_host_version(const char **sysname, const char **release)`.
@@ -834,18 +825,87 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static MAPPING: RwLock<()> = RwLock::new(());
+const SHARDS: usize = 256;
+const SHARD_BITS: u32 = 24;
+static MAP_SHARDS: [RwLock<()>; SHARDS] = [const { RwLock::new(()) }; SHARDS];
+static GLOBAL_MAP_SEQ: AtomicU64 = AtomicU64::new(0);
+static SHARD_SEQ: [AtomicU64; SHARDS] = [const { AtomicU64::new(0) }; SHARDS];
+
+fn range_remap() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_RANGE_REMAP").is_some_and(|v| v == "1"));
+    *ON
+}
+
+/// Ascending lock order even when the address range wraps around the array.
+fn mapping_shards(at: usize, len: usize) -> impl Iterator<Item = usize> {
+    let first = at >> SHARD_BITS;
+    let last = at.saturating_add(len.saturating_sub(1)) >> SHARD_BITS;
+    let span = if len == 0 { 0 } else { (last - first + 1).min(SHARDS) };
+    let lo = first % SHARDS;
+    let hi = lo + span;
+    (0..hi.saturating_sub(SHARDS)).chain(lo..hi.min(SHARDS))
+}
+
+/// Versions for an unlocked VirtualQuery scan. An odd version means a
+/// writer is in the middle of a change to that range.
+pub(crate) fn mapping_snapshot(at: usize, len: usize) -> Option<SmallVec<[u64; 8]>> {
+    let global = GLOBAL_MAP_SEQ.load(Ordering::Acquire);
+    if global & 1 != 0 {
+        return None;
+    }
+    let mut version = SmallVec::new();
+    version.push(global);
+    if range_remap() {
+        for i in mapping_shards(at, len) {
+            let seq = SHARD_SEQ[i].load(Ordering::Acquire);
+            if seq & 1 != 0 {
+                return None;
+            }
+            version.push(seq);
+        }
+    }
+    Some(version)
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(RemapLock);
+
+enum RemapLock {
+    Global {
+        _gate: RwLockWriteGuard<'static, ()>,
+        range: Option<(usize, usize)>,
+    },
+    Range {
+        _shards: SmallVec<[RwLockWriteGuard<'static, ()>; 4]>,
+        _gate: RwLockReadGuard<'static, ()>,
+        at: usize,
+        len: usize,
+    },
+}
 
 impl Drop for Remapping {
     fn drop(&mut self) {
-        if !REMAP_NOTED_RANGE.load(Ordering::Relaxed) {
-            note_memory_changed();
+        match self.0 {
+            RemapLock::Global { range, .. } => {
+                if let Some((at, len)) = range {
+                    note_range_changed(at, len);
+                } else {
+                    note_memory_changed();
+                }
+                GLOBAL_MAP_SEQ.fetch_add(1, Ordering::Release);
+            }
+            RemapLock::Range { at, len, .. } => {
+                // Also invalidate VM scans if the OS call failed partway
+                // through the change and never reported a finished view.
+                note_range_changed(at, len);
+                for i in mapping_shards(at, len) {
+                    SHARD_SEQ[i].fetch_add(1, Ordering::Release);
+                }
+            }
         }
-        REMAP_ACTIVE_SEQ.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -854,39 +914,78 @@ impl Drop for Remapping {
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
-    REMAP_NOTED_RANGE.store(false, Ordering::Relaxed);
-    REMAP_ACTIVE_SEQ.fetch_add(1, Ordering::AcqRel);
-    Remapping(guard)
+    global_remapping(None)
+}
+
+fn global_remapping(range: Option<(usize, usize)>) -> Remapping {
+    let gate = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    GLOBAL_MAP_SEQ.fetch_add(1, Ordering::AcqRel);
+    Remapping(RemapLock::Global { _gate: gate, range })
+}
+
+/// Protects the whole affected range, including any old views that will be
+/// temporarily removed to rebuild their unchanged ends.
+pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
+    if !range_remap() {
+        return global_remapping(Some((at, len)));
+    }
+    let gate = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    let shards = mapping_shards(at, len)
+        .map(|i| MAP_SHARDS[i].write().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    for i in mapping_shards(at, len) {
+        SHARD_SEQ[i].fetch_add(1, Ordering::AcqRel);
+    }
+    Remapping(RemapLock::Range { _shards: shards, _gate: gate, at, len })
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading {
+    _shards: SmallVec<[RwLockReadGuard<'static, ()>; 4]>,
+    _gate: RwLockReadGuard<'static, ()>,
+}
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
 /// Not to be taken twice by one thread, nor held across anything that
 /// maps title memory.
 pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+    title_memory_reading_range(0, usize::MAX)
 }
 
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// As [`title_memory_reading`], for just the supplied address range.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    let gate = MAPPING.read().unwrap_or_else(|e| e.into_inner());
+    let mut shards = SmallVec::new();
+    if range_remap() {
+        shards.extend(mapping_shards(at, len).map(|i| MAP_SHARDS[i].read().unwrap_or_else(|e| e.into_inner())));
     }
+    Reading { _shards: shards, _gate: gate }
+}
+
+/// [`title_memory_reading_range`] only if every lock can be taken without waiting.
+pub(crate) fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    fn ready(lock: &RwLock<()>) -> Option<RwLockReadGuard<'_, ()>> {
+        match lock.try_read() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+    let gate = ready(&MAPPING)?;
+    let mut shards = SmallVec::new();
+    if range_remap() {
+        for i in mapping_shards(at, len) {
+            shards.push(ready(&MAP_SHARDS[i])?);
+        }
+    }
+    Some(Reading { _shards: shards, _gate: gate })
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
-    REMAP_NOTED_RANGE.store(true, Ordering::Relaxed);
     note_range_changed(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
@@ -1475,15 +1574,61 @@ mod tests {
 
 #[cfg(test)]
 mod mapping_tests {
-    use super::{title_memory_reading, title_memory_remapping};
+    use super::{
+        SHARD_BITS, SHARDS, mapping_shards, mapping_snapshot, range_epoch, range_remap,
+        title_memory_reading, title_memory_reading_now, title_memory_reading_range,
+        title_memory_remapping, title_memory_remapping_range,
+    };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn mapping_ranges_take_shards_in_order() {
+        let size = 1 << SHARD_BITS;
+        let shards = |at, len| mapping_shards(at, len).collect::<Vec<_>>();
+        assert_eq!(shards(11 * size, 0), vec![]);
+        assert_eq!(shards(11 * size - 1, 2), vec![10, 11]);
+        assert_eq!(shards(SHARDS * size - 1, 2), vec![0, SHARDS - 1]);
+        assert_eq!(shards(17 * size, SHARDS * size), (0..SHARDS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn mapping_range_excludes_only_overlapping_readers_and_scans() {
+        if !range_remap() {
+            return;
+        }
+        let _serial = SERIAL.lock().unwrap();
+        let local = 37 << SHARD_BITS;
+        let remote = 71 << SHARD_BITS;
+        let (old, epoch) = (mapping_snapshot(local, 1).unwrap(), range_epoch(local, 1));
+        let remote_version = mapping_snapshot(remote, 1).unwrap();
+        let changing = title_memory_remapping_range(local, 1);
+        std::thread::spawn(move || {
+            assert!(title_memory_reading_now(local, 1).is_none());
+            assert!(mapping_snapshot(local, 1).is_none());
+            assert!(title_memory_reading_now(remote, 1).is_some());
+            assert_eq!(mapping_snapshot(remote, 1), Some(remote_version));
+        })
+        .join()
+        .unwrap();
+        drop(changing);
+        assert_ne!(mapping_snapshot(local, 1), Some(old));
+        assert_ne!(range_epoch(local, 1), epoch);
+
+        let reading = title_memory_reading_range(local, 1);
+        let remote_writer = std::thread::spawn(move || drop(title_memory_remapping_range(remote, 1)));
+        remote_writer.join().unwrap();
+        drop(reading);
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _serial = SERIAL.lock().unwrap();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();

@@ -10,8 +10,9 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -155,6 +156,7 @@ pub extern "system" fn XMemVirtualAlloc(
     };
     if !at.is_null() {
         victory_gpu::note_memory_changed();
+        victory_loader::writelog::note(at as usize, size, victory_loader::writelog::Source::XMemVirtualAlloc);
     }
     if base.is_null() {
         tracing::debug!(
@@ -261,7 +263,9 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
+            let at = alloc(size, attributes);
+            victory_loader::writelog::note(at as usize, size, victory_loader::writelog::Source::XMemAlloc);
+            at
         }
     }
 }
@@ -271,6 +275,7 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
     match hooks()[1] {
         0 => XMemFreeDefault(address, attributes),
         hook => {
+            victory_loader::writelog::note(address as usize, 1, victory_loader::writelog::Source::XMemFree);
             // SAFETY: the title's own routine of this type.
             let free: FreeRoutine = unsafe { std::mem::transmute(hook) };
             free(address, attributes)
@@ -322,6 +327,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
             let _changing = victory_gpu::title_memory_remapping();
+            victory_loader::writelog::note(address as usize, 1, victory_loader::writelog::Source::XMemVirtualFree);
             VirtualFree(address, 0, MEM_RELEASE);
             victory_gpu::note_memory_changed();
             return;
@@ -347,17 +353,60 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section {
+    handle: HANDLE,
+    persistent: Option<View>,
+    windows: Mutex<Vec<Range<usize>>>,
+    window_closed: Condvar,
+}
 
-// SAFETY: a section handle may be used from any thread.
+// SAFETY: the handle can be shared and windows serialize overlapping access
+// through the persistent virtual address; disjoint ranges can stream in parallel.
 unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
-        // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        drop(self.persistent.take());
+        // SAFETY: our handle; title views keep the section alive on their own.
+        unsafe { CloseHandle(self.handle) };
+    }
+}
+
+impl Section {
+    fn new(handle: HANDLE, size: usize) -> Self {
+        static PERSISTENT: LazyLock<bool> = LazyLock::new(|| {
+            on_wine() && !std::env::var_os("VICTORY_XMEM_PERSISTENT").is_some_and(|v| v == "0")
+        });
+        Self {
+            handle,
+            persistent: if *PERSISTENT {
+                View::persistent(handle, size)
+            } else {
+                None
+            },
+            windows: Mutex::new(Vec::new()),
+            window_closed: Condvar::new(),
+        }
+    }
+
+    fn open_window(&self, range: &Range<usize>) {
+        let windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        self.window_closed
+            .wait_while(windows, |active| {
+                active.iter().any(|r| r.start < range.end && range.start < r.end)
+            })
+            .unwrap_or_else(|e| e.into_inner())
+            .push(range.clone());
+    }
+
+    fn close_window(&self, range: &Range<usize>) {
+        let mut active = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let index = active.iter().position(|r| r == range).expect("open physical window");
+        active.swap_remove(index);
+        drop(active);
+        self.window_closed.notify_all();
     }
 }
 
@@ -445,7 +494,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section::new(handle, size));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -472,11 +521,20 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     if pages.is_null() {
         return 0;
     }
-    let mut physical = physical();
-    for i in 0..n {
-        // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+    let mut released = Vec::new();
+    {
+        let mut physical = physical();
+        for i in 0..n {
+            // SAFETY: the title passes `n` page numbers.
+            if let Some(slice) = physical.pages.remove(&unsafe { *pages.add(i) })
+                && !released.last().is_some_and(|s| Arc::ptr_eq(s, &slice.section))
+            {
+                released.push(slice.section);
+            }
+        }
     }
+    // A last reference can unmap an entire streaming view.
+    drop(released);
     1
 }
 
@@ -488,6 +546,31 @@ struct View {
 }
 
 impl View {
+    fn persistent(handle: HANDLE, len: usize) -> Option<Self> {
+        let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+            LowestStartingAddress: (1usize << 40) as *mut c_void,
+            ..Default::default()
+        };
+        let mut parameter = MEM_EXTENDED_PARAMETER::default();
+        parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+        parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+        // SAFETY: this Wine section is already SEC_COMMIT. Keep the view
+        // out of the low address space used by the title's own reservations.
+        let at = unsafe {
+            MapViewOfFile3(
+                handle, GetCurrentProcess(), std::ptr::null(), 0, len, 0,
+                PAGE_READWRITE, &mut parameter, 1,
+            )
+        };
+        if at.Value.is_null() {
+            tracing::debug!(len, error = %std::io::Error::last_os_error(), "xmem: using temporary streaming views");
+            return None;
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!(len, "xmem: persistent Wine streaming views active"));
+        Some(Self { at, len })
+    }
+
     /// Maps `n` slices from `slice` on.
     fn map(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
@@ -495,7 +578,7 @@ impl View {
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -558,22 +641,23 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
 
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
-/// One view per run of consecutive pages, not one per page: each view
-/// costs a map, a commit and an unmap (which flushes every core's TLB).
+/// Reuse the streaming view on Wine, or map one temporary view per run.
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return true;
+    }
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
-    for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+    for (slice, n) in runs {
+        let k = (n * PAGE - within).min(data.len() - done);
+        let Some(mut window) = PageWindow::new(slice, n, within, k) else {
             return false;
         };
-        let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        window.bytes().copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
-        written(slice, *n);
     }
     true
 }
@@ -600,22 +684,46 @@ fn written(slice: &Slice, n: usize) {
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
-    within: usize,
-    len: usize,
+    temporary: Option<View>,
+    range: Range<usize>,
     slice: Slice,
+    pages: usize,
 }
 
 impl Drop for PageWindow {
     fn drop(&mut self) {
-        written(&self.slice, self.view.len / PAGE);
+        if self.temporary.is_none() {
+            self.slice.section.close_window(&self.range);
+        }
+        written(&self.slice, self.pages);
     }
 }
 
 impl PageWindow {
+    fn new(slice: Slice, pages: usize, within: usize, len: usize) -> Option<Self> {
+        let (temporary, start) = if slice.section.persistent.is_some() {
+            let start = slice.index * PAGE + within;
+            slice.section.open_window(&(start..start + len));
+            (None, start)
+        } else {
+            (Some(View::map(&slice, pages)?), within)
+        };
+        Some(Self { temporary, range: start..start + len, slice, pages })
+    }
+
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
-        let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        if let Some(view) = &mut self.temporary {
+            return &mut view.bytes()[self.range.clone()];
+        }
+        let view = self.slice.section.persistent.as_ref().expect("persistent physical view");
+        // SAFETY: the section outlives the window; the byte range is committed
+        // and excluded from other streaming windows at this virtual address.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                view.at.Value.cast::<u8>().add(self.range.start),
+                self.range.len(),
+            )
+        }
     }
 }
 
@@ -625,16 +733,15 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
-    let runs = runs(pages, offset, len)?;
-    let [(slice, n)] = runs.as_slice() else {
+    if len == 0 {
         return None;
-    };
-    Some(PageWindow {
-        view: View::map(slice, *n)?,
-        within: offset % PAGE,
-        len,
-        slice: slice.clone(),
-    })
+    }
+    let mut runs = runs(pages, offset, len)?;
+    if runs.len() != 1 {
+        return None;
+    }
+    let (slice, n) = runs.pop()?;
+    PageWindow::new(slice, n, offset % PAGE, len)
 }
 
 /// Maps `n` pages at `address`, in place of what is mapped there; null
@@ -644,14 +751,32 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    if n == 0 {
+        return address;
+    }
     let base = address as usize;
+    let Some(len) = n.checked_mul(PAGE).filter(|&len| base.checked_add(len).is_some()) else {
+        return std::ptr::null_mut();
+    };
     let mut physical = physical();
+    if !pages.is_null() {
+        // SAFETY: the title passes `n` page numbers.
+        let mapped = unsafe { std::slice::from_raw_parts(pages, n) };
+        if mapped.iter().zip((base..).step_by(PAGE)).all(|(page, at)| {
+            physical
+                .pages
+                .get(page)
+                .is_some_and(|slice| shows(&physical, at, slice))
+        }) {
+            return address;
+        }
+    }
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
+    let _changing = changing_views(&physical, base, len);
+    unmap(&mut physical, base, len);
     if pages.is_null() {
         return address;
     }
@@ -682,7 +807,8 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
-/// (the title passes 0 for addresses to clear).
+/// (the title passes 0 for addresses to clear). Only adjacent clears are
+/// batched: later remapping one page must not unmap its neighbours.
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -691,21 +817,37 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
-    for i in 0..n {
-        // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
-        let (address, page) = unsafe {
-            (
-                *addresses.add(i),
-                if pages.is_null() || *pages.add(i) == 0 {
-                    std::ptr::null()
-                } else {
-                    pages.add(i)
-                },
-            )
-        };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+    // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
+    let addresses = unsafe { std::slice::from_raw_parts(addresses, n) };
+    let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
+    let page_at = |i| pages.map_or(0, |p| p[i]);
+    let mut physical = physical();
+    let mut i = 0;
+    while i < n {
+        let base = addresses[i] as usize;
+        let Some(mut end) = base.checked_add(PAGE).filter(|_| base != 0) else {
             return 0;
+        };
+        let page = page_at(i);
+        let mut run = i + 1;
+        while page == 0 && run < n && addresses[run] as usize == end && page_at(run) == 0 {
+            let Some(next) = end.checked_add(PAGE) else { break };
+            end = next;
+            run += 1;
         }
+        let len = end - base;
+        let _changing = changing_views(&physical, base, len);
+        unmap(&mut physical, base, len);
+        if page != 0 {
+            let Some(slice) = physical.pages.get(&page).cloned() else {
+                tracing::warn!(page, "XMemMapPhysicalPagesScatter: unknown page");
+                return 0;
+            };
+            if !map(&mut physical, base, PAGE, slice) {
+                return 0;
+            }
+        }
+        i = run;
     }
     1
 }
@@ -717,25 +859,28 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if len == 0 {
+        return true;
+    }
+    if to.checked_add(len).is_none() || from.checked_add(len).is_none() {
+        return false;
+    }
     let mut physical = physical();
+    if from != 0
+        && (0..len).step_by(PAGE).all(|k| {
+            slice_at(&physical, from + k).is_some_and(|slice| shows(&physical, to + k, &slice))
+        })
+    {
+        return true;
+    }
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let _changing = victory_gpu::title_memory_remapping();
+    let _changing = changing_views(&physical, to, len);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
         }
-        let at = from + k;
-        let Some(slice) = physical
-            .views
-            .range(..=at)
-            .next_back()
-            .filter(|(base, (size, _))| at < *base + size)
-            .map(|(base, (_, s))| Slice {
-                index: s.index + (at - base) / PAGE,
-                section: s.section.clone(),
-            })
-        else {
+        let Some(slice) = slice_at(&physical, from + k) else {
             return false;
         };
         if !map(&mut physical, to + k, PAGE, slice) {
@@ -743,6 +888,49 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+/// The page a title view shows at `at`, if any.
+fn slice_at(physical: &Physical, at: usize) -> Option<Slice> {
+    physical
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, (size, _))| at < *base + size)
+        .map(|(base, (_, s))| Slice {
+            index: s.index + (at - base) / PAGE,
+            section: s.section.clone(),
+        })
+}
+
+/// Whether a title view shows `slice` at `at` already. Mapping it there
+/// again would change nothing, and would cost an unmap and a map, which
+/// under Wine each hold the process's one virtual-memory lock across a
+/// wineserver request: every page fault and protection change on other
+/// threads waits for them (#50).
+fn shows(physical: &Physical, at: usize, slice: &Slice) -> bool {
+    slice_at(physical, at).is_some_and(|s| s.key(0) == slice.key(0))
+}
+
+/// A partial unmap temporarily removes both end views in their entirety.
+/// Hold their ranges as well as the requested range until they are rebuilt.
+fn changing_views(physical: &Physical, base: usize, len: usize) -> victory_gpu::Remapping {
+    let end = base + len;
+    let containing = |address: usize| {
+        physical.views.range(..=address).next_back().and_then(|(&at, &(bytes, _))| {
+            let stop = at + bytes;
+            (address < stop).then_some((at, stop))
+        })
+    };
+    let (lo, hi) = if len == 0 {
+        (base, end)
+    } else {
+        (
+            containing(base).map_or(base, |(at, _)| at),
+            containing(end - 1).map_or(end, |(_, stop)| stop),
+        )
+    };
+    victory_gpu::title_memory_remapping_range(lo, hi - lo)
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -758,7 +946,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
         );
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -786,7 +974,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // New contents, read-write: the GPU side's copies no longer guard it.
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64);
     for k in 0..len / PAGE {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         shown.push(base + k * PAGE);
@@ -1237,7 +1425,7 @@ mod tests {
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let _reading = victory_gpu::title_memory_reading();
+                    let _reading = victory_gpu::title_memory_reading_range(first, 1);
                     // SAFETY: the page is mapped whenever no change of
                     // mapping is under way, and none is while `_reading`
                     // is held.
@@ -1415,5 +1603,49 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn scatter_clears_neighbours_without_merging_the_kept_views() {
+        let pages = allocate(4);
+        let base = XMemVirtualAlloc(
+            std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        assert!(!base.is_null());
+        let addrs = std::array::from_fn::<_, 4, _>(|i| base.wrapping_byte_add(i * PAGE));
+        assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 4, pages.as_ptr()), 1);
+        {
+            let physical = physical();
+            for addr in addrs {
+                assert_eq!(physical.views.get(&(addr as usize)).unwrap().0, PAGE);
+            }
+        }
+        assert!(write_physical(&pages[3..], 0, &[42]));
+        assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), 3, std::ptr::null()), 1);
+        for addr in &addrs[..3] {
+            assert_eq!(query(*addr).host.State, MEM_RESERVE);
+        }
+        // SAFETY: the fourth mapping is still live and was not part of the clear.
+        assert_eq!(unsafe { addrs[3].cast::<u8>().read() }, 42);
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+        // SAFETY: our own reservation is empty.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn streaming_window_reuses_persistent_address() {
+        let pages = allocate(2);
+        let (first, persistent) = {
+            let mut window = page_window(&pages, 4, PAGE).unwrap();
+            let persistent = window.slice.section.persistent.as_ref().map(|v| v.at.Value as usize);
+            (window.bytes().as_mut_ptr() as usize, persistent)
+        };
+        if let Some(persistent) = persistent {
+            let mut window = page_window(&pages, 8, PAGE).unwrap();
+            assert_eq!(first, persistent + 4);
+            assert_eq!(window.bytes().as_mut_ptr() as usize, persistent + 8);
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }

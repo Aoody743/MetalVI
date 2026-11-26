@@ -1007,6 +1007,7 @@ fn into_destination(
         // beside first, see `execute`), so a block guarded again meanwhile
         // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        victory_loader::writelog::note(request.destination as usize, len, victory_loader::writelog::Source::DStorageMemory);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };

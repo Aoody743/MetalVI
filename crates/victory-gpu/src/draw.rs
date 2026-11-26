@@ -187,6 +187,10 @@ fn windows() -> bool {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// Compute dispatches recorded for Metal (`VICTORY_METAL=compute`),
+    /// run when the list is submitted.
+    #[cfg(windows)]
+    pub(crate) metal: Vec<std::sync::Arc<crate::backend::metal::MetalCmd>>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -351,6 +355,29 @@ pub(crate) fn take_dropped() -> u64 {
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+
+type HeapBufferRange = (std::sync::Arc<crate::shadow::Shadow>, u64, u64);
+type HeapBufferSpans = crate::fx::Map<usize, HeapBufferRange>;
+
+#[derive(Default)]
+struct HeapBufferBucket {
+    slots: crate::fx::Map<u32, HeapBufferRange>,
+    spans: HeapBufferSpans,
+}
+
+#[derive(Default)]
+pub(crate) struct HeapBufferCache {
+    passes: usize,
+    buckets: [HeapBufferBucket; crate::descriptor::host::BUFFER_BUCKETS],
+}
+
+fn cover_buffer_span(spans: &mut HeapBufferSpans, range: &HeapBufferRange) {
+    let key = std::sync::Arc::as_ptr(&range.0) as usize;
+    spans.entry(key).and_modify(|old| {
+        old.1 = old.1.min(range.1);
+        old.2 = old.2.max(range.2);
+    }).or_insert_with(|| range.clone());
+}
 
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
@@ -1362,40 +1389,26 @@ impl State {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
-        // Per host heap: the host copy and range each slot's buffer view
-        // reads, kept from pass to pass. Only the slots written since the
-        // last pass are looked at again (83,000 slots a pass otherwise, 0.1 s
-        // at best); all of them every 16 passes, because a view of a
-        // released resource goes stale without a write, and a slot written
-        // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
-        let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
-        let (passes, ranges) = kept
-            .get_or_insert_with(Default::default)
-            .entry(std::ptr::from_ref(host) as usize)
-            .or_insert_with(|| (0, Ranges::new()));
-        let changed = host.buffer_changes();
-        let slots = if *passes % 16 == 0 {
-            ranges.clear();
-            host.buffer_slots()
-        } else {
-            changed
-        };
-        *passes += 1;
+        // Check changed slots immediately and revalidate one bucket each
+        // pass so stale views go away within 16 passes without a full scan.
+        use crate::descriptor::host::{BUFFER_BUCKETS, buffer_bucket};
+        let mut kept = host.buffer_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = kept.get_or_insert_with(Default::default);
+        let rolling = cache.passes.checked_sub(1).map(|pass| pass % BUFFER_BUCKETS);
+        let mut slots = host.buffer_changes();
+        slots.extend(host.buffer_slots(rolling));
+        slots.sort_unstable();
+        slots.dedup();
+        cache.passes += 1;
+        let mut dirty = [false; BUFFER_BUCKETS];
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
+            let bucket = buffer_bucket(index);
+            let ranges = &mut cache.buckets[bucket].slots;
+            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             // Every 64 views while the device lives (a cheap query).
             if alive
                 && n % 64 == 63
@@ -1413,24 +1426,35 @@ impl State {
             }
             // The copy the slot shows (`buffer_copy`), not the one the
             // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            let Some((shadow, address, len)) = view.as_ref().and_then(crate::descriptor::host::buffer_copy) else {
+                dirty[bucket] |= ranges.remove(&index).is_some();
                 continue;
             };
             #[cfg(feature = "diagnostics")]
             if host.shows(index, &shadow.buffer) == Some(false) {
                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
             }
-            ranges.insert(index, (shadow, address, address + len));
+            let end = address + len;
+            if ranges.get(&index).is_none_or(|old| {
+                !std::sync::Arc::ptr_eq(&old.0, &shadow) || old.1 != address || old.2 != end
+            }) {
+                ranges.insert(index, (shadow, address, end));
+                dirty[bucket] = true;
+            }
         }
-        let views = ranges.len() as u32;
-        // Per host copy, the span its picked views cover.
-        let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
-            std::collections::HashMap::new();
-        for (shadow, from, to) in ranges.values() {
-            let key = std::sync::Arc::as_ptr(shadow) as usize;
-            let span = spans.entry(key).or_insert_with(|| (shadow.clone(), *from, *to));
-            span.1 = span.1.min(*from);
-            span.2 = span.2.max(*to);
+        let mut views = 0;
+        let mut spans = HeapBufferSpans::default();
+        for (bucket, dirty) in cache.buckets.iter_mut().zip(dirty) {
+            views += bucket.slots.len() as u32;
+            if dirty {
+                bucket.spans.clear();
+                for range in bucket.slots.values() {
+                    cover_buffer_span(&mut bucket.spans, range);
+                }
+            }
+            for range in bucket.spans.values() {
+                cover_buffer_span(&mut spans, range);
+            }
         }
         drop(kept);
         let bytes: u64 = spans.values().map(|s| s.2 - s.1).sum();
@@ -1597,11 +1621,15 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let room = crate::resource::room();
+        let mut room = crate::resource::room();
+        let mut since_room_check = 0u64;
         if !room {
             HEAP_TEXTURES_FULL.fetch_add(1, Ordering::Relaxed);
             once!("textures picked by index: the card has no room for more; they wait");
         }
+        static REUPLOAD_FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let reupload_full =
+            *REUPLOAD_FULL.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"));
         let mut refused = 0;
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
@@ -1715,16 +1743,22 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
-            // From here on a host texture is made: not without room. The
-            // slot stays due.
-            if !room {
-                refused += 1;
-                if refused > 256 {
-                    break;
+            let handle = heap.handle(index);
+            let view = if room {
+                handle.and_then(|h| host.mirror(index, h, true))
+            } else {
+                // Leave new textures due, but allow a refresh of an
+                // already mirrored view without mirroring a second time.
+                if let Some(view) = handle.filter(|_| reupload_full).and_then(|h| host.existing_texture_view(index, h)) {
+                    Some(view)
+                } else {
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
+            };
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -1793,6 +1827,11 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            since_room_check += bytes;
+            if room && since_room_check >= 32 << 20 {
+                since_room_check = 0;
+                room = crate::resource::room();
+            }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             host.texture_slot_done(index, write, again);
@@ -1876,6 +1915,15 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        #[cfg(windows)]
+        if crate::backend::metal::mode() == crate::backend::metal::Mode::Compute {
+            if self.metal_dispatch(p, [x, y, z]) {
+                DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -1912,6 +1960,171 @@ impl State {
     /// (diagnostics): the pipeline, then per stage the user data it gets
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
+    /// A compute dispatch on Metal (`VICTORY_METAL=compute`): the title's
+    /// pipeline as a Metal pipeline, its user data and root views in the
+    /// top-level argument buffer, the slots its shader reads refreshed in
+    /// the Metal view heap, title memory reached in place. Recorded into
+    /// the list ([`State::metal`]) and run at its submission. False if it
+    /// cannot run.
+    #[cfg(windows)]
+    fn metal_dispatch(&mut self, p: &crate::pipeline::host::HostPipeline, groups: [u32; 3]) -> bool {
+        use crate::backend::metal::backend;
+        use victory_shader::emit::{USER_DATA_SPACE, USER_GROUP_BASE};
+        use crate::backend::metal::{Drop, count};
+        use crate::backend::metal_heap::Missing;
+        static SKIPPED_HOST_WORDS: AtomicU64 = AtomicU64::new(0);
+        let Some(m) = backend() else {
+            count(Drop::NoBackend);
+            return false;
+        };
+        let Some(mp) = m.compute_pipeline(self.pipeline, p) else {
+            count(Drop::NoPipeline);
+            return false;
+        };
+        let _pool = victory_metal::Pool::new();
+        let stage = &p.stages[0];
+        let t = stage.translated();
+        let host = &t.host;
+
+        // User data.
+        let mut words = vec![0u32; host.user_data_dwords() as usize];
+        for u in &host.user_data {
+            let v = match u.root {
+                RootType::Other(kind) if kind == USER_GROUP_BASE => 0, // Metal needs no split dispatches
+                // Metal's one-view tables begin at the title's address itself.
+                RootType::Other(kind) if kind == victory_shader::emit::USER_VIEW_BIAS => 0,
+                RootType::Other(kind)
+                    if kind == victory_shader::emit::USER_VIEW_ADDRESS || kind == victory_shader::emit::USER_VIEW_ADDRESS + 1 =>
+                {
+                    self.host_word(true, kind, u.slot, u.dword, None)
+                }
+                RootType::Other(_) => {
+                    // victory's memory directory words: not built for Metal yet
+                    if SKIPPED_HOST_WORDS.fetch_add(1, Ordering::Relaxed).is_power_of_two() {
+                        tracing::info!(pipeline = %p.name, "Metal: a dispatch needs the memory directory: skipped");
+                    }
+                    count(Drop::MemoryDirectory);
+                    return false;
+                }
+                _ => self.user_value(true, u.slot, u.root, u.dword),
+            };
+            if let Some(w) = words.get_mut(u.index as usize) {
+                *w = v;
+            }
+        }
+        let mut top = mp.top_level.clone();
+        if !words.is_empty() && !top.set_constants(USER_DATA_SPACE, 0, &words) {
+            once!(pipeline = %p.name, "Metal: user data does not fit the top-level layout");
+            count(Drop::UserDataLayout);
+            return false;
+        }
+
+        // Root views by the Metal root layout: victory's own as root
+        // descriptors, the title's as one-view tables bounded by the title
+        // buffer that holds them (zero copy: a stray write is corruption).
+        let mut tables = Vec::new();
+        {
+            use crate::backend::metal::{RootSlot, root_layout};
+            let mut chunks = m.chunks.lock().unwrap_or_else(|e| e.into_inner());
+            for (i, r) in root_layout(host).into_iter().enumerate() {
+                let slot = match r {
+                    RootSlot::Constants(_) => continue,
+                    RootSlot::Cbv(s) | RootSlot::Srv(s) | RootSlot::Uav(s) | RootSlot::TableSrv(s) | RootSlot::TableUav(s) => s,
+                };
+                let va = match self.roots_ref(true).get(usize::from(slot)) {
+                    Some(Root::View(va)) => *va,
+                    _ => 0,
+                };
+                let extent = if va == 0 {
+                    0
+                } else {
+                    match crate::shadow::buffer_extent(va) {
+                        Some((_, end)) => end - va,
+                        None => victory_metal::chunks::committed_extent(va, 4 << 20),
+                    }
+                };
+                let gpu = if extent == 0 { 0 } else { chunks.window(va, extent) };
+                match r {
+                    RootSlot::TableSrv(_) | RootSlot::TableUav(_) => {
+                        let entry = if gpu == 0 { victory_metal::ir::DescriptorEntry::NULL } else { victory_metal::ir::DescriptorEntry::buffer(gpu, extent) };
+                        if let Some(at) = top.offset_of(i) {
+                            tables.push((at, entry));
+                        }
+                    }
+                    _ => {
+                        top.set_u64(i, gpu);
+                    }
+                }
+            }
+        }
+
+        // The heaps: the slots the shader reads, refreshed (view heap at
+        // bind point 0, sampler heap at 1).
+        let mut heap_buffer = None;
+        let mut sampler_buffer = None;
+        let mut worst: Option<Missing> = None;
+        for u in &t.used {
+            if u.root != RootType::Table {
+                continue;
+            }
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else { continue };
+            let handle = table + u64::from(u.table_offset_dwords) * 4;
+            let Some(heap) = self.heap_of(handle) else { continue };
+            let Some(index) = heap.index(handle) else { continue };
+            let key = std::ptr::from_ref(heap) as usize;
+            if let Some((buffer, missing)) = m.refresh_slot(key, heap.count(), index, handle) {
+                worst = worst.or(missing);
+                if heap.samplers() {
+                    sampler_buffer = Some(buffer);
+                } else {
+                    heap_buffer = Some(buffer);
+                }
+            }
+        }
+        // Views picked from the heap by a root constant (table base + byte
+        // offset + constant << shift, 32-byte slots), as `tables` does.
+        for index in &host.root_indexed_views {
+            let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(index.table_slot)) else { continue };
+            let constant = self.user_value(true, index.constant_slot, RootType::Constants, index.constant_dword);
+            let slot = index.byte_offset.wrapping_add(constant << index.shift) / 32;
+            let Some(handle) = table.checked_add(u64::from(slot) * 32) else { continue };
+            let Some(heap) = self.heap_of(handle) else { continue };
+            let Some(i) = heap.index(handle) else { continue };
+            let key = std::ptr::from_ref(heap) as usize;
+            if let Some((buffer, missing)) = m.refresh_slot(key, heap.count(), i, handle) {
+                worst = worst.or(missing);
+                if heap.samplers() {
+                    sampler_buffer = Some(buffer);
+                } else {
+                    heap_buffer = Some(buffer);
+                }
+            }
+        }
+        // Shaders that read no table still get the bound heaps.
+        for (h, out) in [(self.heaps[0], &mut heap_buffer), (self.heaps[1], &mut sampler_buffer)] {
+            if h != 0 && out.is_none() {
+                let heap = crate::descriptor::heap(h as This);
+                *out = m.refresh_slot(h, heap.count(), 0, heap.handle(0).unwrap_or(0)).map(|(b, _)| b);
+            }
+        }
+
+        count(match worst {
+            None => Drop::Ran,
+            Some(Missing::Typed { .. }) => Drop::SlotTyped,
+            Some(Missing::Unmapped) => Drop::SlotUnmapped,
+            Some(_) => Drop::SlotMissing,
+        });
+        self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalCmd {
+            pso: mp,
+            heap: heap_buffer,
+            sampler_heap: sampler_buffer,
+            top: top.bytes,
+            groups: groups.map(u64::from),
+            tables,
+        }));
+        true
+    }
+
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -2388,7 +2601,7 @@ impl State {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
+                let _mapped = crate::watch::title_memory_reading_range(from, n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {
@@ -2461,6 +2674,9 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        if max == 0 {
+            return true;
+        }
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -2513,7 +2729,7 @@ impl State {
             ));
             return false;
         }
-        let len = u64::from(stride) * u64::from(max.max(1));
+        let len = u64::from(stride) * u64::from(max);
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;

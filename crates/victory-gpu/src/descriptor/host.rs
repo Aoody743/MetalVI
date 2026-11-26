@@ -13,6 +13,12 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+pub(crate) const BUFFER_BUCKETS: usize = 16;
+
+pub(crate) fn buffer_bucket(index: u32) -> usize {
+    index as usize % BUFFER_BUCKETS
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -58,7 +64,8 @@ pub(crate) struct HostHeap {
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
     /// buffers from the whole heap.
-    buffers: Mutex<std::collections::BTreeSet<u32>>,
+    buffers: Mutex<[std::collections::BTreeSet<u32>; BUFFER_BUCKETS]>,
+    pub(crate) buffer_cache: Mutex<Option<Box<crate::draw::HeapBufferCache>>>,
     /// Of those and of the slots that left the set: the ones written since
     /// [`HostHeap::buffer_changes`] last took them.
     changed: Mutex<std::collections::HashSet<u32>>,
@@ -416,8 +423,11 @@ impl TextureQueue {
             .filter(|(_, r)| r.due <= frame)
             .map(|(&index, &r)| (index, r))
             .collect();
+        if due.len() > max {
+            due.select_nth_unstable_by_key(max, |&(index, r)| (r.due, index));
+            due.truncate(max);
+        }
         due.sort_unstable_by_key(|&(index, r)| (r.due, index));
-        due.truncate(max);
         due
     }
 
@@ -802,6 +812,7 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
+            buffer_cache: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
             tabled: (0..if sampler { 0 } else { count })
@@ -882,6 +893,21 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+fn free_dynamic_run(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let find = |slots: &[bool]| {
+        let mut run = 0;
+        slots.iter().position(|&busy| {
+            run = if busy { 0 } else { run + 1 };
+            run == n
+        })
+    };
+    find(&taken[cursor..]).map(|last| cursor + last + 1 - n).or_else(|| {
+        // Include a run across the search cursor, but never across the heap end.
+        let end = (cursor + n - 1).min(taken.len());
+        find(&taken[..end]).map(|last| last + 1 - n)
+    })
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -898,24 +924,7 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..self.dynamic as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = enough.then(|| free_dynamic_run(taken, *next as usize, n)).flatten() else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
@@ -933,7 +942,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
@@ -1036,6 +1045,30 @@ impl HostHeap {
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+    }
+
+    /// A refresh can reuse this host texture without a new GPU allocation.
+    pub(crate) fn existing_texture_view(&self, index: u32, handle: u64) -> Option<View> {
+        if index >= self.count {
+            return None;
+        }
+        // SAFETY: the handle is a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        if tag != VIEW_TAG || key == 0 {
+            return None;
+        }
+        // `mirror` uses the same lock order. A null view also has a key,
+        // but does not keep a live resource.
+        let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        if made.get(index as usize) == Some(&key)
+            && self.kept.lock().unwrap_or_else(|e| e.into_inner())
+                .get(index as usize).is_some_and(Option::is_some)
+        {
+            view_at(i, generation)
+        } else {
+            None
+        }
     }
 
     /// Takes the ranges of title memory the runtime mapped, unmapped or
@@ -1328,9 +1361,12 @@ impl HostHeap {
     }
 
     /// The title slots that hold buffer views.
-    pub(crate) fn buffer_slots(&self) -> Vec<u32> {
+    pub(crate) fn buffer_slots(&self, bucket: Option<usize>) -> Vec<u32> {
         let buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        buffers.iter().copied().collect()
+        match bucket {
+            Some(bucket) => buffers[bucket].iter().copied().collect(),
+            None => buffers.iter().flat_map(|slots| slots.iter().copied()).collect(),
+        }
     }
 
     /// The title slots whose buffer view was written, or went, since the
@@ -1414,11 +1450,12 @@ impl HostHeap {
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = &mut buffers[buffer_bucket(index)];
         let was = if stride.is_some() {
-            buffers.insert(index);
+            slots.insert(index);
             true
         } else {
-            buffers.remove(&index)
+            slots.remove(&index)
         };
         if was {
             self.changed
@@ -2704,6 +2741,15 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dynamic_slots_can_cross_the_cursor_but_not_the_end() {
+        let taken = [true, false, false, false, false, true, false, false];
+        assert_eq!(free_dynamic_run(&taken, 3, 4), Some(1));
+        assert_eq!(free_dynamic_run(&taken, 3, 2), Some(3));
+        assert_eq!(free_dynamic_run(&taken, 5, 2), Some(6));
+        assert_eq!(free_dynamic_run(&[false, false, true, true, false, false], 3, 4), None);
+    }
+
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
     #[test]
@@ -2860,6 +2906,17 @@ mod tests {
         assert!(q.due(2, 9).iter().any(|d| d.0 == 8));
         q.rechecked(8, &seen[0].1, false, 5);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
+    }
+
+    #[test]
+    fn limited_texture_rechecks_keep_oldest_first_and_break_ties_by_slot() {
+        let mut q = TextureQueue::default();
+        for (index, frame) in [(1, 6), (2, 3), (3, 1), (4, 3), (5, 8)] {
+            q.recheck(index, frame, (0x1000, 64), 5);
+        }
+        assert!(q.rechecks_due(10, 0).is_empty());
+        let due = q.rechecks_due(10, 3);
+        assert_eq!(due.iter().map(|&(index, _)| index).collect::<Vec<_>>(), [3, 2, 4]);
     }
 
     /// The fingerprint of a texture's memory sees a change at its start, in

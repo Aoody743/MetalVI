@@ -474,6 +474,10 @@ struct Call {
     identity: usize,
     done: Mutex<bool>,
     finished: Condvar,
+    /// The provider's `DoWork` is running (set under `done`): a cancel then
+    /// leaves the completion to it, since the title may free the block and
+    /// what the work writes into the moment the call completes.
+    running: std::sync::atomic::AtomicBool,
 }
 
 impl Call {
@@ -544,6 +548,7 @@ pub fn XAsyncBegin(
         identity: identity as usize,
         done: Mutex::new(false),
         finished: Condvar::new(),
+        running: std::sync::atomic::AtomicBool::new(false),
     });
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
@@ -562,7 +567,17 @@ pub fn XAsyncSchedule(block: *mut AsyncBlock, delay_ms: u32) -> HRESULT {
         let hr = if canceled {
             E_ABORT
         } else {
-            call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut())
+            {
+                let done = lock(&call.done);
+                if *done {
+                    // canceled (or completed) before the work started
+                    return;
+                }
+                call.running.store(true, Ordering::Release);
+            }
+            let hr = call.provider(OP_DO_WORK, block, 0, std::ptr::null_mut());
+            call.running.store(false, Ordering::Release);
+            hr
         };
         if hr != E_PENDING {
             XAsyncComplete(block, hr, 0);
@@ -646,9 +661,26 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
 /// provider completed it first.
+///
+/// While the provider's `DoWork` runs, the call is left for it to complete
+/// (as XAsyncRun's work and providers that ignore cancel do on the console):
+/// completing here let the title free the block and the work's payload
+/// under the running work, which then wrote into freed memory.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
     if let Some(call) = call(block) {
+        static CANCELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = CANCELS.fetch_add(1, Ordering::Relaxed) + 1;
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
+        let running = {
+            let done = lock(&call.done);
+            !*done && call.running.load(Ordering::Acquire)
+        };
+        if n.is_power_of_two() {
+            tracing::info!(cancels = n, running, "XAsyncCancel");
+        }
+        if running {
+            return;
+        }
         XAsyncComplete(block, E_ABORT, 0);
     }
 }
@@ -1203,6 +1235,36 @@ mod tests {
             S_OK
         );
         assert_eq!(XAsyncGetStatus(&mut block, true), E_ABORT);
+    }
+
+    #[test]
+    fn cancel_leaves_running_work_to_complete_the_call() {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        static GO: AtomicBool = AtomicBool::new(false);
+        extern "system" fn work(_: *mut AsyncBlock) -> HRESULT {
+            STARTED.store(true, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            while !GO.load(Ordering::SeqCst) && start.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            S_OK
+        }
+        let mut block = AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        };
+        assert_eq!(XAsyncRun(&mut block, Some(work)), S_OK);
+        let start = std::time::Instant::now();
+        while !STARTED.load(Ordering::SeqCst) && start.elapsed().as_secs() < 5 {
+            std::thread::yield_now();
+        }
+        XAsyncCancel(&mut block);
+        // still in flight: the work has not returned
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        GO.store(true, Ordering::SeqCst);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
     }
 
     #[test]

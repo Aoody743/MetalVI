@@ -1,0 +1,39 @@
+[package]
+name = "victory-metal"
+description = "Safe Rust side of victorymetal, MetalVI's Wine unixlib for Metal (native/victorymetal)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Memory", "Win32_Foundation", "Win32_Security", "Win32_System_LibraryLoader"] }
+
+[[bin]]
+name = "victory-metal-smoke"
+path = "src/bin/smoke.rs"
+
+[[bin]]
+name = "victory-metal-chunks"
+path = "src/bin/chunks.rs"
+
+[[bin]]
+name = "victory-metal-events"
+path = "src/bin/events.rs"
+
+[[bin]]
+name = "victory-metal-textures"
+path = "src/bin/textures.rs"
+
+[[bin]]
+name = "victory-metal-blit"
+path = "src/bin/blit.rs"
+
+[[bin]]
+name = "victory-metal-msc"
+path = "src/bin/msc.rs"
+
+[[bin]]
+name = "victory-metal-bind"
+path = "src/bin/bind.rs"

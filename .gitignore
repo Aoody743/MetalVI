@@ -76,3 +76,9 @@
 *.swp
 Thumbs.db
 .DS_Store
+
+# victorymetal build output: holds a copy of Apple's Metal Shader Converter
+# library (libmetalirconverter, renamed), which is Apple's and must not be
+# redistributed. Each user builds it from their own MSC install.
+/native/victorymetal/build/
+/scripts/macos/*.dylib

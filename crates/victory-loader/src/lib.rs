@@ -26,6 +26,8 @@ mod console_insn;
 mod crash;
 pub mod prepare;
 pub mod resolve;
+pub mod writelog;
+pub mod masked;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]

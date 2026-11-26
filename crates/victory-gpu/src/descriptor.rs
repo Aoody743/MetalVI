@@ -107,6 +107,11 @@ impl Heap {
     }
 
     /// The descriptor index of `handle` in this heap, if it lies in it.
+    /// The number of slots.
+    pub(crate) fn count(&self) -> u32 {
+        self.desc.count
+    }
+
     pub(crate) fn index(&self, handle: u64) -> Option<u32> {
         let step = u64::from(increment(self.desc.kind)?);
         let at = handle.checked_sub(self.start)?;

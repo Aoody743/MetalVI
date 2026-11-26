@@ -518,6 +518,13 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     #[cfg(windows)]
+    if let Some(m) = crate::backend::metal::backend() {
+        // SAFETY: the title passes `count` lists.
+        let titles = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        let cmds: Vec<_> = titles.iter().flat_map(|&l| crate::list::metal_commands(l)).collect();
+        m.run(&cmds);
+    }
+    #[cfg(windows)]
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
@@ -719,6 +726,7 @@ impl Written {
             }
             Written::SystemTimestamp => system_timestamp(),
         };
+        crate::note_write(at as usize, bytes, 1);
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
             if bytes == 4 {
@@ -745,7 +753,31 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+/// T8: present-to-present times, p50/p95/max every 64 frames.
+fn frame_interval(frame: u64) {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static TIMES: Mutex<Vec<f64>> = Mutex::new(Vec::new());
+    let now = std::time::Instant::now();
+    let Some(before) = LAST.lock().unwrap_or_else(|e| e.into_inner()).replace(now) else {
+        return;
+    };
+    let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
+    times.push(now.duration_since(before).as_secs_f64() * 1000.0);
+    if times.len() >= 64 {
+        times.sort_by(f64::total_cmp);
+        let at = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
+        tracing::info!(
+            frame,
+            p50_ms = format!("{:.1}", at(0.5)),
+            p95_ms = format!("{:.1}", at(0.95)),
+            max_ms = format!("{:.1}", at(1.0)),
+            "T8 present-to-present over the last 64 frames"
+        );
+        times.clear();
+    }
+}
+
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -779,6 +811,7 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    frame_interval(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -823,6 +856,7 @@ extern "system" fn present(
         // SAFETY: the plane lists `count` resources.
         && let resource = unsafe { *plane.resources }
         && let Some(texture) = crate::resource::host_resource(resource)
+        && !crate::host::null_gpu()
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;

@@ -7,6 +7,8 @@
 
 #[path = "console_insn_decode.rs"]
 mod decode;
+#[path = "console_patch.rs"]
+pub(crate) mod patch;
 
 use decode::ConsoleOnly;
 use std::cell::Cell;
@@ -105,6 +107,10 @@ fn writable_to(va: usize, end: usize) -> Option<usize> {
 /// `ctx` is the faulting thread's context, from the exception being dispatched.
 pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     let rip = ctx.Rip as usize;
+    if let Some(at) = patch::retry_at(rip, false) {
+        ctx.Rip = at as u64;
+        return CONTINUE_EXECUTION;
+    }
     // The same few instructions fault again and again: their bytes are asked about once.
     let known = if remembers() { CODE.with(Cell::get) } else { [(0, 0); 8] };
     let n = match known.iter().find(|&&(at, n)| at == rip && n > 0) {
@@ -137,18 +143,7 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
     }
     match what {
         ConsoleOnly::Ud2 => return 0,
-        ConsoleOnly::Clwb => {
-            // nothing to write back on the PC: patched to NOPs, no exception next time
-            use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
-            let mut old = 0u32;
-            // SAFETY: the instruction's own bytes, made writable for the patch and restored.
-            unsafe {
-                if VirtualProtect(rip as *const _, len, PAGE_EXECUTE_READWRITE, &mut old) != 0 {
-                    std::slice::from_raw_parts_mut(rip as *mut u8, len).fill(0x90);
-                    VirtualProtect(rip as *const _, len, old, &mut old);
-                }
-            }
-        }
+        ConsoleOnly::Clwb => {}
         ConsoleOnly::Monitorx => {}
         ConsoleOnly::Mwaitx => std::hint::spin_loop(),
         ConsoleOnly::Clzero => {
@@ -234,6 +229,12 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             d.High = 0;
         }
     }
+    let patch_len = match what {
+        // the whole loop: replaced by a jump to a native one
+        ConsoleOnly::ClzeroLoop { .. } => len,
+        _ => len,
+    };
+    patch::patch(rip, what, patch_len, &code[..patch_len.min(code.len())]);
     ctx.Rip += len as u64;
     // How often this runs at all (each one is an exception: a trip into Windows and back).
     let emulated = EMULATED.fetch_add(1, Relaxed) + 1;
@@ -242,6 +243,8 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
             emulated,
             asked = ASKED.load(Relaxed),
             zeroed_mb = ZEROED.load(Relaxed) >> 20,
+            patched = patch::PATCHED.load(Relaxed),
+            refused = patch::REFUSED.load(Relaxed),
             "console CPU instructions emulated so far, the times Windows was asked about memory for them, and what clzero loops zeroed"
         );
     }

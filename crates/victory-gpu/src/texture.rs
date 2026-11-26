@@ -780,12 +780,12 @@ impl Staging {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading_range(start, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -804,6 +804,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                drop(_mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -857,6 +858,8 @@ impl Staging {
             if !take_changed(&mut last.raw, tiled) {
                 return size;
             }
+            // Detiling only reads our snapshot, not the title mapping.
+            drop(_mapped);
             self.detile(&last.raw);
         } else {
             let hash = blake3::hash(tiled);

@@ -30,6 +30,16 @@ pub struct Cache {
     root: PathBuf,
 }
 
+/// Whether a finished entry is at `path`. On Windows a folder does not
+/// open as a file, so opening tells; elsewhere `is_file` is fine.
+fn published(path: &std::path::Path) -> bool {
+    if cfg!(windows) {
+        std::fs::File::open(path).is_ok()
+    } else {
+        path.is_file()
+    }
+}
+
 impl Cache {
     /// Opens (creating) a cache at `root`. Refuses locations inside the repo.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
@@ -48,7 +58,9 @@ impl Cache {
     pub fn get_or_convert(&self, converter: &dyn Converter, input: &[u8]) -> Result<PathBuf> {
         let key = CacheKey::new(converter, input);
         let path = self.path_for(&key);
-        if path.is_file() {
+        // Asks for no metadata (a Wine mount-manager call that has hung the
+        // pipeline workers, see `victory_gpu::read_file`): opened instead.
+        if published(&path) {
             tracing::trace!(converter = converter.id(), key = %key.to_hex(), "cache hit");
             return Ok(path);
         }
@@ -56,7 +68,11 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
+        match std::fs::create_dir(dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)?,
+            made => made?,
+        }
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
         let mut file = std::fs::OpenOptions::new()

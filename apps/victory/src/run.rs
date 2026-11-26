@@ -22,7 +22,8 @@ pub fn run(
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let known = victory_game::identify(&hash);
+    match known {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
@@ -35,6 +36,33 @@ pub fn run(
     // whole run (two blocks of 114.7 MB each for the title, in
     // physical memory: run 65's memory map).
     drop(prepared);
+    // Rosetta does AVX masked stores as read-modify-writes of all their
+    // lanes, undoing other threads' writes to the lanes masked off (the
+    // pool-header crashes): they are redone as plain per-lane stores
+    // (`victory_loader::masked`). `VICTORY_PATCH_MASKED=none` keeps them.
+    let masked = victory_loader::masked::masked_stores(image.info(), &original);
+    println!("masked stores  {}", victory_loader::masked::summary(&masked));
+    if let Some(which) = victory_loader::masked::choice(std::env::var("VICTORY_PATCH_MASKED").ok(), true) {
+        let wanted = victory_loader::masked::wanted_from(Some(&which));
+        let n = victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
+        println!("masked stores  {n} patched to plain per-lane stores");
+    }
+    // The title's hang watchdog off, for slow loads and first world frames.
+    #[cfg(windows)]
+    if std::env::var_os("VICTORY_NO_HANG_WATCHDOG").is_some_and(|v| v != "0") {
+        match known.map(|b| b.hang_watchdog).filter(|p| !p.is_empty()) {
+            Some(patches) => {
+                for p in patches {
+                    if victory_loader::masked::patch_code(image.base() as u64, p.rva, p.original, p.replacement) {
+                        println!("hang watchdog  off at +{:#x}", p.rva);
+                    } else {
+                        println!("hang watchdog  left on: unexpected bytes at +{:#x}", p.rva);
+                    }
+                }
+            }
+            None => println!("hang watchdog  left on: unknown build"),
+        }
+    }
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
