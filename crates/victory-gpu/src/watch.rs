@@ -127,18 +127,17 @@ pub(crate) fn should_skip_d3d12_host(
     metal_present: Option<&str>,
     cuts: Option<&str>,
 ) -> bool {
-    match cuts {
-        Some("1") => return true,
-        Some("0") => return false,
-        _ => {}
-    }
-    metal == Some("compute") && metal_draw == Some("1") && metal_present == Some("1")
+    // Opt-in only. Metal draws are still recorded only for draws the D3D12
+    // path prepared (its descriptor mirroring among them), so skipping that
+    // work drops every draw on both paths and the title stalls on its first
+    // screen (runs metal85-87). The other switches no longer turn it on.
+    let _ = (metal, metal_draw, metal_present);
+    cuts == Some("1")
 }
 
 /// Whether D3D12-only host copies, descriptor mirroring, and write-watch
-/// tracking can be skipped because Metal draws and presents the window
-/// (`VICTORY_METAL=compute`, `VICTORY_METAL_DRAW=1`, `VICTORY_METAL_PRESENT=1`),
-/// or `VICTORY_METAL_CPU_CUTS=1` (`0` forces D3D12 host work on).
+/// tracking are skipped: only with `VICTORY_METAL_CPU_CUTS=1`, for when Metal
+/// no longer depends on the D3D12 path (see `should_skip_d3d12_host`).
 pub(crate) fn skip_d3d12_host() -> bool {
     static SKIP: LazyLock<bool> = LazyLock::new(|| {
         let val = |k: &str| std::env::var(k).ok();
@@ -1731,7 +1730,7 @@ mod mapping_tests {
         assert!(!should_skip_d3d12_host(Some("compute"), None, None, None));
         assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), None, None));
         assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), Some("0"), None));
-        assert!(should_skip_d3d12_host(Some("compute"), Some("1"), Some("1"), None));
+        assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), Some("1"), None));
         assert!(!should_skip_d3d12_host(Some("compute"), Some("1"), Some("1"), Some("0")));
         assert!(should_skip_d3d12_host(None, None, None, Some("1")));
     }
