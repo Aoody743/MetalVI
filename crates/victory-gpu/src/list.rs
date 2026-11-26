@@ -879,6 +879,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            if crate::backend::metal_draw::draws_on() {
+                metal_copy(this, src, 0, dst, 0, [0; 3], None, true);
+            }
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1046,9 +1049,65 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        // Texture to texture on Metal too (F50), in list order.
+        if crate::backend::metal_draw::draws_on() && src.kind != FOOTPRINT && dst.kind != FOOTPRINT {
+            // SAFETY: a subresource location's union starts with its index.
+            let (si, di) = unsafe {
+                (
+                    (&raw const src.footprint).cast::<u32>().read_unaligned(),
+                    (&raw const dst.footprint).cast::<u32>().read_unaligned(),
+                )
+            };
+            // SAFETY: the title's box or null (left, top, front, right, bottom, back).
+            let source = unsafe { source_box.as_ref() }.copied();
+            metal_copy(this, src.resource, si, dst.resource, di, [x, y, z], source, false);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// A texture copy on Metal too (`VICTORY_METAL_DRAW=1`): whole resources, or
+/// subresource `si` of `src` (its `source` box, else all of it) to `di` of
+/// `dst` at `at`, recorded into the list in order.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn metal_copy(this: This, src: This, si: u32, dst: This, di: u32, at: [u32; 3], source: Option<[u32; 6]>, whole: bool) {
+    use crate::backend::metal_copy::{decode_subresource, subresource_dims};
+    let Some(m) = crate::backend::metal::backend() else { return };
+    let _pool = victory_metal::Pool::new();
+    let (Some(s), Some(d)) = (m.texture_for(src), m.texture_for(dst)) else { return };
+    // (plane, mip, slice)
+    let (Some((_, sl, ss)), Some((_, dl, ds))) = (decode_subresource(si, s.mips, s.slices.max(1)), decode_subresource(di, d.mips, d.slices.max(1))) else {
+        return;
+    };
+    let three_d = s.desc.dimension == 4;
+    let dims = subresource_dims(s.desc.width, s.desc.height.max(1), u32::from(s.desc.depth_or_array_size.max(1)), sl, three_d);
+    let (origin, size) = match source {
+        Some(b) => (
+            [u64::from(b[0]), u64::from(b[1]), u64::from(b[2])],
+            [u64::from(b[3].saturating_sub(b[0])), u64::from(b[4].saturating_sub(b[1])), u64::from(b[5].saturating_sub(b[2])).max(1)],
+        ),
+        None => ([0; 3], dims),
+    };
+    if size.contains(&0) {
+        return;
+    }
+    let copy = crate::backend::metal_draw::MetalTexCopy {
+        src: s,
+        dst: d,
+        whole,
+        src_slice: ss,
+        src_level: sl,
+        src_origin: origin,
+        size,
+        dst_slice: ds,
+        dst_level: dl,
+        dst_origin: at.map(u64::from),
+    };
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Copy(copy)));
 }
 
 /// Records a texture to buffer copy (a read back) of [`copy_texture_region`]

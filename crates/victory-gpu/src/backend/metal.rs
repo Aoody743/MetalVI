@@ -168,6 +168,7 @@ pub(crate) enum MetalOp {
     Dispatch(MetalCmd),
     Draw(super::metal_draw::MetalDraw),
     Clear(super::metal_draw::MetalClear),
+    Copy(super::metal_draw::MetalTexCopy),
 }
 
 /// Memory for the one-view tables of a submission (resident, GPU reads it
@@ -337,7 +338,7 @@ impl MetalBackend {
                         blob += (indices.len() * 4).next_multiple_of(256);
                     }
                 }
-                MetalOp::Clear(_) => {}
+                MetalOp::Clear(_) | MetalOp::Copy(_) => {}
             }
         }
         let need = tables + blob.div_ceil(entry) + 256 / entry + 1;
@@ -415,7 +416,7 @@ impl MetalBackend {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((tops, a, u, vt, zt));
                 }
-                MetalOp::Clear(_) => {
+                MetalOp::Clear(_) | MetalOp::Copy(_) => {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
@@ -453,6 +454,28 @@ impl MetalBackend {
                         i += 1;
                     }
                     ok = cb.compute(&steps).is_ok();
+                }
+                MetalOp::Copy(c) => {
+                    if let Err(e) = super::metal_copy::encode_texture_to_texture(
+                        &cb,
+                        &c.src.texture,
+                        c.src_slice,
+                        c.src_level,
+                        c.src_origin,
+                        c.size,
+                        &c.dst.texture,
+                        c.dst_slice,
+                        c.dst_level,
+                        c.dst_origin,
+                        c.whole,
+                        None,
+                    ) {
+                        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            tracing::info!(error = %e, "Metal: a texture copy left out");
+                        }
+                    }
+                    i += 1;
                 }
                 MetalOp::Clear(c) => {
                     let clear = sys::WMTLoadAction::WMTLoadActionClear;
@@ -590,6 +613,7 @@ impl MetalBackend {
                         .map(|o| match &**o {
                             MetalOp::Dispatch(_) => "dispatch".to_string(),
                             MetalOp::Draw(d) => format!("draw {}", d.pso.name),
+                            MetalOp::Copy(c) => format!("copy {} → {}", c.src.pixel.0, c.dst.pixel.0),
                             MetalOp::Clear(c) => {
                                 let t = &c.target.texture;
                                 format!(
@@ -630,7 +654,7 @@ impl MetalBackend {
                     match &**op {
                         MetalOp::Dispatch(_) => dispatches += 1,
                         MetalOp::Draw(_) => draws += 1,
-                        MetalOp::Clear(_) => clears += 1,
+                        MetalOp::Clear(_) | MetalOp::Copy(_) => clears += 1,
                     }
                 }
                 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

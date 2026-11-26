@@ -840,3 +840,18 @@ pub(crate) fn note_once(what: String) {
         seen.push(what);
     }
 }
+
+/// A texture-to-texture copy as recorded into a title list (F50's encoder
+/// at replay): whole resources, or one subresource region.
+pub(crate) struct MetalTexCopy {
+    pub(crate) src: std::sync::Arc<super::metal_texture::MetalTexture>,
+    pub(crate) dst: std::sync::Arc<super::metal_texture::MetalTexture>,
+    pub(crate) whole: bool,
+    pub(crate) src_slice: u32,
+    pub(crate) src_level: u32,
+    pub(crate) src_origin: [u64; 3],
+    pub(crate) size: [u64; 3],
+    pub(crate) dst_slice: u32,
+    pub(crate) dst_level: u32,
+    pub(crate) dst_origin: [u64; 3],
+}
