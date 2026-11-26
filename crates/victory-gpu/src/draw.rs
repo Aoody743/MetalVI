@@ -2049,7 +2049,11 @@ impl State {
             self.note_asked(7);
             return;
         };
-        let rects = self.topology == RECTANGLES && !p.mesh && !matches!(kind, DrawKindIn::Mesh { .. });
+        // `VICTORY_METAL_RECTS=triangles` (experiment): rectangles drawn as
+        // their first triangle, without MSC's geometry emulation.
+        static RECTS_AS_TRIANGLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let as_triangles = *RECTS_AS_TRIANGLES.get_or_init(|| std::env::var("VICTORY_METAL_RECTS").is_ok_and(|v| v == "triangles"));
+        let rects = self.topology == RECTANGLES && !p.mesh && !matches!(kind, DrawKindIn::Mesh { .. }) && !as_triangles;
         let Some(g) = m.graphics_pipeline(self.pipeline, p, rects) else {
             count_draw(DrawDrop::NoPipeline);
             return;
@@ -2068,6 +2072,8 @@ impl State {
             3
         } else if let Some(c) = console {
             c.primitive()
+        } else if as_triangles && self.topology == RECTANGLES {
+            3 // MTLPrimitiveTypeTriangle
         } else {
             match crate::backend::metal_map::map_topology(self.topology as i32) {
                 Some(t) => t.primitive_type as u64 as u8,
