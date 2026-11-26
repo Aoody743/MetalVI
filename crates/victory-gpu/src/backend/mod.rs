@@ -19,6 +19,10 @@ pub mod metal_texture;
 #[cfg(windows)]
 #[allow(dead_code)]
 pub mod metal_detile;
-// P2: graphics pipeline state → Metal descriptions (F7), not wired yet.
+#[cfg(windows)]
+pub mod metal_draw;
+#[cfg(windows)]
+pub mod metal_present;
+// P2: graphics pipeline state → Metal descriptions (F7).
 #[allow(dead_code)]
 pub mod metal_render_map;

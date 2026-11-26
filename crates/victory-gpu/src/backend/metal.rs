@@ -201,6 +201,13 @@ pub(crate) struct MetalCmd {
     pub(crate) tables: Vec<(u32, DescriptorEntry)>,
 }
 
+/// What a title list records for Metal, in its order.
+pub(crate) enum MetalOp {
+    Dispatch(MetalCmd),
+    Draw(super::metal_draw::MetalDraw),
+    Clear(super::metal_draw::MetalClear),
+}
+
 /// Memory for the one-view tables of a submission (resident, GPU reads it
 /// in place); reused from the start by every submission, which is safe
 /// because a submission is waited for before the next one runs.
@@ -239,6 +246,12 @@ pub(crate) struct MetalBackend {
     sampler_states: Mutex<HashMap<[u32; 11], victory_metal::sampler::SamplerState>>,
     /// The GPU detile kernels, compiled on first use (`None`: they failed).
     detiler: OnceLock<Option<super::metal_detile::Detiler>>,
+    /// Graphics pipelines by title pipeline object (`None`: refused).
+    pub(crate) graphics: Mutex<HashMap<usize, Option<Arc<super::metal_draw::MetalGraphics>>>>,
+    /// Depth-stencil states by description.
+    pub(crate) depth_stencils: Mutex<HashMap<victory_metal::render::DepthStencilDesc, victory_metal::render::DepthStencilState>>,
+    /// Render target views in another pixel format, by (resource, format).
+    pub(crate) target_views: Mutex<HashMap<(usize, u32), victory_metal::texture::Texture>>,
 }
 
 /// A title view heap as Metal Shader Converter descriptor entries, in
@@ -295,6 +308,9 @@ impl MetalBackend {
             samplers: Mutex::new(HashMap::new()),
             sampler_states: Mutex::new(HashMap::new()),
             detiler: OnceLock::new(),
+            graphics: Mutex::new(HashMap::new()),
+            depth_stencils: Mutex::new(HashMap::new()),
+            target_views: Mutex::new(HashMap::new()),
             ring: Mutex::new(None),
             textures: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
@@ -317,59 +333,265 @@ impl MetalBackend {
         made
     }
 
-    /// Runs the dispatches of one submission in order in one command buffer
-    /// (a buffer barrier between dispatches) and waits for it: the title's
-    /// fences may be signalled after this returns. False if it failed.
-    pub(crate) fn run(&self, cmds: &[Arc<MetalCmd>]) -> bool {
-        use victory_metal::{Compute, msc};
-        if cmds.is_empty() {
+    /// Runs what one submission recorded, in order, in one command buffer
+    /// (dispatches in compute passes with a barrier between them, runs of
+    /// draws to the same targets in one render pass each, clears as passes
+    /// of their own) and waits for it: the title's fences may be signalled
+    /// after this returns. False if it failed.
+    pub(crate) fn run(&self, ops: &[Arc<MetalOp>]) -> bool {
+        use super::metal_draw::{DrawKind, STAGE_VERTEX, draw_params, stage_buffer};
+        use victory_metal::render::{PassColor, PassDepth, Render, RenderPass};
+        use victory_metal::{Compute, msc, sys};
+        if ops.is_empty() {
             return true;
         }
         let _pool = victory_metal::Pool::new();
         let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-        let need: usize = cmds.iter().map(|c| c.tables.len()).sum();
+        // Ring space: the one-view tables' entries, then the bytes draws
+        // bind (top levels, draw arguments, index type), 256-aligned.
+        let entry = size_of::<DescriptorEntry>();
+        let mut tables = 0usize;
+        let mut blob = 0usize;
+        for op in ops {
+            match &**op {
+                MetalOp::Dispatch(c) => tables += c.tables.len(),
+                MetalOp::Draw(d) => {
+                    for s in &d.stages {
+                        tables += s.tables.len();
+                        blob += s.top.len().next_multiple_of(256);
+                    }
+                    blob += 512;
+                }
+                MetalOp::Clear(_) => {}
+            }
+        }
+        let need = tables + blob.div_ceil(entry) + 256 / entry + 1;
         if ring.as_ref().is_none_or(|r| r.capacity < need) {
             *ring = self.new_ring(need.max(1 << 16));
         }
-        // The top-level bytes of each dispatch, with its tables' addresses.
-        let mut tops: Vec<Vec<u8>> = Vec::with_capacity(cmds.len());
-        let mut next = 0usize;
-        for c in cmds {
-            let mut top = c.top.clone();
-            if let Some(r) = ring.as_ref() {
-                for &(at, entry) in &c.tables {
-                    // SAFETY: next < capacity (sized above); the GPU is idle
-                    // (the previous submission was waited for).
-                    unsafe { r.entries.add(next).write(entry) };
-                    let gpu = r.buffer.gpu_address + (next * size_of::<DescriptorEntry>()) as u64;
-                    let at = at as usize;
-                    if at + 8 <= top.len() {
-                        top[at..at + 8].copy_from_slice(&gpu.to_le_bytes());
-                    }
-                    next += 1;
+        let Some(r) = ring.as_ref() else { return false };
+        let base = r.entries.cast::<u8>();
+        let mut next_entry = 0usize;
+        let mut next_byte = (tables * entry).next_multiple_of(256);
+        // Writes `top` with its tables' addresses: (bytes, ring offset if
+        // put in the ring).
+        let mut patch = |top: &[u8], tabs: &[(u32, DescriptorEntry)]| -> Vec<u8> {
+            let mut top = top.to_vec();
+            for &(at, e) in tabs {
+                // SAFETY: next_entry < capacity (sized above); the GPU is
+                // idle (the previous submission was waited for).
+                unsafe { r.entries.add(next_entry).write(e) };
+                let gpu = r.buffer.gpu_address + (next_entry * entry) as u64;
+                let at = at as usize;
+                if at + 8 <= top.len() {
+                    top[at..at + 8].copy_from_slice(&gpu.to_le_bytes());
+                }
+                next_entry += 1;
+            }
+            top
+        };
+        let mut put = |bytes: &[u8]| -> u64 {
+            let at = next_byte;
+            // SAFETY: inside the ring (sized above).
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at), bytes.len()) };
+            next_byte = (at + bytes.len()).next_multiple_of(256);
+            at as u64
+        };
+        // Per op: dispatch top bytes, or per draw its stages' top offsets
+        // and its draw-argument / index-type offsets.
+        let mut dispatch_tops: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
+        let mut draw_offsets: Vec<(Vec<u64>, u64, u64)> = Vec::with_capacity(ops.len());
+        for op in ops {
+            match &**op {
+                MetalOp::Dispatch(c) => {
+                    dispatch_tops.push(patch(&c.top, &c.tables));
+                    draw_offsets.push((Vec::new(), 0, 0));
+                }
+                MetalOp::Draw(d) => {
+                    let tops = d.stages.iter().map(|s| { let t = patch(&s.top, &s.tables); put(&t) }).collect();
+                    let (args, index_type) = draw_params(&d.kind);
+                    let args: Vec<u8> = args.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let a = put(&args);
+                    let u = put(&index_type.to_le_bytes());
+                    dispatch_tops.push(Vec::new());
+                    draw_offsets.push((tops, a, u));
+                }
+                MetalOp::Clear(_) => {
+                    dispatch_tops.push(Vec::new());
+                    draw_offsets.push((Vec::new(), 0, 0));
                 }
             }
-            tops.push(top);
         }
-        let Ok(cb) = self.queue.command_buffer() else { return false };
-        let mut steps = Vec::with_capacity(cmds.len() * 5);
-        for (i, c) in cmds.iter().enumerate() {
-            if i > 0 {
-                steps.push(Compute::Barrier);
+        let Ok(mut cb) = self.queue.command_buffer() else { return false };
+        // `VICTORY_METAL_SPLIT=1`: every pass in a command buffer of its own,
+        // waited for, so a GPU fault names the pass that made it.
+        static SPLIT: OnceLock<bool> = OnceLock::new();
+        let split = *SPLIT.get_or_init(|| std::env::var("VICTORY_METAL_SPLIT").is_ok_and(|v| v == "1"));
+        let load = sys::WMTLoadAction::WMTLoadActionLoad;
+        let store = sys::WMTStoreAction::WMTStoreActionStore;
+        let mut i = 0;
+        let mut ok = true;
+        while i < ops.len() && ok {
+            let group_start = i;
+            match &*ops[i] {
+                MetalOp::Dispatch(_) => {
+                    let mut steps = Vec::new();
+                    while let Some(MetalOp::Dispatch(c)) = ops.get(i).map(|o| &**o) {
+                        if !steps.is_empty() {
+                            steps.push(Compute::Barrier);
+                        }
+                        steps.push(Compute::Pipeline { pipeline: &c.pso.pso, threads_per_group: c.pso.threadgroup });
+                        if let Some(b) = &c.heap {
+                            steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::DESCRIPTOR_HEAP_BIND_POINT });
+                        }
+                        if let Some(b) = &c.sampler_heap {
+                            steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::SAMPLER_HEAP_BIND_POINT });
+                        }
+                        if !dispatch_tops[i].is_empty() {
+                            steps.push(Compute::Bytes { bytes: &dispatch_tops[i], index: msc::ARGUMENT_BUFFER_BIND_POINT });
+                        }
+                        steps.push(Compute::Dispatch { groups: c.groups });
+                        i += 1;
+                    }
+                    ok = cb.compute(&steps).is_ok();
+                }
+                MetalOp::Clear(c) => {
+                    let clear = sys::WMTLoadAction::WMTLoadActionClear;
+                    let mut pass = RenderPass { width: c.target.width, height: c.target.height, samples: c.target.samples, ..Default::default() };
+                    if let Some(color) = c.color {
+                        pass.colors[0] = Some(PassColor { texture: &c.target.texture, level: c.target.level, slice: c.target.slice, load: clear, store, clear: color });
+                    } else {
+                        let d = PassDepth {
+                            texture: &c.target.texture,
+                            level: c.target.level,
+                            slice: c.target.slice,
+                            load,
+                            store,
+                            clear_depth: c.depth.unwrap_or(1.0),
+                            clear_stencil: c.stencil.unwrap_or(0),
+                        };
+                        pass.depth = Some(PassDepth { load: if c.depth.is_some() { clear } else { load }, ..d });
+                        if c.has_stencil {
+                            pass.stencil = Some(PassDepth { load: if c.stencil.is_some() { clear } else { load }, ..d });
+                        }
+                    }
+                    ok = cb.render_pass_with(&pass, &[]).is_ok();
+                    i += 1;
+                }
+                MetalOp::Draw(first) => {
+                    let t = first.targets.clone();
+                    let mut pass = RenderPass { width: t.width, height: t.height, samples: t.samples, ..Default::default() };
+                    for (out, a) in pass.colors.iter_mut().zip(&t.colors) {
+                        *out = a.as_ref().map(|a| PassColor { texture: &a.texture, level: a.level, slice: a.slice, load, store, clear: [0.0; 4] });
+                    }
+                    if let Some(d) = &t.depth {
+                        let pd = PassDepth { texture: &d.texture, level: d.level, slice: d.slice, load, store, clear_depth: 1.0, clear_stencil: 0 };
+                        pass.depth = Some(pd);
+                        if t.stencil {
+                            pass.stencil = Some(pd);
+                        }
+                    }
+                    let mut steps: Vec<Render> = Vec::new();
+                    while let Some(MetalOp::Draw(d)) = ops.get(i).map(|o| &**o) {
+                        if !d.targets.same(&t) {
+                            break;
+                        }
+                        let g = &d.pso;
+                        steps.push(Render::Pipeline { pipeline: &g.pso });
+                        steps.push(Render::DepthStencil { state: &g.dss, stencil_ref: d.stencil_ref });
+                        steps.push(Render::Rasterizer {
+                            fill: g.raster[0],
+                            cull: g.raster[1],
+                            depth_clip: g.raster[2],
+                            winding: g.raster[3],
+                            depth_bias: g.bias[0],
+                            slope_scale: g.bias[1],
+                            clamp: g.bias[2],
+                        });
+                        steps.push(Render::BlendColorStencil { color: d.blend, stencil_ref: d.stencil_ref });
+                        steps.push(Render::Viewports { viewports: std::slice::from_ref(&d.viewport) });
+                        steps.push(Render::Scissors { rects: std::slice::from_ref(&d.scissor) });
+                        let (tops, args, uniforms) = &draw_offsets[i];
+                        for (s, &top) in d.stages.iter().zip(tops) {
+                            if let Some(b) = &s.heap {
+                                steps.push(stage_buffer(s.bind, b, 0, msc::DESCRIPTOR_HEAP_BIND_POINT));
+                            }
+                            if let Some(b) = &s.sampler_heap {
+                                steps.push(stage_buffer(s.bind, b, 0, msc::SAMPLER_HEAP_BIND_POINT));
+                            }
+                            if !s.top.is_empty() {
+                                steps.push(stage_buffer(s.bind, &r.buffer, top, msc::ARGUMENT_BUFFER_BIND_POINT));
+                            }
+                            if s.bind == STAGE_VERTEX {
+                                // MSC's draw arguments and index type (IRRuntimeDrawPrimitives).
+                                steps.push(stage_buffer(s.bind, &r.buffer, *args, 4));
+                                steps.push(stage_buffer(s.bind, &r.buffer, *uniforms, 5));
+                            }
+                        }
+                        let primitive = sys::WMTPrimitiveType(d.primitive);
+                        steps.push(match &d.kind {
+                            DrawKind::Vertices { count, instances, first, first_instance } => Render::Draw {
+                                primitive_type: primitive,
+                                vertex_start: u64::from(*first),
+                                vertex_count: u64::from(*count),
+                                instance_count: *instances,
+                                base_instance: *first_instance,
+                            },
+                            DrawKind::Indexed { count, instances, first, base, first_instance, buffer, offset, index_type } => Render::DrawIndexed {
+                                primitive_type: primitive,
+                                index_type: *index_type,
+                                index_count: u64::from(*count),
+                                index_buffer: buffer,
+                                index_offset: offset + u64::from(*first) * if *index_type == 0 { 2 } else { 4 },
+                                instance_count: *instances,
+                                base_vertex: *base,
+                                base_instance: *first_instance,
+                            },
+                            DrawKind::Mesh { groups } => Render::DrawMesh { groups: *groups, object_threads: [1, 1, 1], mesh_threads: g.mesh_threads },
+                        });
+                        i += 1;
+                    }
+                    ok = cb.render_pass_with(&pass, &steps).is_ok();
+                }
             }
-            steps.push(Compute::Pipeline { pipeline: &c.pso.pso, threads_per_group: c.pso.threadgroup });
-            if let Some(b) = &c.heap {
-                steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::DESCRIPTOR_HEAP_BIND_POINT });
+            if split && ok {
+                cb.commit();
+                if let Err(e) = cb.wait() {
+                    let what: Vec<String> = ops[group_start..i]
+                        .iter()
+                        .take(4)
+                        .map(|o| match &**o {
+                            MetalOp::Dispatch(_) => "dispatch".to_string(),
+                            MetalOp::Draw(d) => format!("draw {}", d.pso.name),
+                            MetalOp::Clear(c) => {
+                                let t = &c.target.texture;
+                                format!(
+                                    "clear {} format {} level {} slice {} ({}x{}, texture {}x{} mips {} layers {} samples {}){}",
+                                    if c.color.is_some() { "color" } else { "depth" },
+                                    c.target.pixel,
+                                    c.target.level,
+                                    c.target.slice,
+                                    c.target.width,
+                                    c.target.height,
+                                    t.width(),
+                                    t.height(),
+                                    t.mipmap_level_count(),
+                                    t.array_length(),
+                                    c.target.samples,
+                                    if c.has_stencil { " +stencil" } else { "" }
+                                )
+                            }
+                        })
+                        .collect();
+                    // SAFETY: a live device.
+                    let allocated = unsafe { sys::MTLDevice_currentAllocatedSize(self.device.handle()) } >> 20;
+                    tracing::warn!(ops = i - group_start, first = ?what, allocated_mb = allocated, error = %e, "Metal: a pass failed on the GPU (split)");
+                }
+                let Ok(next) = self.queue.command_buffer() else { return false };
+                cb = next;
             }
-            if let Some(b) = &c.sampler_heap {
-                steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::SAMPLER_HEAP_BIND_POINT });
-            }
-            if !tops[i].is_empty() {
-                steps.push(Compute::Bytes { bytes: &tops[i], index: msc::ARGUMENT_BUFFER_BIND_POINT });
-            }
-            steps.push(Compute::Dispatch { groups: c.groups });
         }
-        if cb.compute(&steps).is_err() {
+        if !ok {
             return false;
         }
         cb.commit();
@@ -380,9 +602,20 @@ impl MetalBackend {
         match waited {
             Ok(()) => true,
             Err(e) => {
+                let (mut dispatches, mut draws, mut clears) = (0, 0, 0);
+                for op in ops {
+                    match &**op {
+                        MetalOp::Dispatch(_) => dispatches += 1,
+                        MetalOp::Draw(_) => draws += 1,
+                        MetalOp::Clear(_) => clears += 1,
+                    }
+                }
                 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    tracing::warn!(dispatches = cmds.len(), error = %e, "Metal: a submission failed on the GPU");
+                    tracing::warn!(dispatches, draws, clears, error = %e, "Metal: a submission failed on the GPU");
+                }
+                if draws + clears > 0 && !super::metal_draw::DRAWS_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!("Metal: draws stop for this run (a submission with draws faulted); compute goes on");
                 }
                 false
             }
@@ -879,7 +1112,7 @@ impl Census {
 }
 
 /// One stage through Metal Shader Converter, from the disk cache when there.
-fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage) -> Result<victory_metal::msc::Converted, String> {
+pub(crate) fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage) -> Result<victory_metal::msc::Converted, String> {
     let params = root_params(host);
     let samplers = static_samplers(host);
     let path = msc_cache_path(&host.dxil, &params, &samplers).map(|p| p.with_extension(format!("{stage:?}.vmsc")));
@@ -900,12 +1133,14 @@ fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage) -> Result
 }
 
 /// F7's map as victory-metal's render pipeline description.
-fn render_desc(map: &super::metal_render_map::RenderPipelineMap) -> victory_metal::render::RenderPipelineDesc {
+pub(crate) fn render_desc(map: &super::metal_render_map::RenderPipelineMap) -> victory_metal::render::RenderPipelineDesc {
     let mut d = victory_metal::render::RenderPipelineDesc::default();
     for (out, c) in d.colors.iter_mut().zip(&map.color) {
         let Some(c) = c else { continue };
         out.pixel_format = c.pixel_format.map_or(0, |f| f as u64 as u32);
-        out.blending = c.blending_enabled;
+        // D3D12 ignores blending on integer targets; Metal aborts the
+        // process on it (a descriptor validation assertion).
+        out.blending = c.blending_enabled && !integer_format(out.pixel_format);
         out.src_rgb = c.source_rgb_factor.map_or(1, |f| f as u64 as u8);
         out.dst_rgb = c.destination_rgb_factor.map_or(0, |f| f as u64 as u8);
         out.op_rgb = c.rgb_operation.map_or(0, |f| f as u64 as u8);
@@ -920,4 +1155,9 @@ fn render_desc(map: &super::metal_render_map::RenderPipelineMap) -> victory_meta
     d.alpha_to_coverage = map.alpha_to_coverage;
     d.topology_class = map.input_primitive_topology.map_or(0, |t| t as u64 as u32);
     d
+}
+
+/// Integer (uint/sint) Metal pixel formats: never blendable.
+pub(crate) fn integer_format(f: u32) -> bool {
+    matches!(f, 13 | 14 | 23 | 24 | 33 | 34 | 53 | 54 | 63 | 64 | 73 | 74 | 91 | 103 | 104 | 113 | 114 | 123 | 124)
 }

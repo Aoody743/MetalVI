@@ -6492,7 +6492,7 @@ impl Host {
 
 /// A visible top-level window of this process: the one the title made, if
 /// it made one.
-fn title_window() -> Option<HWND> {
+pub(crate) fn title_window() -> Option<HWND> {
     extern "system" fn visit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
         // SAFETY: a window handle from the enumeration; `found` is ours.

@@ -225,6 +225,19 @@ impl RtvRecord {
         self.host_desc(TEXTURE_2D)
     }
 
+    /// The render target view's description words (format, dimension,
+    /// then the dimension's fields), as the host gets them.
+    #[cfg(windows)]
+    pub(crate) fn target_words(&self) -> Option<[u32; 6]> {
+        self.host_desc(4)
+    }
+
+    /// The depth view's description words, as the host gets them.
+    #[cfg(windows)]
+    pub(crate) fn depth_words(&self) -> Option<[u32; 6]> {
+        self.host_desc(3)
+    }
+
     /// The description words as a host type, the format as the host has it.
     /// Without one, a typeless host copy gets a 2D view (`dimension`) in
     /// the title's format, which the host needs spelled out.

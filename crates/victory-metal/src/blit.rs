@@ -40,7 +40,8 @@ macro_rules! blit_cmd {
 }
 blit_cmd!(
     sys::wmtcmd_blit_copy_from_buffer_to_buffer,
-    sys::wmtcmd_blit_copy_from_buffer_to_texture
+    sys::wmtcmd_blit_copy_from_buffer_to_texture,
+    sys::wmtcmd_blit_copy_from_texture_to_buffer
 );
 
 fn null_next() -> sys::WMTMemoryPointer {
@@ -108,6 +109,36 @@ impl BlitEncoder {
             slice,
             level,
             origin: sys::WMTOrigin { x: origin[0], y: origin[1], z: origin[2] },
+        }));
+    }
+
+    /// `copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:
+    /// toBuffer:destinationOffset:destinationBytesPerRow:destinationBytesPerImage:`
+    pub fn copy_from_texture_to_buffer(
+        &mut self,
+        src: &Texture,
+        slice: u32,
+        level: u32,
+        origin: [u64; 3],
+        size: [u64; 3],
+        dst: &Buffer,
+        dst_offset: u64,
+        bytes_per_row: u32,
+        bytes_per_image: u32,
+    ) {
+        self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_texture_to_buffer {
+            type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromTextureToBuffer,
+            reserved: [0; 3],
+            next: null_next(),
+            src: src.handle(),
+            slice,
+            level,
+            origin: sys::WMTOrigin { x: origin[0], y: origin[1], z: origin[2] },
+            size: sys::WMTSize { width: size[0], height: size[1], depth: size[2] },
+            dst: dst.handle(),
+            offset: dst_offset,
+            bytes_per_row,
+            bytes_per_image,
         }));
     }
 

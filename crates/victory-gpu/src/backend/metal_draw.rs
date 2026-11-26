@@ -1,0 +1,611 @@
+//! P2: the title's draws on Metal (`VICTORY_METAL_DRAW=1`, with
+//! `VICTORY_METAL=compute`).
+//!
+//! For now the draws are recorded on Metal *as well as* on the D3D12 path
+//! (which still shows the picture): what Metal draws goes into its own
+//! copies of the title's render targets, and is read back now and then
+//! (`VICTORY_METAL_CAPTURE_EVERY`) so it can be compared with the D3D12
+//! picture. Presenting from Metal comes once the two agree.
+//!
+//! - Pipelines: each title graphics pipeline's stages through Metal Shader
+//!   Converter (disk-cached), the fixed-function state from F7's map, made
+//!   on first use and kept per pipeline (as compute pipelines are).
+//! - Recording (`draw.rs` `metal_draw`): everything resolved at record
+//!   time, as for dispatches: per stage its top-level argument buffer, its
+//!   one-view tables and the heap slots it reads; the targets as Metal
+//!   textures; viewport, scissor, blend factor, stencil reference; the
+//!   index buffer as a window of title memory (zero copy).
+//! - Replay (`metal.rs` `run`): in list order with the dispatches;
+//!   consecutive draws to the same targets share one render pass. Targets
+//!   load and store (D3D12 keeps their contents); a clear is a pass of its
+//!   own that clears.
+
+use std::sync::Arc;
+
+use victory_metal::Buffer;
+use victory_metal::ir::{DescriptorEntry, TopLevel};
+use victory_metal::render::{DepthStencilDesc, DepthStencilState, RenderPipeline, StencilFace};
+use victory_metal::sys;
+use victory_metal::texture::Texture;
+
+use super::metal::{MetalBackend, convert_cached, render_desc};
+use super::metal_render_map as map;
+use crate::object::This;
+use crate::pipeline::host::HostPipeline;
+
+/// Whether draws are recorded on Metal too.
+pub(crate) fn draws_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        super::metal::mode() == super::metal::Mode::Compute && std::env::var("VICTORY_METAL_DRAW").is_ok_and(|v| v == "1")
+    }) && !DRAWS_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set when a submission with draws faulted on the GPU: Metal then ignores
+/// the process's submissions for a while, compute too, so draws stop.
+pub(crate) static DRAWS_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A title graphics pipeline made on Metal.
+pub(crate) struct MetalGraphics {
+    /// The title pipeline's shaders, for reports.
+    pub(crate) name: String,
+    pub(crate) pso: RenderPipeline,
+    pub(crate) dss: DepthStencilState,
+    /// Fill, cull, depth clip, winding (Metal values).
+    pub(crate) raster: [u8; 4],
+    /// Depth bias, slope scale, clamp.
+    pub(crate) bias: [f32; 3],
+    /// Per stage (in the host pipeline's order): its empty top level and
+    /// where it binds (0 vertex, 1 fragment, 2 mesh).
+    pub(crate) stages: Vec<(TopLevel, u8)>,
+    pub(crate) mesh: bool,
+    pub(crate) mesh_threads: [u64; 3],
+    /// What its targets must be (Metal pixel formats; 0 none) and their
+    /// sample count.
+    pub(crate) colors: [u32; 8],
+    pub(crate) depth: u32,
+    pub(crate) stencil: u32,
+    pub(crate) samples: u8,
+}
+
+pub(crate) const STAGE_VERTEX: u8 = 0;
+pub(crate) const STAGE_FRAGMENT: u8 = 1;
+pub(crate) const STAGE_MESH: u8 = 2;
+
+/// Dual-source blend factors (Metal 15..=18) as their first-source kind: a
+/// pixel shader that does not write the second output (MSC gives it none)
+/// cannot be made with them.
+fn single_source(f: u8) -> u8 {
+    match f {
+        15 => 2,
+        16 => 3,
+        17 => 4,
+        18 => 5,
+        f => f,
+    }
+}
+
+impl MetalBackend {
+    /// The Metal pipeline of title graphics pipeline `key`, made on first use.
+    pub(crate) fn graphics_pipeline(&self, key: usize, p: &HostPipeline) -> Option<Arc<MetalGraphics>> {
+        if let Some(known) = self.graphics.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return known.clone();
+        }
+        let made = self.make_graphics(p);
+        if made.is_err() {
+            dump_failed(p);
+        }
+        if let Err(e) = &made {
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                tracing::warn!(pipeline = %p.name, error = %e, "no Metal pipeline for a graphics pipeline");
+            }
+        }
+        let made = made.ok().map(Arc::new);
+        self.graphics.lock().unwrap_or_else(|e| e.into_inner()).insert(key, made.clone());
+        made
+    }
+
+    fn make_graphics(&self, p: &HostPipeline) -> Result<MetalGraphics, String> {
+        use victory_metal::msc::Stage;
+        let input = p.metal_input.as_ref().ok_or("no graphics state kept")?;
+        let _pool = victory_metal::Pool::new();
+        let mut stages = Vec::new();
+        let mut vertex = None;
+        let mut fragment = None;
+        let mut mesh = None;
+        let mut mesh_threads = [1u64; 3];
+        for s in &p.stages {
+            let (stage, bind) = match s.shader.stage {
+                "vertex" => (Stage::Vertex, STAGE_VERTEX),
+                "pixel" => (Stage::Fragment, STAGE_FRAGMENT),
+                "mesh" => (Stage::Mesh, STAGE_MESH),
+                other => return Err(format!("{other} stage")),
+            };
+            let c = convert_cached(&s.translated().host, stage)?;
+            let lib = self.device.library(&c.metallib).map_err(|e| e.to_string())?;
+            stages.push((c.top_level.clone(), bind));
+            match bind {
+                STAGE_VERTEX => vertex = Some((lib, c.entry)),
+                STAGE_FRAGMENT => fragment = Some((lib, c.entry)),
+                _ => {
+                    mesh_threads = c.threadgroup.map(|t| u64::from(t.max(1)));
+                    mesh = Some((lib, c.entry));
+                }
+            }
+        }
+        let m = map::map_pipeline_state(input);
+        let mut desc = render_desc(&m);
+        let frag = fragment.as_ref().map(|(l, n)| (l, n.as_str()));
+        let make = |desc: &victory_metal::render::RenderPipelineDesc| match (&vertex, &mesh) {
+            (Some((l, n)), _) => self.device.render_pipeline_desc((l, n), frag, desc),
+            (None, Some((l, n))) => self.device.mesh_render_pipeline_desc((l, n), frag, desc),
+            _ => Err(victory_metal::Error("no vertex or mesh stage".into())),
+        };
+        let pso = match make(&desc) {
+            Ok(pso) => pso,
+            Err(e) if e.to_string().contains("index(1)") => {
+                for c in &mut desc.colors {
+                    c.src_rgb = single_source(c.src_rgb);
+                    c.dst_rgb = single_source(c.dst_rgb);
+                    c.src_alpha = single_source(c.src_alpha);
+                    c.dst_alpha = single_source(c.dst_alpha);
+                }
+                make(&desc).map_err(|e| e.to_string())?
+            }
+            Err(e) => return Err(e.to_string()),
+        };
+        let face = |f: &map::StencilMap| StencilFace {
+            compare: f.compare as u64 as u8,
+            stencil_fail: f.stencil_fail as u64 as u8,
+            depth_fail: f.depth_fail as u64 as u8,
+            pass: f.depth_pass as u64 as u8,
+            read_mask: f.read_mask,
+            write_mask: f.write_mask,
+        };
+        let ds = &m.depth_stencil;
+        let dss = self
+            .depth_stencil(&DepthStencilDesc {
+                depth_compare: ds.depth_compare as u64 as u8,
+                depth_write: ds.depth_write,
+                stencil: input.depth_stencil.stencil_enable,
+                front: face(&ds.front),
+                back: face(&ds.back),
+            })
+            .ok_or("no depth-stencil state")?;
+        let r = &m.raster;
+        Ok(MetalGraphics {
+            name: p.name.clone(),
+            pso,
+            dss,
+            raster: [
+                r.fill.map_or(0, |v| v as u64 as u8),
+                r.cull.map_or(0, |v| v as u64 as u8),
+                r.depth_clip_mode as u64 as u8,
+                r.winding as u64 as u8,
+            ],
+            bias: [r.depth_bias.depth_bias as f32, r.depth_bias.slope_scale, r.depth_bias.clamp],
+            stages,
+            mesh: mesh.is_some(),
+            mesh_threads,
+            colors: desc.colors.map(|c| c.pixel_format),
+            depth: desc.depth_format,
+            stencil: desc.stencil_format,
+            samples: desc.sample_count.max(1),
+        })
+    }
+
+    /// A depth-stencil state, one per description.
+    fn depth_stencil(&self, desc: &DepthStencilDesc) -> Option<DepthStencilState> {
+        let mut known = self.depth_stencils.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = known.get(desc) {
+            return Some(s.clone());
+        }
+        let s = self.device.depth_stencil_state(desc).ok()?;
+        known.insert(*desc, s.clone());
+        Some(s)
+    }
+
+    /// The attachment for a render target or depth view of title texture
+    /// `resource` in DXGI format `format` at `level`/`slice`: its Metal
+    /// texture, or a view of it in that format when Metal allows one.
+    pub(crate) fn attachment(&self, resource: This, format: u32, level: u32, slice: u32, depth: bool) -> Option<Attachment> {
+        let t = self.texture_for(resource)?;
+        if level >= t.mips || slice >= t.slices.max(1) {
+            return None;
+        }
+        let pixel = super::metal_texture::view_format(&t, format);
+        // A depth view needs a depth format and a target view a colour one
+        // (the other way round is a GPU fault, not an error).
+        if super::metal_texture::is_depth_pixel(pixel.0) != depth {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::warn!(pixel = pixel.0, depth, format, "Metal: an attachment of the wrong kind of format, left out");
+            }
+            return None;
+        }
+        let texture = if pixel == t.pixel {
+            t.texture.clone()
+        } else {
+            let key = (resource as usize, pixel.0);
+            let mut views = self.target_views.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(v) = views.get(&key) {
+                v.clone()
+            } else {
+                let _pool = victory_metal::Pool::new();
+                let mut id = 0u64;
+                // SAFETY: a live texture; every level and slice, its own type.
+                let view = unsafe {
+                    sys::MTLTexture_newTextureView(
+                        t.texture.handle(),
+                        pixel,
+                        super::metal_texture::base_type(&t),
+                        0,
+                        t.mips as u16,
+                        0,
+                        t.slices.max(1) as u16,
+                        super::metal_texture::identity(),
+                        &mut id,
+                    )
+                };
+                let view = Texture::from_object(victory_metal::Object::adopt(view)?);
+                views.insert(key, view.clone());
+                view
+            }
+        };
+        let width = (t.desc.width as u32 >> level).max(1);
+        let height = (t.desc.height.max(1) >> level).max(1);
+        Some(Attachment { texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8 })
+    }
+}
+
+/// One render target or depth attachment.
+#[derive(Clone)]
+pub(crate) struct Attachment {
+    pub(crate) texture: Texture,
+    /// Its Metal pixel format.
+    pub(crate) pixel: u32,
+    pub(crate) level: u16,
+    pub(crate) slice: u16,
+    /// Size of that level.
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) samples: u8,
+}
+
+impl Attachment {
+    fn same(&self, o: &Attachment) -> bool {
+        self.texture.handle() == o.texture.handle() && self.level == o.level && self.slice == o.slice
+    }
+}
+
+/// The targets of a run of draws.
+#[derive(Clone, Default)]
+pub(crate) struct Targets {
+    pub(crate) colors: [Option<Attachment>; 8],
+    pub(crate) depth: Option<Attachment>,
+    /// The depth texture has a stencil plane (it is also the stencil
+    /// attachment).
+    pub(crate) stencil: bool,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) samples: u8,
+}
+
+impl Targets {
+    /// Whether draws to `self` and `o` can share a render pass.
+    pub(crate) fn same(&self, o: &Targets) -> bool {
+        let eq = |a: &Option<Attachment>, b: &Option<Attachment>| match (a, b) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same(b),
+            _ => false,
+        };
+        self.colors.iter().zip(&o.colors).all(|(a, b)| eq(a, b)) && eq(&self.depth, &o.depth)
+    }
+
+    /// Whether pipeline `g` can draw into these targets (formats and sample
+    /// counts as Metal requires them; a mismatch is a GPU fault, not an
+    /// error).
+    pub(crate) fn fit(&self, g: &MetalGraphics) -> bool {
+        // Exactly what the pipeline was made for, as D3D12 also requires: a
+        // pass attachment the pipeline has no format for (or the other way
+        // round) is a Metal validation error, undefined without the layer.
+        let colors = self.colors.iter().zip(&g.colors).all(|(t, &f)| t.as_ref().map_or(0, |t| t.pixel) == f);
+        let depth = self.depth.as_ref().map_or(0, |d| d.pixel) == g.depth;
+        let stencil = if self.stencil { self.depth.as_ref().map_or(0, |d| d.pixel) } else { 0 } == g.stencil;
+        colors && depth && stencil && self.samples.max(1) == g.samples.max(1)
+    }
+
+    /// Fills in the size and sample count from the attachments (the
+    /// smallest size: D3D12 draws into the intersection).
+    pub(crate) fn finish(&mut self) {
+        let all = self.colors.iter().flatten().chain(self.depth.iter());
+        let (mut w, mut h, mut s) = (u32::MAX, u32::MAX, 1);
+        for a in all {
+            w = w.min(a.width);
+            h = h.min(a.height);
+            s = a.samples;
+        }
+        if w == u32::MAX {
+            (w, h) = (0, 0);
+        }
+        (self.width, self.height, self.samples) = (w, h, s);
+    }
+}
+
+/// One stage's bindings for a draw (as a dispatch's).
+pub(crate) struct StageBind {
+    /// 0 vertex, 1 fragment, 2 mesh.
+    pub(crate) bind: u8,
+    pub(crate) top: Vec<u8>,
+    pub(crate) tables: Vec<(u32, DescriptorEntry)>,
+    pub(crate) heap: Option<Buffer>,
+    pub(crate) sampler_heap: Option<Buffer>,
+}
+
+/// A draw as the title asks for it (before the index buffer is found).
+pub(crate) enum DrawKindIn {
+    Vertices { count: u32, instances: u32, first: u32, first_instance: u32 },
+    Indexed { count: u32, instances: u32, first: u32, base: i32, first_instance: u32 },
+    Mesh { groups: u32 },
+}
+
+pub(crate) enum DrawKind {
+    Vertices { count: u32, instances: u32, first: u32, first_instance: u32 },
+    Indexed { count: u32, instances: u32, first: u32, base: i32, first_instance: u32, buffer: Buffer, offset: u64, index_type: u8 },
+    Mesh { groups: [u64; 3] },
+}
+
+/// One draw as recorded into a title list.
+pub(crate) struct MetalDraw {
+    pub(crate) pso: Arc<MetalGraphics>,
+    pub(crate) targets: Arc<Targets>,
+    pub(crate) stages: Vec<StageBind>,
+    pub(crate) viewport: sys::WMTViewport,
+    pub(crate) scissor: sys::WMTScissorRect,
+    pub(crate) blend: [f32; 4],
+    pub(crate) stencil_ref: u8,
+    /// MTLPrimitiveType.
+    pub(crate) primitive: u8,
+    pub(crate) kind: DrawKind,
+}
+
+/// One clear as recorded into a title list.
+pub(crate) struct MetalClear {
+    pub(crate) target: Attachment,
+    /// A color clear, or depth (and stencil when given) of a depth target.
+    pub(crate) color: Option<[f64; 4]>,
+    pub(crate) depth: Option<f32>,
+    pub(crate) stencil: Option<u8>,
+    /// The depth texture has a stencil plane.
+    pub(crate) has_stencil: bool,
+}
+
+/// Why draws did not go to Metal, counted for the log.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum DrawDrop {
+    Ran,
+    NoPipeline,
+    Topology,
+    Targets,
+    Bind,
+    IndexBuffer,
+    Scissor,
+}
+
+static DRAW_COUNTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+pub(crate) fn count_draw(d: DrawDrop) {
+    let n = DRAW_COUNTS[d as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let total: u64 = DRAW_COUNTS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
+    if total.is_power_of_two() && total >= 64 {
+        let c: Vec<u64> = DRAW_COUNTS.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).collect();
+        tracing::info!(
+            draws = total,
+            ran = c[0],
+            no_pipeline = c[1],
+            topology = c[2],
+            targets = c[3],
+            bind = c[4],
+            index_buffer = c[5],
+            scissor = c[6],
+            "Metal draws: outcomes"
+        );
+    }
+    let _ = n;
+}
+
+/// D3D12 render target / depth view words → (level, slice) of the view.
+/// RTV dimensions: 2 1D, 3 1D array, 4 2D, 5 2D array, 6 2DMS, 7 2DMS array,
+/// 8 3D; DSV (flags before the fields): 1 1D, 2 1D array, 3 2D, 4 2D array,
+/// 5 2DMS, 6 2DMS array.
+pub(crate) fn level_slice(words: &[u32; 6], depth: bool) -> Option<(u32, u32)> {
+    let dim = words[1];
+    let (level, slice) = if depth {
+        // D3D12_DEPTH_STENCIL_VIEW_DESC: format, dimension, flags, then the
+        // dimension's fields.
+        match dim {
+            1 | 3 => (words[3], 0),
+            2 | 4 => (words[3], words[4]),
+            5 => (0, 0),
+            6 => (0, words[3]),
+            _ => return None,
+        }
+    } else {
+        match dim {
+            2 | 4 => (words[2], 0),
+            3 | 5 => (words[2], words[3]),
+            6 => (0, 0),
+            7 => (0, words[2]),
+            _ => return None, // 3D targets: by depth plane, not yet
+        }
+    };
+    Some((level, slice))
+}
+
+/// A D3D12 viewport as Metal's.
+pub(crate) fn viewport(v: &windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT) -> sys::WMTViewport {
+    sys::WMTViewport {
+        originX: f64::from(v.TopLeftX),
+        originY: f64::from(v.TopLeftY),
+        width: f64::from(v.Width),
+        height: f64::from(v.Height),
+        znear: f64::from(v.MinDepth),
+        zfar: f64::from(v.MaxDepth),
+    }
+}
+
+/// A D3D12 scissor clamped into a `width`×`height` target (Metal requires
+/// it inside); `None` if nothing is left.
+pub(crate) fn scissor(r: &windows::Win32::Foundation::RECT, width: u32, height: u32) -> Option<sys::WMTScissorRect> {
+    let l = r.left.clamp(0, width as i32) as u64;
+    let t = r.top.clamp(0, height as i32) as u64;
+    let rr = r.right.clamp(0, width as i32) as u64;
+    let b = r.bottom.clamp(0, height as i32) as u64;
+    (rr > l && b > t).then_some(sys::WMTScissorRect { x: l, y: t, width: rr - l, height: b - t })
+}
+
+/// The bytes MSC's vertex stages read at the draw-arguments bind point
+/// (`IRRuntimeDrawParams`, 20 bytes) and the uniforms bind point (the index
+/// type: 0 not indexed, 1 16-bit, 2 32-bit).
+pub(crate) fn draw_params(kind: &DrawKind) -> ([u32; 5], u16) {
+    match *kind {
+        DrawKind::Vertices { count, instances, first, first_instance } => ([count, instances, first, first_instance, 0], 0),
+        DrawKind::Indexed { count, instances, first, base, first_instance, index_type, .. } => {
+            ([count, instances, first, base as u32, first_instance], u16::from(index_type) + 1)
+        }
+        DrawKind::Mesh { .. } => ([0; 5], 0),
+    }
+}
+
+/// Every Metal render target this many presents is read back to
+/// `VICTORY_METAL_CAPTURE_DIR` (`VICTORY_METAL_CAPTURE_EVERY`, 0: never).
+pub(crate) fn capture_every() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_METAL_CAPTURE_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+impl MetalBackend {
+    /// Reads Metal texture `resource` back (level 0, slice 0) and writes it
+    /// as a binary PPM (8-bit RGBA/BGRA formats only; others are skipped)
+    /// to `<dir>/<name>.ppm`.
+    pub(crate) fn capture(&self, resource: This, name: &str) {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(dir) = std::env::var_os("VICTORY_METAL_CAPTURE_DIR") else { return };
+        let Some(t) = self.texture_for(resource) else { return };
+        // RGBA8 (70..=71), BGRA8 (80..=81); others not written.
+        let bgra = match t.pixel.0 {
+            70 | 71 => false,
+            80 | 81 => true,
+            _ => return,
+        };
+        let (w, h) = (t.desc.width as u32, t.desc.height.max(1));
+        let row = (w * 4).next_multiple_of(256);
+        let bytes = (row * h) as usize;
+        let _pool = victory_metal::Pool::new();
+        // SAFETY: a fresh allocation, freed after the GPU is done.
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if mem.is_null() {
+            return;
+        }
+        // SAFETY: lives until the blit is waited for.
+        if let Ok(buffer) = unsafe { self.device.wrap(mem, bytes as u64) }
+            && let Ok(cb) = self.queue.command_buffer()
+            && let Ok(mut blit) = cb.blit_encoder()
+        {
+            blit.copy_from_texture_to_buffer(&t.texture, 0, 0, [0, 0, 0], [u64::from(w), u64::from(h), 1], &buffer, 0, row, row * h);
+            blit.finish();
+            cb.commit();
+            if cb.wait().is_ok() {
+                // SAFETY: the GPU wrote `bytes` bytes there.
+                let data = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), bytes) };
+                let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for y in 0..h as usize {
+                    for x in 0..w as usize {
+                        let p = &data[y * row as usize + x * 4..][..4];
+                        if bgra {
+                            out.extend_from_slice(&[p[2], p[1], p[0]]);
+                        } else {
+                            out.extend_from_slice(&p[..3]);
+                        }
+                    }
+                }
+                let path = std::path::Path::new(&dir).join(format!("{name}.ppm"));
+                let _ = crate::make_dir(std::path::Path::new(&dir));
+                if std::fs::write(&path, out).is_ok() {
+                    tracing::info!(path = %path.display(), "Metal: a render target captured");
+                }
+            }
+        }
+        // SAFETY: ours, the GPU is done.
+        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+    }
+}
+
+/// A buffer bound to the stage `bind` binds to.
+pub(crate) fn stage_buffer(bind: u8, buffer: &Buffer, offset: u64, index: u8) -> victory_metal::render::Render<'_> {
+    use victory_metal::render::Render;
+    match bind {
+        STAGE_VERTEX => Render::VertexBuffer { buffer, offset, index },
+        STAGE_FRAGMENT => Render::FragmentBuffer { buffer, offset, index },
+        _ => Render::MeshBuffer { buffer, offset, index },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_words_give_level_and_slice() {
+        // RTV 2D mip 3; 2D array mip 1 slice 5; 2DMS array slice 2; 3D: not yet.
+        assert_eq!(level_slice(&[28, 4, 3, 0, 0, 0], false), Some((3, 0)));
+        assert_eq!(level_slice(&[28, 5, 1, 5, 1, 0], false), Some((1, 5)));
+        assert_eq!(level_slice(&[28, 7, 2, 1, 0, 0], false), Some((0, 2)));
+        assert_eq!(level_slice(&[28, 8, 0, 0, 1, 0], false), None);
+        // DSV (flags read-only depth 1, then the fields): 2D mip 2; 2D array
+        // mip 0 slice 4; 2DMS; 2DMS array slice 3.
+        assert_eq!(level_slice(&[40, 3, 1, 2, 0, 0], true), Some((2, 0)));
+        assert_eq!(level_slice(&[40, 4, 0, 0, 4, 1], true), Some((0, 4)));
+        assert_eq!(level_slice(&[40, 5, 3, 0, 0, 0], true), Some((0, 0)));
+        assert_eq!(level_slice(&[40, 6, 0, 3, 1, 0], true), Some((0, 3)));
+    }
+
+    #[test]
+    fn scissors_are_clamped_into_the_target() {
+        use windows::Win32::Foundation::RECT;
+        let s = scissor(&RECT { left: -10, top: 5, right: 5000, bottom: 300 }, 1920, 1080).unwrap();
+        assert_eq!((s.x, s.y, s.width, s.height), (0, 5, 1920, 295));
+        assert!(scissor(&RECT { left: 2000, top: 0, right: 2100, bottom: 10 }, 1920, 1080).is_none());
+        assert!(scissor(&RECT { left: 10, top: 10, right: 10, bottom: 20 }, 1920, 1080).is_none());
+    }
+
+    #[test]
+    fn draw_arguments_as_msc_reads_them() {
+        let (a, u) = draw_params(&DrawKind::Vertices { count: 6, instances: 2, first: 3, first_instance: 1 });
+        assert_eq!((a, u), ([6, 2, 3, 1, 0], 0));
+        assert_eq!(draw_params(&DrawKind::Mesh { groups: [4, 1, 1] }).1, 0);
+    }
+
+    #[test]
+    fn dual_source_factors_fall_back_to_the_first_source() {
+        assert_eq!([15, 16, 17, 18, 1, 6].map(single_source), [2, 3, 4, 5, 1, 6]);
+    }
+}
+
+/// The DXIL of a graphics pipeline Metal refused, kept for study in
+/// `<VICTORY_METAL_CACHE>/refused/<pipeline>.<stage>.dxil` (once each).
+fn dump_failed(p: &HostPipeline) {
+    let Some(dir) = std::env::var_os("VICTORY_METAL_CACHE").map(std::path::PathBuf::from) else { return };
+    let dir = dir.join("refused");
+    if crate::make_dir(&dir).is_err() {
+        return;
+    }
+    let stem: String = p.name.chars().filter(|c| c.is_ascii_alphanumeric()).take(80).collect();
+    for s in &p.stages {
+        let path = dir.join(format!("{stem}.{}.dxil", s.shader.stage));
+        if crate::read_file(&path).is_err() {
+            let _ = std::fs::write(&path, &s.translated().host.dxil);
+        }
+    }
+}

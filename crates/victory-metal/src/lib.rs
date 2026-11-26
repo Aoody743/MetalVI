@@ -217,6 +217,17 @@ impl Device {
         self.compute_pipeline_from_library(&library, function)
     }
 
+    /// A library from MSL source (runtime compiled: our own helper shaders).
+    pub fn library_msl(&self, source: &str) -> Result<Object> {
+        let _pool = Pool::new();
+        let mut err = 0;
+        // SAFETY: source is valid for its length.
+        Object::adopt(unsafe {
+            sys::MTLDevice_newLibraryWithSource(self.handle(), source.as_ptr().cast(), source.len() as u64, &mut err)
+        })
+        .ok_or_else(|| error_text(err, "newLibraryWithSource"))
+    }
+
     /// A compute pipeline from function `function` of `library`.
     pub fn compute_pipeline_from_library(&self, library: &Object, function: &str) -> Result<ComputePipeline> {
         let _pool = Pool::new();

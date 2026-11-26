@@ -190,7 +190,11 @@ pub(crate) struct State {
     /// Compute dispatches recorded for Metal (`VICTORY_METAL=compute`),
     /// run when the list is submitted.
     #[cfg(windows)]
-    pub(crate) metal: Vec<std::sync::Arc<crate::backend::metal::MetalCmd>>,
+    pub(crate) metal: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
+    /// The bound targets as Metal attachments, made at the first Metal draw
+    /// after they were set (`None`: not made yet).
+    #[cfg(windows)]
+    metal_targets: Option<std::sync::Arc<crate::backend::metal_draw::Targets>>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -585,6 +589,10 @@ impl State {
         let Some(host) = crate::host::host() else {
             return;
         };
+        #[cfg(windows)]
+        {
+            self.metal_targets = None;
+        }
         self.target_handles.clear();
         self.target_handles.extend_from_slice(handles);
         self.depth_handle = depth;
@@ -1991,10 +1999,7 @@ impl State {
     #[cfg(windows)]
     fn metal_dispatch(&mut self, p: &crate::pipeline::host::HostPipeline, groups: [u32; 3], limit: u32) -> bool {
         use crate::backend::metal::backend;
-        use victory_shader::emit::{USER_DATA_SPACE, USER_GROUP_BASE};
         use crate::backend::metal::{Drop, count};
-        use crate::backend::metal_heap::Missing;
-        static SKIPPED_HOST_WORDS: AtomicU64 = AtomicU64::new(0);
         let Some(m) = backend() else {
             count(Drop::NoBackend);
             return false;
@@ -2004,7 +2009,167 @@ impl State {
             return false;
         };
         let _pool = victory_metal::Pool::new();
-        let stage = &p.stages[0];
+        let bound = match self.metal_stage(m, p, &p.stages[0], true, mp.top_level.clone(), limit) {
+            Ok(b) => b,
+            Err(d) => {
+                count(d);
+                return false;
+            }
+        };
+        count(bound.outcome);
+        self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Dispatch(crate::backend::metal::MetalCmd {
+            pso: mp,
+            heap: bound.heap,
+            sampler_heap: bound.sampler_heap,
+            top: bound.top,
+            groups: groups.map(u64::from),
+            tables: bound.tables,
+        })));
+        true
+    }
+
+    /// A draw on Metal too (`VICTORY_METAL_DRAW=1`): recorded into the
+    /// list as [`crate::backend::metal::MetalOp::Draw`], counted.
+    #[cfg(windows)]
+    fn metal_draw(&mut self, kind: crate::backend::metal_draw::DrawKindIn) {
+        use crate::backend::metal_draw::{DrawDrop, DrawKind, DrawKindIn, MetalDraw, StageBind, count_draw};
+        let Some(m) = crate::backend::metal::backend() else { return };
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let Some(g) = m.graphics_pipeline(self.pipeline, p) else {
+            count_draw(DrawDrop::NoPipeline);
+            return;
+        };
+        let _pool = victory_metal::Pool::new();
+        let primitive = if g.mesh {
+            3
+        } else {
+            match crate::backend::metal_map::map_topology(self.topology as i32) {
+                Some(t) => t.primitive_type as u64 as u8,
+                None => {
+                    count_draw(DrawDrop::Topology);
+                    return;
+                }
+            }
+        };
+        let targets = match &self.metal_targets {
+            Some(t) => t.clone(),
+            None => {
+                let t = std::sync::Arc::new(self.make_metal_targets(m));
+                self.metal_targets = Some(t.clone());
+                t
+            }
+        };
+        if targets.width == 0 || !targets.fit(&g) {
+            count_draw(DrawDrop::Targets);
+            return;
+        }
+        let mut stages = Vec::with_capacity(p.stages.len());
+        for (stage, (top, bind)) in p.stages.iter().zip(&g.stages) {
+            match self.metal_stage(m, p, stage, false, top.clone(), 0) {
+                Ok(b) => stages.push(StageBind { bind: *bind, top: b.top, tables: b.tables, heap: b.heap, sampler_heap: b.sampler_heap }),
+                Err(_) => {
+                    count_draw(DrawDrop::Bind);
+                    return;
+                }
+            }
+        }
+        let kind = match kind {
+            DrawKindIn::Vertices { count, instances, first, first_instance } => DrawKind::Vertices { count, instances, first, first_instance },
+            DrawKindIn::Indexed { count, instances, first, base, first_instance } => {
+                let v = self.index;
+                let index_type = match v.format {
+                    57 => 0, // R16_UINT
+                    42 => 1, // R32_UINT
+                    _ => {
+                        count_draw(DrawDrop::IndexBuffer);
+                        return;
+                    }
+                };
+                let Some((buffer, offset)) = (v.address != 0 && v.size != 0)
+                    .then(|| m.chunks().window_buffer(v.address, u64::from(v.size)))
+                    .flatten()
+                else {
+                    count_draw(DrawDrop::IndexBuffer);
+                    return;
+                };
+                DrawKind::Indexed { count, instances, first, base, first_instance, buffer, offset, index_type }
+            }
+            DrawKindIn::Mesh { groups } => DrawKind::Mesh { groups: [u64::from(groups), 1, 1] },
+        };
+        let full = victory_metal::sys::WMTViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: f64::from(targets.width),
+            height: f64::from(targets.height),
+            znear: 0.0,
+            zfar: 1.0,
+        };
+        let viewport = self.viewports.first().map_or(full, crate::backend::metal_draw::viewport);
+        let scissor = match self.scissors.first() {
+            Some(r) => match crate::backend::metal_draw::scissor(r, targets.width, targets.height) {
+                Some(s) => s,
+                None => {
+                    count_draw(DrawDrop::Scissor);
+                    return;
+                }
+            },
+            None => victory_metal::sys::WMTScissorRect { x: 0, y: 0, width: u64::from(targets.width), height: u64::from(targets.height) },
+        };
+        count_draw(DrawDrop::Ran);
+        self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Draw(MetalDraw {
+            pso: g,
+            targets,
+            stages,
+            viewport,
+            scissor,
+            blend: self.blend.unwrap_or([1.0; 4]),
+            stencil_ref: self.stencil.unwrap_or(0) as u8,
+            primitive,
+            kind,
+        })));
+    }
+
+    /// The bound render targets and depth view as Metal attachments.
+    #[cfg(windows)]
+    fn make_metal_targets(&self, m: &crate::backend::metal::MetalBackend) -> crate::backend::metal_draw::Targets {
+        use crate::backend::metal_draw::{Targets, level_slice};
+        let mut t = Targets::default();
+        for (slot, &h) in t.colors.iter_mut().zip(&self.target_handles) {
+            let Some(record) = crate::descriptor::rtv_record(h) else { continue };
+            let Some(words) = record.target_words() else { continue };
+            let Some((level, slice)) = level_slice(&words, false) else { continue };
+            *slot = m.attachment(record.resource, words[0], level, slice, false);
+        }
+        if let Some(record) = crate::descriptor::dsv_record(self.depth_handle)
+            && let Some(words) = record.depth_words()
+            && let Some((level, slice)) = level_slice(&words, true)
+        {
+            t.depth = m.attachment(record.resource, words[0], level, slice, true);
+            // Depth32Float_Stencil8 (260), X32_Stencil8 (261): a stencil plane.
+            t.stencil = t.depth.as_ref().is_some_and(|d| matches!(d.pixel, 260 | 261));
+        }
+        t.finish();
+        t
+    }
+
+    /// One stage's Metal bindings (`compute`: the compute roots, else the
+    /// graphics roots): its user data in a copy of `top`, its root views as
+    /// one-view tables or root descriptors, the heap slots it reads
+    /// refreshed. `limit`: the guarded dispatch's thread count.
+    #[cfg(windows)]
+    fn metal_stage(
+        &self,
+        m: &crate::backend::metal::MetalBackend,
+        p: &crate::pipeline::host::HostPipeline,
+        stage: &crate::pipeline::host::Stage,
+        compute: bool,
+        mut top: victory_metal::ir::TopLevel,
+        limit: u32,
+    ) -> Result<MetalStage, crate::backend::metal::Drop> {
+        use crate::backend::metal::Drop;
+        use crate::backend::metal_heap::Missing;
+        use victory_shader::emit::{USER_DATA_SPACE, USER_GROUP_BASE};
+        static SKIPPED_HOST_WORDS: AtomicU64 = AtomicU64::new(0);
         let t = stage.translated();
         let host = &t.host;
 
@@ -2019,27 +2184,24 @@ impl State {
                 RootType::Other(kind)
                     if kind == victory_shader::emit::USER_VIEW_ADDRESS || kind == victory_shader::emit::USER_VIEW_ADDRESS + 1 =>
                 {
-                    self.host_word(true, kind, u.slot, u.dword, None)
+                    self.host_word(compute, kind, u.slot, u.dword, None)
                 }
                 RootType::Other(_) => {
                     // victory's memory directory words: not built for Metal yet
                     if SKIPPED_HOST_WORDS.fetch_add(1, Ordering::Relaxed).is_power_of_two() {
-                        tracing::info!(pipeline = %p.name, "Metal: a dispatch needs the memory directory: skipped");
+                        tracing::info!(pipeline = %p.name, "Metal: a shader needs the memory directory: skipped");
                     }
-                    count(Drop::MemoryDirectory);
-                    return false;
+                    return Err(Drop::MemoryDirectory);
                 }
-                _ => self.user_value(true, u.slot, u.root, u.dword),
+                _ => self.user_value(compute, u.slot, u.root, u.dword),
             };
             if let Some(w) = words.get_mut(u.index as usize) {
                 *w = v;
             }
         }
-        let mut top = mp.top_level.clone();
         if !words.is_empty() && !top.set_constants(USER_DATA_SPACE, 0, &words) {
             once!(pipeline = %p.name, "Metal: user data does not fit the top-level layout");
-            count(Drop::UserDataLayout);
-            return false;
+            return Err(Drop::UserDataLayout);
         }
 
         // Root views by the Metal root layout: victory's own as root
@@ -2054,7 +2216,7 @@ impl State {
                     RootSlot::Constants(_) => continue,
                     RootSlot::Cbv(s) | RootSlot::Srv(s) | RootSlot::Uav(s) | RootSlot::TableSrv(s) | RootSlot::TableUav(s) => s,
                 };
-                let va = match self.roots_ref(true).get(usize::from(slot)) {
+                let va = match self.roots_ref(compute).get(usize::from(slot)) {
                     Some(Root::View(va)) => *va,
                     _ => 0,
                 };
@@ -2090,7 +2252,7 @@ impl State {
             if u.root != RootType::Table {
                 continue;
             }
-            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(u.slot)) else { continue };
+            let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else { continue };
             let handle = table + u64::from(u.table_offset_dwords) * 4;
             let Some(heap) = self.heap_of(handle) else { continue };
             let Some(index) = heap.index(handle) else { continue };
@@ -2107,8 +2269,8 @@ impl State {
         // Views picked from the heap by a root constant (table base + byte
         // offset + constant << shift, 32-byte slots), as `tables` does.
         for index in &host.root_indexed_views {
-            let Some(&Root::Table(table)) = self.roots_ref(true).get(usize::from(index.table_slot)) else { continue };
-            let constant = self.user_value(true, index.constant_slot, RootType::Constants, index.constant_dword);
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(index.table_slot)) else { continue };
+            let constant = self.user_value(compute, index.constant_slot, RootType::Constants, index.constant_dword);
             let slot = index.byte_offset.wrapping_add(constant << index.shift) / 32;
             let Some(handle) = table.checked_add(u64::from(slot) * 32) else { continue };
             let Some(heap) = self.heap_of(handle) else { continue };
@@ -2130,22 +2292,13 @@ impl State {
                 *out = m.refresh_slot(h, heap.count(), 0, heap.handle(0).unwrap_or(0)).map(|(b, _)| b);
             }
         }
-
-        count(match worst {
+        let outcome = match worst {
             None => Drop::Ran,
             Some(Missing::Typed { .. }) => Drop::SlotTyped,
             Some(Missing::Unmapped) => Drop::SlotUnmapped,
             Some(_) => Drop::SlotMissing,
-        });
-        self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalCmd {
-            pso: mp,
-            heap: heap_buffer,
-            sampler_heap: sampler_buffer,
-            top: top.bytes,
-            groups: groups.map(u64::from),
-            tables,
-        }));
-        true
+        };
+        Ok(MetalStage { top: top.bytes, tables, heap: heap_buffer, sampler_heap: sampler_buffer, outcome })
     }
 
     #[cfg(feature = "diagnostics")]
@@ -2235,6 +2388,10 @@ impl State {
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    #[cfg(windows)]
+                    if crate::backend::metal_draw::draws_on() {
+                        self.metal_draw(crate::backend::metal_draw::DrawKindIn::Mesh { groups: x });
+                    }
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -2565,6 +2722,10 @@ impl State {
             } else {
                 (vertices, first)
             };
+            #[cfg(windows)]
+            if crate::backend::metal_draw::draws_on() && !rects {
+                self.metal_draw(crate::backend::metal_draw::DrawKindIn::Vertices { count: vertices, instances, first, first_instance });
+            }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -2666,6 +2827,10 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
+            #[cfg(windows)]
+            if crate::backend::metal_draw::draws_on() {
+                self.metal_draw(crate::backend::metal_draw::DrawKindIn::Indexed { count: indices, instances, first, base, first_instance });
+            }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -3171,4 +3336,14 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
     }
+}
+
+/// One stage's Metal bindings ([`State::metal_stage`]).
+#[cfg(windows)]
+pub(crate) struct MetalStage {
+    top: Vec<u8>,
+    tables: Vec<(u32, victory_metal::ir::DescriptorEntry)>,
+    heap: Option<victory_metal::Buffer>,
+    sampler_heap: Option<victory_metal::Buffer>,
+    outcome: crate::backend::metal::Drop,
 }

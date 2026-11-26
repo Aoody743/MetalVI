@@ -107,6 +107,13 @@ impl MetalBackend {
             fail("no pixel format", Some(&d), None);
             return None;
         };
+        // A texture the title may use as a depth target gets a depth format
+        // (its typeless or colour format says only the size): Metal takes
+        // only depth formats as depth attachments (a colour one there is a
+        // GPU fault). Shaders still read it, depth sampling into red.
+        // Not for one shaders also write: Metal depth formats take no
+        // shader writes (its depth views are left out instead).
+        let pixel = if d.flags & DEPTH != 0 && d.flags & UNORDERED == 0 { depth_pixel(d.format).unwrap_or(pixel) } else { pixel };
         let mips = u32::from(d.mip_levels.max(1));
         let (type_, depth, slices) = match d.dimension {
             TEXTURE_1D if d.depth_or_array_size > 1 => (WMTTextureType::WMTTextureType1DArray, 1, u32::from(d.depth_or_array_size)),
@@ -436,7 +443,7 @@ impl MetalBackend {
 ///   depth view samples the same value in red);
 /// - a colour texture: `wanted` only if its texel or block size is the
 ///   texture's (Metal's pixel format views), else its own format.
-fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
+pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
     if wanted == 0 {
         return t.pixel;
     }
@@ -492,7 +499,7 @@ fn view_type(t: &MetalTexture, wanted: WMTTextureType, slices: u32) -> WMTTextur
     }
 }
 
-fn identity() -> WMTTextureSwizzleChannels {
+pub(crate) fn identity() -> WMTTextureSwizzleChannels {
     WMTTextureSwizzleChannels {
         r: WMTTextureSwizzle(2),
         g: WMTTextureSwizzle(3),
@@ -558,4 +565,43 @@ fn uav_view(w: &[u32], _t: &MetalTexture) -> Option<ViewShape> {
         _ => return None,
     };
     Some(ViewShape { type_: Some(type_), levels: (mip, 1), slices, swizzle: identity(), min_lod: 0.0 })
+}
+
+/// The type of texture `t` itself (what an all-levels, all-slices view of
+/// it has).
+pub(crate) fn base_type(t: &MetalTexture) -> WMTTextureType {
+    match t.desc.dimension {
+        TEXTURE_1D if t.slices > 1 => WMTTextureType::WMTTextureType1DArray,
+        TEXTURE_1D => WMTTextureType::WMTTextureType1D,
+        TEXTURE_3D => WMTTextureType::WMTTextureType3D,
+        _ if t.desc.sample_count > 1 => WMTTextureType::WMTTextureType2DMultisample,
+        _ if t.slices > 1 => WMTTextureType::WMTTextureType2DArray,
+        _ => WMTTextureType::WMTTextureType2D,
+    }
+}
+
+/// The Metal depth format for a texture of DXGI format `dxgi` used as a
+/// depth target: its own if it is one, else by its size and planes (the
+/// 24-bit depth families as Depth32Float_Stencil8, Apple GPUs having no
+/// 24-bit depth).
+pub(crate) fn depth_pixel(dxgi: u32) -> Option<WMTPixelFormat> {
+    let pc = crate::resource::pc_format(dxgi);
+    let props = format_props(pc as i32)?;
+    if props.depth_stencil {
+        return pixel_format(dxgi);
+    }
+    Some(match pc {
+        // R24G8 and R32G8X24 families: depth with stencil
+        44..=47 | 19..=22 => WMTPixelFormat::WMTPixelFormatDepth32Float_Stencil8,
+        _ => match props.block_size_bytes {
+            2 => WMTPixelFormat::WMTPixelFormatDepth16Unorm,
+            4 => WMTPixelFormat::WMTPixelFormatDepth32Float,
+            _ => return None,
+        },
+    })
+}
+
+/// Whether Metal pixel format `p` is a depth and/or stencil format.
+pub(crate) fn is_depth_pixel(p: u32) -> bool {
+    matches!(p, 250 | 252 | 253 | 255 | 260 | 261 | 262)
 }

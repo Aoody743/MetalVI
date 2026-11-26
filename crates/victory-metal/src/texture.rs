@@ -16,6 +16,11 @@ impl Texture {
         self.0.gpu_resource_id()
     }
 
+    /// A texture from an owned object (a texture view, say).
+    pub fn from_object(object: Object) -> Texture {
+        Texture(object)
+    }
+
     /// The texture as a plain object (to keep it alive with others).
     pub fn into_object(self) -> Object {
         self.0

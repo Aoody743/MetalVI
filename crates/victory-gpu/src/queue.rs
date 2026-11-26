@@ -840,12 +840,45 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    // P2: Metal's copy of the presented image, read back now and then to
+    // compare with the D3D12 picture (`VICTORY_METAL_CAPTURE_EVERY`).
+    #[cfg(windows)]
+    if crate::backend::metal_draw::draws_on()
+        && let every = crate::backend::metal_draw::capture_every()
+        && every > 0
+        && frame % every == 0
+        && planes > 0
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && plane.count > 0
+        && !plane.resources.is_null()
+        && let Some(m) = crate::backend::metal::backend()
+    {
+        // SAFETY: the plane lists `count` resources.
+        let resource = unsafe { *plane.resources };
+        m.capture(resource, &format!("frame{frame:06}"));
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
+    }
+    // P2-5: the picture Metal drew, in the window (`VICTORY_METAL_PRESENT`);
+    // the D3D12 present is skipped when it shows.
+    #[cfg(windows)]
+    if crate::backend::metal_present::present_on()
+        && planes > 0
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && plane.count > 0
+        && !plane.resources.is_null()
+        && let Some(m) = crate::backend::metal::backend()
+        // SAFETY: the plane lists `count` resources.
+        && m.present_metal(unsafe { *plane.resources })
+    {
+        return S_OK;
     }
     #[cfg(windows)]
     if planes > 0

@@ -52,6 +52,33 @@ pub enum Render<'a> {
     FragmentBytes { bytes: &'a [u8], index: u8 },
     /// `setFragmentTexture:atIndex:`.
     FragmentTexture { texture: &'a Texture, index: u8 },
+    /// `setMeshBuffer:offset:atIndex:` / `setObjectBuffer:offset:atIndex:`.
+    MeshBuffer { buffer: &'a Buffer, offset: u64, index: u8 },
+    ObjectBuffer { buffer: &'a Buffer, offset: u64, index: u8 },
+    /// `setViewports:count:` (up to 16).
+    Viewports { viewports: &'a [sys::WMTViewport] },
+    /// `setScissorRects:count:` (up to 16).
+    Scissors { rects: &'a [sys::WMTScissorRect] },
+    /// Fill mode, cull mode, depth clip mode, front-facing winding and depth
+    /// bias, at once (Metal enum values).
+    Rasterizer { fill: u8, cull: u8, depth_clip: u8, winding: u8, depth_bias: f32, slope_scale: f32, clamp: f32 },
+    /// `setDepthStencilState:` + `setStencilReferenceValue:`.
+    DepthStencil { state: &'a DepthStencilState, stencil_ref: u8 },
+    /// `setBlendColorRed:green:blue:alpha:` + `setStencilReferenceValue:`.
+    BlendColorStencil { color: [f32; 4], stencil_ref: u8 },
+    /// `drawIndexedPrimitives:...` (index type 0: 16-bit, 1: 32-bit).
+    DrawIndexed {
+        primitive_type: sys::WMTPrimitiveType,
+        index_type: u8,
+        index_count: u64,
+        index_buffer: &'a Buffer,
+        index_offset: u64,
+        instance_count: u32,
+        base_vertex: i32,
+        base_instance: u32,
+    },
+    /// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`.
+    DrawMesh { groups: [u64; 3], object_threads: [u64; 3], mesh_threads: [u64; 3] },
     /// `drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:`.
     Draw {
         primitive_type: sys::WMTPrimitiveType,
@@ -85,8 +112,84 @@ render_link!(
     sys::wmtcmd_render_setbuffer,
     sys::wmtcmd_render_setbytes,
     sys::wmtcmd_render_settexture,
-    sys::wmtcmd_render_draw
+    sys::wmtcmd_render_draw,
+    sys::wmtcmd_render_setviewports,
+    sys::wmtcmd_render_setscissorrects,
+    sys::wmtcmd_render_setrasterizerstate,
+    sys::wmtcmd_render_setdsso,
+    sys::wmtcmd_render_setblendcolor,
+    sys::wmtcmd_render_draw_indexed,
+    sys::wmtcmd_render_draw_meshthreadgroups
 );
+
+/// A Metal depth-stencil state (+1 reference released on drop).
+#[derive(Clone, Debug)]
+pub struct DepthStencilState(Object);
+
+impl DepthStencilState {
+    pub fn handle(&self) -> obj_handle_t {
+        self.0.handle()
+    }
+}
+
+/// One stencil face (Metal enum values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StencilFace {
+    pub compare: u8,
+    pub stencil_fail: u8,
+    pub depth_fail: u8,
+    pub pass: u8,
+    pub read_mask: u8,
+    pub write_mask: u8,
+}
+
+/// A depth-stencil state description (Metal enum values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DepthStencilDesc {
+    /// MTLCompareFunction (7 = always when depth testing is off).
+    pub depth_compare: u8,
+    pub depth_write: bool,
+    pub stencil: bool,
+    pub front: StencilFace,
+    pub back: StencilFace,
+}
+
+/// One color attachment of a [`RenderPass`].
+#[derive(Clone, Copy, Debug)]
+pub struct PassColor<'a> {
+    pub texture: &'a Texture,
+    pub level: u16,
+    pub slice: u16,
+    pub load: sys::WMTLoadAction,
+    pub store: sys::WMTStoreAction,
+    pub clear: [f64; 4],
+}
+
+/// The depth or stencil attachment of a [`RenderPass`].
+#[derive(Clone, Copy, Debug)]
+pub struct PassDepth<'a> {
+    pub texture: &'a Texture,
+    pub level: u16,
+    pub slice: u16,
+    pub load: sys::WMTLoadAction,
+    pub store: sys::WMTStoreAction,
+    /// Depth clear value (the stencil attachment uses `clear_stencil`).
+    pub clear_depth: f32,
+    pub clear_stencil: u8,
+}
+
+/// A whole render pass description.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderPass<'a> {
+    pub colors: [Option<PassColor<'a>>; 8],
+    pub depth: Option<PassDepth<'a>>,
+    pub stencil: Option<PassDepth<'a>>,
+    pub width: u32,
+    pub height: u32,
+    pub samples: u8,
+    /// Layers rendered to (1 unless layered rendering).
+    pub array_length: u8,
+}
 
 fn null_next() -> sys::WMTMemoryPointer {
     sys::WMTMemoryPointer { ptr: core::ptr::null_mut() }
@@ -232,6 +335,79 @@ impl Device {
     }
 }
 
+impl Device {
+    /// A mesh render pipeline from `desc`, a mesh function and, when given,
+    /// a fragment function (no object stage).
+    pub fn mesh_render_pipeline_desc(
+        &self,
+        mesh: (&Object, &str),
+        fragment: Option<(&Object, &str)>,
+        desc: &RenderPipelineDesc,
+    ) -> Result<RenderPipeline> {
+        let _pool = Pool::new();
+        let function = |lib: &Object, name: &str| -> Result<Object> {
+            let c = std::ffi::CString::new(name).map_err(|_| Error("function name has a NUL".into()))?;
+            // SAFETY: a live library; `newFunction` returns owned (+1).
+            Object::adopt(unsafe { sys::MTLLibrary_newFunction(lib.handle(), c.as_ptr()) })
+                .ok_or_else(|| Error(format!("no function {name:?} in the library")))
+        };
+        let mesh = function(mesh.0, mesh.1)?;
+        let fragment = match fragment {
+            Some((lib, name)) => Some(function(lib, name)?),
+            None => None,
+        };
+        // SAFETY: all-zero is the default for the info struct.
+        let mut info: sys::WMTMeshRenderPipelineInfo = unsafe { std::mem::zeroed() };
+        for (out, c) in info.colors.iter_mut().zip(&desc.colors) {
+            out.pixel_format = sys::WMTPixelFormat(c.pixel_format);
+            out.blending_enabled = c.blending;
+            out.src_rgb_blend_factor = sys::WMTBlendFactor(c.src_rgb);
+            out.dst_rgb_blend_factor = sys::WMTBlendFactor(c.dst_rgb);
+            out.rgb_blend_operation = sys::WMTBlendOperation(c.op_rgb);
+            out.src_alpha_blend_factor = sys::WMTBlendFactor(c.src_alpha);
+            out.dst_alpha_blend_factor = sys::WMTBlendFactor(c.dst_alpha);
+            out.alpha_blend_operation = sys::WMTBlendOperation(c.op_alpha);
+            out.write_mask = c.write_mask;
+        }
+        info.alpha_to_coverage_enabled = desc.alpha_to_coverage;
+        info.rasterization_enabled = true;
+        info.raster_sample_count = desc.sample_count.max(1);
+        info.depth_pixel_format = sys::WMTPixelFormat(desc.depth_format);
+        info.stencil_pixel_format = sys::WMTPixelFormat(desc.stencil_format);
+        info.mesh_function = mesh.handle();
+        info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
+        let mut err = 0;
+        // SAFETY: info is valid for the call; returns owned (+1).
+        let pso = Object::adopt(unsafe { sys::MTLDevice_newMeshRenderPipelineState(self.handle(), &info, &mut err) })
+            .ok_or_else(|| error_text(err, "newMeshRenderPipelineState"))?;
+        Ok(RenderPipeline(pso))
+    }
+
+    /// A depth-stencil state from `desc`.
+    pub fn depth_stencil_state(&self, desc: &DepthStencilDesc) -> Result<DepthStencilState> {
+        let face = |f: &StencilFace| sys::WMTStencilInfo {
+            enabled: desc.stencil,
+            depth_stencil_pass_op: sys::WMTStencilOperation(f.pass),
+            stencil_fail_op: sys::WMTStencilOperation(f.stencil_fail),
+            depth_fail_op: sys::WMTStencilOperation(f.depth_fail),
+            stencil_compare_function: sys::WMTCompareFunction(f.compare),
+            write_mask: f.write_mask,
+            read_mask: f.read_mask,
+        };
+        let info = sys::WMTDepthStencilInfo {
+            depth_compare_function: sys::WMTCompareFunction(desc.depth_compare),
+            depth_write_enabled: desc.depth_write,
+            front_stencil: face(&desc.front),
+            back_stencil: face(&desc.back),
+        };
+        let _pool = Pool::new();
+        // SAFETY: info valid for the call; returns owned (+1).
+        Object::adopt(unsafe { sys::MTLDevice_newDepthStencilState(self.handle(), &info) })
+            .map(DepthStencilState)
+            .ok_or_else(|| Error("newDepthStencilState".into()))
+    }
+}
+
 impl CommandBuffer {
     /// Opens a render pass for `attachments`, encodes `steps`, and ends the
     /// pass. The command buffer is not committed here.
@@ -242,22 +418,47 @@ impl CommandBuffer {
         height: u32,
         steps: &[Render<'_>],
     ) -> Result<()> {
+        let mut pass = RenderPass { width, height, samples: 1, array_length: 0, ..Default::default() };
+        for (slot, a) in pass.colors.iter_mut().zip(attachments) {
+            *slot = Some(PassColor { texture: a.texture, level: 0, slice: 0, load: a.load_action, store: a.store_action, clear: a.clear });
+        }
+        self.render_pass_with(&pass, steps)
+    }
+
+    /// Opens the render pass `desc`, encodes `steps`, and ends the pass.
+    /// The command buffer is not committed here.
+    pub fn render_pass_with(&self, desc: &RenderPass<'_>, steps: &[Render<'_>]) -> Result<()> {
         let _pool = Pool::new();
         // SAFETY: all-zero pass descriptor; fields set below.
         let mut pass: sys::WMTRenderPassInfo = unsafe { std::mem::zeroed() };
-        pass.default_raster_sample_count = 1;
-        pass.render_target_width = width;
-        pass.render_target_height = height;
-        for (i, a) in attachments.iter().enumerate() {
-            pass.colors[i].texture = a.texture.handle();
-            pass.colors[i].load_action = a.load_action;
-            pass.colors[i].store_action = a.store_action;
-            pass.colors[i].clear_color = sys::WMTClearColor {
-                r: a.clear[0],
-                g: a.clear[1],
-                b: a.clear[2],
-                a: a.clear[3],
-            };
+        pass.default_raster_sample_count = desc.samples.max(1);
+        pass.render_target_array_length = desc.array_length;
+        pass.render_target_width = desc.width;
+        pass.render_target_height = desc.height;
+        for (out, a) in pass.colors.iter_mut().zip(&desc.colors) {
+            let Some(a) = a else { continue };
+            out.texture = a.texture.handle();
+            out.load_action = a.load;
+            out.store_action = a.store;
+            out.level = a.level;
+            out.slice = a.slice;
+            out.clear_color = sys::WMTClearColor { r: a.clear[0], g: a.clear[1], b: a.clear[2], a: a.clear[3] };
+        }
+        if let Some(d) = &desc.depth {
+            pass.depth.texture = d.texture.handle();
+            pass.depth.load_action = d.load;
+            pass.depth.store_action = d.store;
+            pass.depth.level = d.level;
+            pass.depth.slice = d.slice;
+            pass.depth.clear_depth = d.clear_depth;
+        }
+        if let Some(d) = &desc.stencil {
+            pass.stencil.texture = d.texture.handle();
+            pass.stencil.load_action = d.load;
+            pass.stencil.store_action = d.store;
+            pass.stencil.level = d.level;
+            pass.stencil.slice = d.slice;
+            pass.stencil.clear_stencil = d.clear_stencil;
         }
 
         // SAFETY: a live command buffer; the encoder is autoreleased.
@@ -307,6 +508,100 @@ impl CommandBuffer {
                     texture: texture.handle(),
                     index,
                 }),
+                Render::MeshBuffer { buffer, offset, index } => Box::new(sys::wmtcmd_render_setbuffer {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetMeshBuffer,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    buffer: buffer.handle(),
+                    offset,
+                    index,
+                }),
+                Render::ObjectBuffer { buffer, offset, index } => Box::new(sys::wmtcmd_render_setbuffer {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetObjectBuffer,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    buffer: buffer.handle(),
+                    offset,
+                    index,
+                }),
+                Render::Viewports { viewports } => Box::new(sys::wmtcmd_render_setviewports {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetViewports,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    viewports: sys::WMTMemoryPointer { ptr: viewports.as_ptr() as *mut c_void },
+                    viewport_count: viewports.len().min(16) as u8,
+                }),
+                Render::Scissors { rects } => Box::new(sys::wmtcmd_render_setscissorrects {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetScissorRects,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    scissor_rects: sys::WMTMemoryPointer { ptr: rects.as_ptr() as *mut c_void },
+                    rect_count: rects.len().min(16) as u8,
+                }),
+                Render::Rasterizer { fill, cull, depth_clip, winding, depth_bias, slope_scale, clamp } => {
+                    Box::new(sys::wmtcmd_render_setrasterizerstate {
+                        type_: sys::WMTRenderCommandType::WMTRenderCommandSetRasterizerState,
+                        reserved: [0; 3],
+                        next: null_next(),
+                        fill_mode: sys::WMTTriangleFillMode(fill),
+                        cull_mode: sys::WMTCullMode(cull),
+                        depth_clip_mode: sys::WMTDepthClipMode(depth_clip),
+                        winding: sys::WMTWinding(winding),
+                        depth_bias,
+                        scole_scale: slope_scale,
+                        depth_bias_clamp: clamp,
+                    })
+                }
+                Render::DepthStencil { state, stencil_ref } => Box::new(sys::wmtcmd_render_setdsso {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetDSSO,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    dsso: state.handle(),
+                    stencil_ref,
+                }),
+                Render::BlendColorStencil { color, stencil_ref } => Box::new(sys::wmtcmd_render_setblendcolor {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandSetBlendFactorAndStencilRef,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    red: color[0],
+                    green: color[1],
+                    blue: color[2],
+                    alpha: color[3],
+                    stencil_ref,
+                }),
+                Render::DrawIndexed {
+                    primitive_type,
+                    index_type,
+                    index_count,
+                    index_buffer,
+                    index_offset,
+                    instance_count,
+                    base_vertex,
+                    base_instance,
+                } => Box::new(sys::wmtcmd_render_draw_indexed {
+                    type_: sys::WMTRenderCommandType::WMTRenderCommandDrawIndexed,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    primitive_type,
+                    index_type: sys::WMTIndexType(index_type),
+                    index_count,
+                    index_buffer: index_buffer.handle(),
+                    index_buffer_offset: index_offset,
+                    instance_count,
+                    base_vertex,
+                    base_instance,
+                }),
+                Render::DrawMesh { groups, object_threads, mesh_threads } => {
+                    let size = |v: [u64; 3]| sys::WMTSize { width: v[0], height: v[1], depth: v[2] };
+                    Box::new(sys::wmtcmd_render_draw_meshthreadgroups {
+                        type_: sys::WMTRenderCommandType::WMTRenderCommandDrawMeshThreadgroups,
+                        reserved: [0; 3],
+                        next: null_next(),
+                        threadgroup_per_grid: size(groups),
+                        object_threadgroup_size: size(object_threads),
+                        mesh_threadgroup_size: size(mesh_threads),
+                    })
+                }
                 Render::Draw { primitive_type, vertex_start, vertex_count, instance_count, base_instance } => {
                     Box::new(sys::wmtcmd_render_draw {
                         type_: sys::WMTRenderCommandType::WMTRenderCommandDraw,

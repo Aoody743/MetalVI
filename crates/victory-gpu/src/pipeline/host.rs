@@ -401,6 +401,9 @@ pub(crate) struct HostPipeline {
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+    /// Its graphics state for the Metal backend (none for compute).
+    #[cfg(windows)]
+    pub(crate) metal_input: Option<crate::backend::metal_render_map::PipelineStateInput>,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -633,6 +636,8 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                #[cfg(windows)]
+                metal_input: None,
             });
         }
         let Some(g) = g else {
@@ -696,6 +701,8 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                #[cfg(windows)]
+                metal_input: Some(g.metal_input()),
             });
         }
 
@@ -842,6 +849,8 @@ impl HostPipeline {
                     b.RenderTargetWriteMask
                 )
             },
+            #[cfg(windows)]
+            metal_input: Some(g.metal_input()),
         })
     }
 }

@@ -155,7 +155,7 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
 
 /// The Metal dispatches recorded into a title list (`VICTORY_METAL`).
 #[cfg(windows)]
-pub(crate) fn metal_commands(this: This) -> Vec<std::sync::Arc<crate::backend::metal::MetalCmd>> {
+pub(crate) fn metal_commands(this: This) -> Vec<std::sync::Arc<crate::backend::metal::MetalOp>> {
     if this.is_null() {
         return Vec::new();
     }
@@ -1245,9 +1245,42 @@ extern "system" fn clear_rtv(
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
+        if crate::backend::metal_draw::draws_on() && rects.is_none() {
+            metal_clear(this, record, false, Some(color.map(f64::from)), None, None);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, color, count, rects);
+}
+
+/// A whole-view clear on Metal too (`VICTORY_METAL_DRAW=1`), recorded into
+/// the list in order with its draws.
+#[cfg(windows)]
+fn metal_clear(
+    this: This,
+    record: crate::descriptor::RtvRecord,
+    depth_view: bool,
+    color: Option<[f64; 4]>,
+    depth: Option<f32>,
+    stencil: Option<u8>,
+) {
+    use crate::backend::metal_draw::{MetalClear, level_slice};
+    let Some(m) = crate::backend::metal::backend() else { return };
+    let words = if depth_view { record.depth_words() } else { record.target_words() };
+    let Some(words) = words else { return };
+    let Some((level, slice)) = level_slice(&words, depth_view) else { return };
+    let _pool = victory_metal::Pool::new();
+    let Some(target) = m.attachment(record.resource, words[0], level, slice, depth_view) else { return };
+    let has_stencil = matches!(target.pixel, 260 | 261);
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Clear(MetalClear {
+        target,
+        color,
+        depth,
+        stencil,
+        has_stencil,
+    })));
 }
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
@@ -1292,6 +1325,9 @@ extern "system" fn clear_dsv(
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
+        if crate::backend::metal_draw::draws_on() && rects.is_none() && flags & 3 != 0 {
+            metal_clear(this, record, true, None, (flags & 1 != 0).then_some(depth), (flags & 2 != 0).then_some(stencil));
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);
