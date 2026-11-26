@@ -957,6 +957,68 @@ fn half_to_f32(h: u16) -> f32 {
 /// pixel area (for captures of intermediate targets).
 pub(crate) static DRAWN_TARGETS: std::sync::Mutex<Vec<(usize, u64)>> = std::sync::Mutex::new(Vec::new());
 
+/// Title textures handed to the window (`present`), for the final-draw
+/// dossier below.
+pub(crate) static PRESENTED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a presented texture.
+pub(crate) fn note_presented(resource: usize) {
+    let mut p = PRESENTED.lock().unwrap_or_else(|e| e.into_inner());
+    if !p.contains(&resource) {
+        p.push(resource);
+    }
+}
+
+/// The final-draw dossier (when capturing): the presented texture a draw
+/// recorded just now targets, if any; `run` captures it right after the
+/// submission holding that draw finishes.
+pub(crate) static CAPTURE_AFTER: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Logs (the first times) and marks for a capture a draw into a presented
+/// texture.
+pub(crate) fn final_draw_dossier(d: &MetalDraw) {
+    if capture_every() == 0 {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let presented = PRESENTED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(target) = d.targets.colors.iter().flatten().find(|a| presented.contains(&a.resource)) else { return };
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if n >= 6 && !n.is_power_of_two() {
+        return;
+    }
+    let (args, index_type) = draw_params(&d.kind);
+    let others: Vec<String> = d
+        .targets
+        .colors
+        .iter()
+        .flatten()
+        .map(|a| format!("{}:{}x{} px{}", a.resource, a.width, a.height, a.pixel))
+        .collect();
+    let v = d.viewport;
+    let s = d.scissor;
+    tracing::info!(
+        n,
+        pipeline = %d.pso.name,
+        colors = ?d.pso.colors,
+        depth_format = d.pso.depth,
+        depth_attached = d.targets.depth.is_some(),
+        depth_write = d.pso.depth_write,
+        raster = ?d.pso.raster,
+        primitive = d.primitive,
+        args = ?args,
+        index_type,
+        viewport = format_args!("{:.0},{:.0} {:.0}x{:.0} z{:.2}-{:.2}", v.originX, v.originY, v.width, v.height, v.znear, v.zfar),
+        scissor = format_args!("{},{} {}x{}", s.x, s.y, s.width, s.height),
+        targets = ?others,
+        stages = d.stages.len(),
+        tables = ?d.stages.iter().map(|b| (b.bind, b.tables.len(), b.heap.is_some())).collect::<Vec<_>>(),
+        vertex_fetch = d.vertex.is_some(),
+        "Metal final-draw dossier: a draw into the presented texture"
+    );
+    CAPTURE_AFTER.lock().unwrap_or_else(|e| e.into_inner()).push((target.resource, format!("final-draw{n:03}")));
+}
+
 /// What wrote each title texture since the last capture (only when
 /// capturing): draws, clears, copies on Metal; resolves left on D3D12
 /// and D3D12-only buffer copies.

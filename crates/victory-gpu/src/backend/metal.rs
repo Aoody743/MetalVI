@@ -808,7 +808,15 @@ impl MetalBackend {
         }
         cb.commit();
         match cb.wait() {
-            Ok(()) => true,
+            Ok(()) => {
+                // The final-draw dossier: the presented texture right after
+                // the draw into it ran (before a later clear).
+                let wanted = std::mem::take(&mut *super::metal_draw::CAPTURE_AFTER.lock().unwrap_or_else(|e| e.into_inner()));
+                for (resource, name) in wanted {
+                    self.capture(resource as crate::object::This, &name);
+                }
+                true
+            }
             Err(e) => {
                 let (mut dispatches, mut draws, mut clears) = (0, 0, 0);
                 for op in ops {

@@ -881,6 +881,18 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    if crate::backend::metal_draw::draws_on()
+        && crate::backend::metal_draw::capture_every() > 0
+        && planes > 0
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let Some(plane) = unsafe { plane_parameters.as_ref() }
+        && plane.count > 0
+        && !plane.resources.is_null()
+    {
+        // SAFETY: the plane lists `count` resources.
+        crate::backend::metal_draw::note_presented(unsafe { *plane.resources } as usize);
+    }
     // P2: Metal's copy of the presented image, read back now and then to
     // compare with the D3D12 picture (`VICTORY_METAL_CAPTURE_EVERY`).
     #[cfg(windows)]

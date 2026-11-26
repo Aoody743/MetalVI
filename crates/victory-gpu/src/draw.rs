@@ -2284,7 +2284,7 @@ impl State {
         };
         count_draw(DrawDrop::Ran);
         crate::backend::metal_draw::note_targets(&targets);
-        self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Draw(MetalDraw {
+        let op = std::sync::Arc::new(crate::backend::metal::MetalOp::Draw(MetalDraw {
             pso: g,
             targets,
             stages,
@@ -2295,7 +2295,11 @@ impl State {
             stencil_ref: self.stencil.unwrap_or(0) as u8,
             primitive,
             kind,
-        })));
+        }));
+        if let crate::backend::metal::MetalOp::Draw(d) = &*op {
+            crate::backend::metal_draw::final_draw_dossier(d);
+        }
+        self.metal.push(op);
     }
 
     /// A draw in console topology `c` as a [`DrawKind::Generated`]: its
