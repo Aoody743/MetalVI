@@ -61,6 +61,64 @@ pub(crate) fn texture_fill_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_METAL_TEXTURES").map_or(true, |v| v != "nofill"))
 }
 
+/// Submissions run on Metal so far (the fence for retired wrappers).
+static SUBMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The runtime remapped title memory `[at, at + len)`: the no-copy buffers
+/// over it show the pages that were there (F26). They are retired, and let
+/// go once the next submission has run (lists recorded before hold them);
+/// the next use wraps the new pages.
+pub(crate) fn title_memory_remapped(at: u64, len: u64) {
+    // Off unless VICTORY_METAL_REWRAP=1: re-wrapping left the old no-copy
+    // buffer resident (until its fence) while a new one over the same pages
+    // was added, and that panicked the kernel (IOGPUGroupMemory.cpp:220,
+    // 2026-11-26). Until the old wrapper is gone before the new one is made,
+    // wrappers keep showing the pages they were made over.
+    // Counted either way, for the log: how often the title remaps.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(calls = n, at = format_args!("{at:#x}"), len, "Metal: title memory remapped");
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    if mode() != Mode::Compute || !*ON.get_or_init(|| std::env::var("VICTORY_METAL_REWRAP").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    // Only noted here: callers hold their own locks (xmem's while it maps
+    // and unmaps), and the chunks lock is held around calls that take
+    // others, so taking it here could deadlock. `MetalBackend::chunks`
+    // applies what is noted before anyone uses a wrapper.
+    REMAPPED.lock().unwrap_or_else(|e| e.into_inner()).push((at, len));
+    REMAPS_PENDING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static REMAPS_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl MetalBackend {
+    /// The no-copy wrappers, with remaps noted since the last look applied
+    /// (their wrappers retired until the next submission has run).
+    pub(crate) fn chunks(&self) -> std::sync::MutexGuard<'_, Chunks> {
+        if REMAPS_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
+            if !ranges.is_empty() {
+                // Typed buffer views made over the old wrappers.
+                self.typed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|&(va, bytes, _), _| ranges.iter().all(|&(at, len)| va + bytes <= at || at + len <= va));
+                let fence = SUBMITTED.load(std::sync::atomic::Ordering::Acquire) + 1;
+                let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+                for (at, len) in ranges {
+                    chunks.remapped(at, len, fence);
+                }
+                return chunks;
+            }
+        }
+        self.chunks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// Why dispatches did not run on Metal, counted for the log.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Drop {
@@ -315,7 +373,11 @@ impl MetalBackend {
             return false;
         }
         cb.commit();
-        match cb.wait() {
+        let waited = cb.wait();
+        // This submission is done: wrappers retired before it can go.
+        let done = SUBMITTED.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+        self.chunks().retire(done);
+        match waited {
             Ok(()) => true,
             Err(e) => {
                 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -390,7 +452,7 @@ impl MetalBackend {
             }
             Some(view) => {
                 let e = {
-                    let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut chunks = self.chunks();
                     super::metal_heap::entry(&view, &mut chunks)
                 };
                 match e {
@@ -429,7 +491,7 @@ impl MetalBackend {
         if elem == 0 {
             return None;
         }
-        let (buffer, offset) = self.chunks.lock().unwrap_or_else(|e| e.into_inner()).window_buffer(va, bytes)?;
+        let (buffer, offset) = self.chunks().window_buffer(va, bytes)?;
         let pixel = WMTPixelFormat(pixel as u32);
         // SAFETY: a plain query.
         let align = unsafe { victory_metal::sys::MTLDevice_minimumLinearTextureAlignmentForPixelFormat(self.device.handle(), pixel) }.max(1);
@@ -558,7 +620,7 @@ impl MetalBackend {
         }
         // SAFETY: as above.
         let buffer = unsafe { self.device.wrap(mem, bytes as u64) }.ok()?;
-        let chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let chunks = self.chunks();
         chunks.residency().add(&[buffer.handle()]);
         chunks.residency().commit();
         Some(Ring { buffer, entries: mem.cast(), capacity: bytes / size_of::<DescriptorEntry>() })
@@ -575,7 +637,7 @@ impl MetalBackend {
         }
         // SAFETY: as above.
         let buffer = unsafe { self.device.wrap(mem, bytes as u64) }.ok()?;
-        let chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+        let chunks = self.chunks();
         chunks.residency().add(&[buffer.handle()]);
         chunks.residency().commit();
         Some(MetalHeap { buffer, entries: mem.cast(), count })
@@ -703,4 +765,159 @@ pub(crate) fn static_samplers(t: &HostShader) -> Vec<StaticSampler> {
             register_space: 0,
         })
         .collect()
+}
+
+/// P2 census: the title's graphics pipelines made on Metal too, on a thread
+/// of their own, and only counted (nothing draws with them yet). Each stage
+/// goes through Metal Shader Converter (with the disk cache) and the pair
+/// becomes a render pipeline in the state F7's map gives.
+/// Off unless `VICTORY_METAL_CENSUS=1` (not yet run in the game).
+pub(crate) fn census_graphics(
+    shaders: Vec<std::sync::Arc<crate::pipeline::Shader>>,
+    input: super::metal_render_map::PipelineStateInput,
+) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if mode() != Mode::Compute || !*ON.get_or_init(|| std::env::var("VICTORY_METAL_CENSUS").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    type Job = (Vec<std::sync::Arc<crate::pipeline::Shader>>, super::metal_render_map::PipelineStateInput);
+    static TX: OnceLock<Option<std::sync::Mutex<std::sync::mpsc::Sender<Job>>>> = OnceLock::new();
+    let tx = TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("metal census".into())
+            .spawn(move || {
+                let mut c = Census::default();
+                for (shaders, input) in rx {
+                    c.one(&shaders, &input);
+                }
+            })
+            .ok()?;
+        Some(std::sync::Mutex::new(tx))
+    });
+    if let Some(tx) = tx {
+        let _ = tx.lock().unwrap_or_else(|e| e.into_inner()).send((shaders, input));
+    }
+}
+
+#[derive(Default)]
+struct Census {
+    pipelines: u64,
+    made: u64,
+    stage_ok: u64,
+    stage_failed: u64,
+    pipeline_failed: u64,
+    with_inputs: u64,
+    reasons: HashMap<String, u64>,
+}
+
+impl Census {
+    fn one(&mut self, shaders: &[std::sync::Arc<crate::pipeline::Shader>], input: &super::metal_render_map::PipelineStateInput) {
+        let Some(m) = backend() else { return };
+        let _pool = victory_metal::Pool::new();
+        self.pipelines += 1;
+        if !input.elements.is_empty() {
+            self.with_inputs += 1;
+        }
+        let mut vertex = None;
+        let mut fragment = None;
+        let mut failed = false;
+        for s in shaders {
+            let stage = match s.stage {
+                "vertex" => victory_metal::msc::Stage::Vertex,
+                "pixel" => victory_metal::msc::Stage::Fragment,
+                _ => continue,
+            };
+            let Some(t) = s.translated() else { continue };
+            match convert_cached(&t.host, stage).and_then(|c| m.device.library(&c.metallib).map(|l| (l, c.entry)).map_err(|e| e.to_string())) {
+                Ok(lib) => {
+                    self.stage_ok += 1;
+                    if stage == victory_metal::msc::Stage::Vertex {
+                        vertex = Some(lib);
+                    } else {
+                        fragment = Some(lib);
+                    }
+                }
+                Err(e) => {
+                    self.stage_failed += 1;
+                    failed = true;
+                    self.reason(format!("{} stage: {e}", s.stage));
+                }
+            }
+        }
+        if !failed && let Some((vlib, vname)) = &vertex {
+            let desc = render_desc(&super::metal_render_map::map_pipeline_state(input));
+            match m.device.render_pipeline_desc((vlib, vname), fragment.as_ref().map(|(l, n)| (l, n.as_str())), &desc) {
+                Ok(_) => self.made += 1,
+                Err(e) => {
+                    self.pipeline_failed += 1;
+                    self.reason(format!("pipeline: {e}"));
+                }
+            }
+        }
+        if self.pipelines.is_power_of_two() || self.pipelines % 256 == 0 {
+            tracing::info!(
+                pipelines = self.pipelines,
+                made = self.made,
+                stages_converted = self.stage_ok,
+                stages_failed = self.stage_failed,
+                pipelines_refused = self.pipeline_failed,
+                with_vertex_inputs = self.with_inputs,
+                "Metal census of graphics pipelines"
+            );
+        }
+    }
+
+    fn reason(&mut self, text: String) {
+        let key: String = text.chars().take(160).collect();
+        let n = self.reasons.entry(key.clone()).or_insert(0);
+        *n += 1;
+        if *n == 1 && self.reasons.len() <= 48 {
+            tracing::warn!(reason = %key, "Metal census: a graphics pipeline did not make it (first of its kind)");
+        }
+    }
+}
+
+/// One stage through Metal Shader Converter, from the disk cache when there.
+fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage) -> Result<victory_metal::msc::Converted, String> {
+    let params = root_params(host);
+    let samplers = static_samplers(host);
+    let path = msc_cache_path(&host.dxil, &params, &samplers).map(|p| p.with_extension(format!("{stage:?}.vmsc")));
+    if let Some(path) = &path
+        && let Ok(bytes) = crate::read_file(path)
+        && let Some(c) = victory_metal::msc::Converted::from_bytes(&bytes)
+    {
+        return Ok(c);
+    }
+    let c = victory_metal::msc::convert(&host.dxil, stage, &params, &samplers).map_err(|e| e.to_string())?;
+    if let Some(path) = &path {
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, c.to_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+    Ok(c)
+}
+
+/// F7's map as victory-metal's render pipeline description.
+fn render_desc(map: &super::metal_render_map::RenderPipelineMap) -> victory_metal::render::RenderPipelineDesc {
+    let mut d = victory_metal::render::RenderPipelineDesc::default();
+    for (out, c) in d.colors.iter_mut().zip(&map.color) {
+        let Some(c) = c else { continue };
+        out.pixel_format = c.pixel_format.map_or(0, |f| f as u64 as u32);
+        out.blending = c.blending_enabled;
+        out.src_rgb = c.source_rgb_factor.map_or(1, |f| f as u64 as u8);
+        out.dst_rgb = c.destination_rgb_factor.map_or(0, |f| f as u64 as u8);
+        out.op_rgb = c.rgb_operation.map_or(0, |f| f as u64 as u8);
+        out.src_alpha = c.source_alpha_factor.map_or(1, |f| f as u64 as u8);
+        out.dst_alpha = c.destination_alpha_factor.map_or(0, |f| f as u64 as u8);
+        out.op_alpha = c.alpha_operation.map_or(0, |f| f as u64 as u8);
+        out.write_mask = c.write_mask.0 as u8;
+    }
+    d.depth_format = map.depth_format.map_or(0, |f| f as u64 as u32);
+    d.stencil_format = map.stencil_format.map_or(0, |f| f as u64 as u32);
+    d.sample_count = map.raster_sample_count.clamp(1, 8) as u8;
+    d.alpha_to_coverage = map.alpha_to_coverage;
+    d.topology_class = map.input_primitive_topology.map_or(0, |t| t as u64 as u32);
+    d
 }

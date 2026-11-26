@@ -150,6 +150,88 @@ impl Device {
     }
 }
 
+/// One color attachment of a [`RenderPipelineDesc`] (Metal enum values).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ColorDesc {
+    /// MTLPixelFormat; 0 = no attachment.
+    pub pixel_format: u32,
+    pub blending: bool,
+    /// MTLBlendFactor / MTLBlendOperation values.
+    pub src_rgb: u8,
+    pub dst_rgb: u8,
+    pub op_rgb: u8,
+    pub src_alpha: u8,
+    pub dst_alpha: u8,
+    pub op_alpha: u8,
+    /// MTLColorWriteMask bits.
+    pub write_mask: u8,
+}
+
+/// A whole render pipeline description (Metal enum values throughout).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RenderPipelineDesc {
+    pub colors: [ColorDesc; 8],
+    /// MTLPixelFormat of the depth / stencil attachments; 0 = none.
+    pub depth_format: u32,
+    pub stencil_format: u32,
+    pub sample_count: u8,
+    pub alpha_to_coverage: bool,
+    /// MTLPrimitiveTopologyClass; 0 = unspecified.
+    pub topology_class: u32,
+}
+
+impl Device {
+    /// A render pipeline from `desc`, a vertex function and, when given, a
+    /// fragment function (depth-only pipelines have none).
+    pub fn render_pipeline_desc(
+        &self,
+        vertex: (&Object, &str),
+        fragment: Option<(&Object, &str)>,
+        desc: &RenderPipelineDesc,
+    ) -> Result<RenderPipeline> {
+        let _pool = Pool::new();
+        let function = |lib: &Object, name: &str| -> Result<Object> {
+            let c = std::ffi::CString::new(name).map_err(|_| Error("function name has a NUL".into()))?;
+            // SAFETY: a live library; `newFunction` returns owned (+1).
+            Object::adopt(unsafe { sys::MTLLibrary_newFunction(lib.handle(), c.as_ptr()) })
+                .ok_or_else(|| Error(format!("no function {name:?} in the library")))
+        };
+        let vertex = function(vertex.0, vertex.1)?;
+        let fragment = match fragment {
+            Some((lib, name)) => Some(function(lib, name)?),
+            None => None,
+        };
+        // SAFETY: all-zero is the default for the info struct.
+        let mut info: sys::WMTRenderPipelineInfo = unsafe { std::mem::zeroed() };
+        for (out, c) in info.colors.iter_mut().zip(&desc.colors) {
+            out.pixel_format = sys::WMTPixelFormat(c.pixel_format);
+            out.blending_enabled = c.blending;
+            out.src_rgb_blend_factor = sys::WMTBlendFactor(c.src_rgb);
+            out.dst_rgb_blend_factor = sys::WMTBlendFactor(c.dst_rgb);
+            out.rgb_blend_operation = sys::WMTBlendOperation(c.op_rgb);
+            out.src_alpha_blend_factor = sys::WMTBlendFactor(c.src_alpha);
+            out.dst_alpha_blend_factor = sys::WMTBlendFactor(c.dst_alpha);
+            out.alpha_blend_operation = sys::WMTBlendOperation(c.op_alpha);
+            out.write_mask = c.write_mask.into();
+        }
+        info.alpha_to_coverage_enabled = desc.alpha_to_coverage;
+        info.rasterization_enabled = true;
+        info.raster_sample_count = desc.sample_count.max(1);
+        info.depth_pixel_format = sys::WMTPixelFormat(desc.depth_format);
+        info.stencil_pixel_format = sys::WMTPixelFormat(desc.stencil_format);
+        info.vertex_function = vertex.handle();
+        info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
+        info.input_primitive_topology = sys::WMTPrimitiveTopologyClass(desc.topology_class);
+        // Metal rejects a zero tessellation factor even without tessellation.
+        info.max_tessellation_factor = 64;
+        let mut err = 0;
+        // SAFETY: info is valid for the call; newRenderPipelineState returns owned (+1).
+        let pso = Object::adopt(unsafe { sys::MTLDevice_newRenderPipelineState(self.handle(), &info, &mut err) })
+            .ok_or_else(|| error_text(err, "newRenderPipelineState"))?;
+        Ok(RenderPipeline(pso))
+    }
+}
+
 impl CommandBuffer {
     /// Opens a render pass for `attachments`, encodes `steps`, and ends the
     /// pass. The command buffer is not committed here.

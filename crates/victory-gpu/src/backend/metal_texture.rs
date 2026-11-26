@@ -152,7 +152,7 @@ impl MetalBackend {
         // Shaders reach it through argument buffers (its gpuResourceID):
         // it must be resident, as title memory is (T4 §3.6).
         {
-            let chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+            let chunks = self.chunks();
             chunks.residency().add(&[texture.handle()]);
             chunks.residency().commit();
         }
@@ -215,8 +215,15 @@ impl MetalBackend {
         // The detile on the GPU, reading the title's memory where it is
         // (zero copy), for every subresource the kernels take (F10,
         // `metal_detile`); the CPU does the rest into the same staging.
-        let window = if super::metal::gpu_detile_on() {
-            self.chunks.lock().unwrap_or_else(|e| e.into_inner()).window_buffer(memory as u64, tiled_size)
+        // On the GPU only where it pays (F16: under ~6 MB a command buffer's
+        // fixed cost outweighs it, and linear layouts copy faster on the CPU).
+        static MIN_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let min_bytes = *MIN_BYTES.get_or_init(|| {
+            std::env::var("VICTORY_METAL_GPU_DETILE_MIN_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(4096) << 10
+        });
+        let worth_gpu = tiled_size >= min_bytes && layout.desc.swizzle.0 != 0;
+        let window = if super::metal::gpu_detile_on() && worth_gpu {
+            self.chunks().window_buffer(memory as u64, tiled_size)
         } else {
             None
         };
@@ -385,7 +392,7 @@ impl MetalBackend {
             }
         };
         {
-            let chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
+            let chunks = self.chunks();
             chunks.residency().add(&[texture.handle()]);
             chunks.residency().commit();
         }

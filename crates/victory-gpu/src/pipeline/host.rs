@@ -92,6 +92,85 @@ impl Default for GraphicsState {
 }
 
 impl GraphicsState {
+    /// The state as the Metal render map takes it (F7).
+    #[cfg(windows)]
+    pub(crate) fn metal_input(&self) -> crate::backend::metal_render_map::PipelineStateInput {
+        use crate::backend::metal_render_map as m;
+        let rt = |t: &D3D12_RENDER_TARGET_BLEND_DESC| m::RtBlend {
+            blend_enable: t.BlendEnable.as_bool(),
+            logic_op_enable: t.LogicOpEnable.as_bool(),
+            src_blend: t.SrcBlend.0,
+            dest_blend: t.DestBlend.0,
+            blend_op: t.BlendOp.0,
+            src_blend_alpha: t.SrcBlendAlpha.0,
+            dest_blend_alpha: t.DestBlendAlpha.0,
+            blend_op_alpha: t.BlendOpAlpha.0,
+            logic_op: t.LogicOp.0,
+            render_target_write_mask: u32::from(t.RenderTargetWriteMask),
+        };
+        let face = |f: &D3D12_DEPTH_STENCILOP_DESC| m::StencilFaceDesc {
+            fail_op: f.StencilFailOp.0,
+            depth_fail_op: f.StencilDepthFailOp.0,
+            pass_op: f.StencilPassOp.0,
+            func: f.StencilFunc.0,
+        };
+        let r = &self.rasterizer;
+        let d = &self.depth;
+        let mut rtv_formats = [0i32; 8];
+        for (o, f) in rtv_formats.iter_mut().zip(&self.targets.RTFormats) {
+            *o = f.0;
+        }
+        m::PipelineStateInput {
+            blend: m::BlendDesc {
+                alpha_to_coverage: self.blend.AlphaToCoverageEnable.as_bool(),
+                independent_blend_enable: self.blend.IndependentBlendEnable.as_bool(),
+                render_targets: self.blend.RenderTarget.each_ref().map(rt),
+            },
+            rasterizer: m::RasterizerDesc {
+                fill_mode: r.FillMode.0,
+                cull_mode: r.CullMode.0,
+                front_counter_clockwise: r.FrontCounterClockwise.as_bool(),
+                depth_bias: r.DepthBias,
+                depth_bias_clamp: r.DepthBiasClamp,
+                slope_scaled_depth_bias: r.SlopeScaledDepthBias,
+                depth_clip_enable: r.DepthClipEnable.as_bool(),
+                multisample_enable: r.MultisampleEnable.as_bool(),
+                antialiased_line_enable: r.AntialiasedLineEnable.as_bool(),
+                forced_sample_count: r.ForcedSampleCount,
+                conservative_raster_enable: r.ConservativeRaster.0 != 0,
+            },
+            depth_stencil: m::DepthStencilDesc {
+                depth_enable: d.DepthEnable.as_bool(),
+                depth_write_mask: d.DepthWriteMask.0 != 0,
+                depth_func: d.DepthFunc.0,
+                stencil_enable: d.StencilEnable.as_bool(),
+                stencil_read_mask: d.StencilReadMask,
+                stencil_write_mask: d.StencilWriteMask,
+                front: face(&d.FrontFace),
+                back: face(&d.BackFace),
+            },
+            rtv_formats,
+            num_render_targets: self.targets.NumRenderTargets.min(8),
+            dsv_format: self.depth_format.0,
+            sample_count: self.samples.Count.max(1),
+            primitive_topology_type: self.topology.0,
+            elements: self
+                .inputs
+                .iter()
+                .zip(&self.names)
+                .map(|(e, n)| m::InputElement {
+                    semantic_name: n.to_string_lossy().into_owned(),
+                    semantic_index: e.SemanticIndex,
+                    format: e.Format.0,
+                    input_slot: e.InputSlot,
+                    aligned_byte_offset: e.AlignedByteOffset,
+                    slot_class: e.InputSlotClass.0,
+                    instance_step_rate: e.InstanceDataStepRate,
+                })
+                .collect(),
+        }
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -722,6 +801,9 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
+        // P2: the same pipeline on Metal, made aside and only counted for now.
+        #[cfg(windows)]
+        crate::backend::metal::census_graphics(bound.iter().map(|s| s.shader.clone()).collect(), g.metal_input());
         Some(HostPipeline {
             compute: false,
             mesh: false,

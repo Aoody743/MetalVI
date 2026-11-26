@@ -24,6 +24,14 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// root SRV also tells the host that the buffer views of the whole heap
 /// must be ready when it runs, not only those its tables name.
 pub const SLOT_STRIDES: u8 = 255;
+/// The bits of a [`SLOT_STRIDES`] dword that hold the stride.
+pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
+/// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
+/// (`UINT` or `SINT`), whose 16-bit typed accesses (`_d16`) pass bits.
+/// (After VIctory 4243a96a.)
+pub const VIEW_INTEGER: u32 = 1 << 31;
+/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
+pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
 
@@ -76,12 +84,21 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
 /// that are told the x number alone (the one-dimensional ones).
 pub const USER_GROUP_BASE: u32 = 0x104;
 
+/// `RootType::Other` code of a user-data dword the host sets at a dispatch
+/// counted in threads (the console's `DispatchX`): how many of the threads
+/// numbered along X run (0: all of every group). The metadata's `dword` is
+/// the group's width. Asked for by the structure builder's programs
+/// ([`crate::spill::is_spilled`]).
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
     pub const DOUBLES: u64 = 1 << 2;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// Unordered views in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -451,6 +468,27 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.pixel {
+            // Reading a per-vertex value with attributeAtVertex needs a
+            // constant input, even when the source declaration was smooth.
+            // D3D requires all components packed into the same register to
+            // share a mode, including the ones the shader never reads.
+            for index in 0..self.inputs.len() {
+                let unused = &self.inputs[index];
+                if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
+                    continue;
+                }
+                let mut modes = self.inputs.iter()
+                    .filter(|e| e.row == unused.row && e.usage != 0)
+                    .map(|e| e.interp);
+                if let Some(mode) = modes.next()
+                    && (mode == 1 || unused.comp == 9)
+                    && modes.all(|other| other == mode)
+                {
+                    self.inputs[index].interp = mode;
+                }
+            }
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         // The clean-up, before anything is declared about the code: a
@@ -472,6 +510,12 @@ impl Shader {
                     self.flags &= !flag;
                 }
             }
+        }
+        // Unordered views outside pixel and compute programs (memory by
+        // address), as DXC counts them: ranges declared below, not views
+        // picked from the heap (VIctory a1a2077a).
+        if needs_graphics_uav_flag(self.root_uavs.len(), self.pixel, self.threads.is_some(), self.mesh.is_some(), self.geometry.is_some()) {
+            self.flags |= flags::UAVS_EVERY_STAGE;
         }
         let mut resources = None;
         let mut bindings = Vec::new();
@@ -685,6 +729,11 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        if self.pixel {
+            container::same_mode_per_row(&mut self.inputs, true);
+        } else {
+            container::same_mode_per_row(&mut self.outputs, false);
+        }
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -786,6 +835,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
+        }
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
         }
         if self.flags & flags::STENCIL_REF != 0 {
             features |= 0x200;
@@ -892,5 +944,25 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+fn needs_graphics_uav_flag(uavs: usize, pixel: bool, threads: bool, mesh: bool, geometry: bool) -> bool {
+    let compute = threads && !mesh && !geometry;
+    uavs != 0 && !pixel && !compute
+}
+
+#[cfg(test)]
+mod uav_feature_tests {
+    use super::*;
+
+    #[test]
+    fn root_uavs_require_all_stages_feature_in_vertex_mesh_and_geometry() {
+        assert!(needs_graphics_uav_flag(1, false, false, false, false));
+        assert!(needs_graphics_uav_flag(1, false, true, true, false));
+        assert!(needs_graphics_uav_flag(1, false, false, false, true));
+        assert!(!needs_graphics_uav_flag(1, false, true, false, false));
+        assert!(!needs_graphics_uav_flag(1, true, false, false, false));
+        assert!(!needs_graphics_uav_flag(0, false, false, false, false));
     }
 }

@@ -2978,7 +2978,14 @@ static NTSTATUS
 _MTLResidencySet_addAllocations(void *obj) {
   struct unixcall_mtlresidencyset_addallocations *params = obj;
   id<MTLResidencySet> set = (id<MTLResidencySet>)params->set;
-  [set addAllocations:(id<MTLAllocation> const *)params->allocations.ptr count:params->count];
+  /* victorymetal: only allocations. One object that is not (a sampler
+   * state, say) made the whole call add nothing, and textures reached
+   * through argument buffers then read 0. */
+  id const *in = (id const *)params->allocations.ptr;
+  for (uint64_t i = 0; i < params->count; i++) {
+    if (in[i] && [in[i] conformsToProtocol:@protocol(MTLAllocation)])
+      [set addAllocation:(id<MTLAllocation>)in[i]];
+  }
   return STATUS_SUCCESS;
 }
 

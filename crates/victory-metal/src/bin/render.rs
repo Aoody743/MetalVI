@@ -32,12 +32,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     use victory_metal::render::{ColorAttachment, Render, RenderPipeline};
     use victory_metal::sampler::SamplerDescriptor;
     use victory_metal::texture::TextureDescriptor;
-    use victory_metal::{Buffer, Device, Pool, ResidencySet};
+    use victory_metal::{Buffer, Device, Error, Object, Pool, ResidencySet};
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
 
     const W: u32 = 64;
     const H: u32 = 64;
-    const ROW: u64 = W as u64 * 4;
     const BYTES: usize = (W * H * 4) as usize;
     const HEAP_BYTES: usize = 64 << 10;
     const TEX: u32 = 4; // source texture 4×4
@@ -277,7 +276,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         support_argument_buffers: true,
         ..Default::default()
     })?;
-    let tex_id = src_tex.gpu_resource_id();
+    // Production-style SRV: a texture view over the source texture; the entry
+    // carries the view's gpuResourceID (mirrors victory-gpu metal_texture.rs).
+    let mut view_id = 0u64;
+    let view_handle = unsafe {
+        victory_metal::sys::MTLTexture_newTextureView(
+            src_tex.handle(),
+            victory_metal::sys::WMTPixelFormat::WMTPixelFormatBGRA8Unorm,
+            victory_metal::sys::WMTTextureType::WMTTextureType2D,
+            0,
+            1,
+            0,
+            1,
+            victory_metal::sys::WMTTextureSwizzleChannels {
+                r: victory_metal::sys::WMTTextureSwizzle::WMTTextureSwizzleRed,
+                g: victory_metal::sys::WMTTextureSwizzle::WMTTextureSwizzleGreen,
+                b: victory_metal::sys::WMTTextureSwizzle::WMTTextureSwizzleBlue,
+                a: victory_metal::sys::WMTTextureSwizzle::WMTTextureSwizzleAlpha,
+            },
+            &mut view_id,
+        )
+    };
+    let view = Object::adopt(view_handle).ok_or_else(|| Error("newTextureView failed".into()))?;
+    if view_id == 0 {
+        view_id = view.gpu_resource_id();
+    }
+    let tex_id = view_id;
     let samp_id = sampler.gpu_resource_id();
     if tex_id == 0 || samp_id == 0 {
         return Err(format!("zero gpu resource id (texture {tex_id:#x}, sampler {samp_id:#x})").into());
@@ -290,21 +314,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sheap_buf: Buffer = unsafe { device.wrap(mem_sheap, HEAP_BYTES as u64)? };
 
     // IR enum numbering (metal_irconverter/*.h): point filter 0, clamp 3,
-    // always 8, transparent black 0.
-    let samplers = [StaticSampler {
-        filter: 0,
-        address_u: 3,
-        address_v: 3,
-        address_w: 3,
-        mip_lod_bias: 0.0,
-        max_anisotropy: 1,
-        comparison_func: 8,
-        border_color: 0,
-        min_lod: 0.0,
-        max_lod: 1000.0,
-        shader_register: 0,
-        register_space: 0,
-    }];
+    // always 8, transparent black 0. The load variant passes no sampler.
+    let samplers: [StaticSampler; 0] = [];
     let ps2 = msc::convert(
         &ps_sample_dxil,
         Stage::Fragment,
@@ -347,23 +358,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("  debug top2 bytes: {:?}", &top2.bytes[..top2.bytes.len().min(16)]);
 
     let rt2 = device.new_texture(&rt_desc)?;
-    residency.add(&[src_tex.handle(), rt2.handle(), sampler.handle(), heap_buf.handle(), sheap_buf.handle()]);
+    // The sampler state is not an MTLAllocation: it is in the list on purpose,
+    // as a check that victorymetal skips it (it used to make `addAllocations`
+    // add nothing, and the texture then read 0).
+    residency.add(&[src_tex.handle(), sampler.handle(), rt2.handle(), heap_buf.handle(), sheap_buf.handle()]);
     residency.commit();
 
-    // Expected output: each 16×16 block copies one 4×4 texel.
-    let mut want2 = vec![[0u8; 4]; BYTES / 4];
-    for y in 0..H as usize {
-        for x in 0..W as usize {
-            let tx = (x / 16).min(TEX as usize - 1);
-            let ty = (y / 16).min(TEX as usize - 1);
-            want2[y * W as usize + x] = [
-                (tx * 64) as u8,
-                (ty * 64) as u8,
-                128,
-                255,
-            ];
-        }
-    }
+    // Expected output: the Load variant returns texel (0,0) everywhere
+    // ([B, G, R, A] = [0, 0, 128, 255]).
+    let want2 = vec![[0u8, 0, 128, 255]; BYTES / 4];
 
     let t1 = std::time::Instant::now();
     let cb = queue.command_buffer()?;
@@ -378,6 +381,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         H,
         &[
             Render::Pipeline { pipeline: &pso2 },
+            Render::FragmentTexture { texture: &src_tex, index: 0 },
             Render::FragmentBuffer { buffer: &heap_buf, offset: 0, index: msc::DESCRIPTOR_HEAP_BIND_POINT },
             Render::FragmentBuffer { buffer: &sheap_buf, offset: 0, index: msc::SAMPLER_HEAP_BIND_POINT },
             Render::FragmentBytes { bytes: &top2.bytes, index: msc::ARGUMENT_BUFFER_BIND_POINT },

@@ -83,6 +83,10 @@
 mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
+mod cube_lod_tests;
+#[cfg(all(test, windows))]
+mod quad_edge_tests;
+#[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod intersect_tests;
@@ -114,8 +118,8 @@ pub use lower::{host_max_wave, set_host_f64, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -593,6 +597,12 @@ fn emit_program(
             _ => 0,
         };
     }
+    // (DexNom/VIctory 5f4c3df4.)
+    if native.stage == HwStage::Vs
+        && let Some(psv) = c.part(FourCC::PSV0)
+    {
+        vertex_output_interpolation(psv.data, &mut outputs)?;
+    }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
@@ -660,6 +670,67 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// The title's vertex output interpolation lives in PSV0. A float packed
+/// beside an integer can be explicitly constant, as can a float on its own.
+/// OSG1 supplies the physical rows and columns used to match both tables.
+fn vertex_output_interpolation(
+    mut data: &[u8],
+    outputs: &mut [container::SigElement],
+) -> Result<(), ShaderError> {
+    const TRUNCATED: ShaderError =
+        ShaderError::Malformed("truncated vertex pipeline validation data");
+    fn take<'a>(data: &mut &'a [u8], len: usize) -> Result<&'a [u8], ShaderError> {
+        let (head, tail) = data.split_at_checked(len).ok_or(TRUNCATED)?;
+        *data = tail;
+        Ok(head)
+    }
+    fn size(data: &mut &[u8]) -> Result<usize, ShaderError> {
+        Ok(u32::from_le_bytes(take(data, 4)?.try_into().unwrap()) as usize)
+    }
+    let info_size = size(&mut data)?;
+    let info = take(&mut data, info_size)?;
+    // PSVRuntimeInfo0 has no signature. PSVRuntimeInfo1 and later share
+    // these stage and signature count fields.
+    if info.len() < 36 || info[24] != 1 || info[29] == 0 {
+        return Ok(());
+    }
+    let resources = size(&mut data)?;
+    if resources != 0 {
+        let stride = size(&mut data)?;
+        take(&mut data, resources.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    }
+    let strings = size(&mut data)?;
+    take(&mut data, strings)?;
+    let indices = size(&mut data)?;
+    take(&mut data, indices.checked_mul(4).ok_or(TRUNCATED)?)?;
+    let stride = size(&mut data)?;
+    if stride < 16 {
+        return Err(TRUNCATED);
+    }
+    let count = usize::from(info[28]) + usize::from(info[29]);
+    let elements = take(&mut data, count.checked_mul(stride).ok_or(TRUNCATED)?)?;
+    for record in elements.chunks_exact(stride).skip(usize::from(info[28])) {
+        let packed = record[10];
+        if packed & 0x40 == 0 {
+            continue;
+        }
+        if record[13] > 7 {
+            return Err(ShaderError::Malformed("invalid vertex output interpolation"));
+        }
+        let first = u32::from(record[9]);
+        let rows = first..first + u32::from(record[8]);
+        for output in outputs.iter_mut().filter(|e| {
+            e.row.is_some_and(|r| rows.contains(&r))
+                && e.col == ((packed >> 4) & 3)
+                && e.cols == (packed & 15)
+                && e.kind == record[11]
+        }) {
+            output.interp = record[13];
+        }
+    }
+    Ok(())
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1508,6 +1579,10 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with_inputs(words, input_addr, &[element("TEXCOORD", 0, 0)])
+    }
+
+    fn pixel_with_inputs(words: &[u32], input_addr: u32, inputs: &[container::SigElement]) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1533,7 +1608,7 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let isg1 = container::signature(inputs, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
@@ -1542,6 +1617,25 @@ mod barycentric_tests {
         let io = io::raise(&p, &native)?;
         let st = structure::structure(&p)?;
         emit(&c, &native, &p, &st, &io, &res)
+    }
+
+    #[test]
+    fn an_unused_packed_input_matches_its_provoking_vertex_sibling() {
+        let [e0, e1] = exp_mrt0(3);
+        // v_interp_mov_f32 v3, p0, attr0.z followed by exp mrt0.
+        let words = [0xC80E_0202, e0, e1, 0xBF81_0000];
+        let xy = container::SigElement { cols: 2, ..element("TEXCOORD", 0, 0) };
+        let zw = container::SigElement { col: 2, cols: 2, ..element("NORMAL", 0, 0) };
+        let shader = pixel_with_inputs(&words, PERSP_CENTER, &[xy, zw]).unwrap();
+        let c = Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        for columns in [0x42, 0x62] {
+            let record = [1, 0, columns, 0, 3, 1];
+            assert!(psv.windows(record.len()).any(|w| w == record));
+        }
+        let inputs = c.part(FourCC::ISG1).unwrap().data;
+        assert_eq!((inputs[8 + 25], inputs[8 + 32 + 25]), (0, 4));
+        validate(&shader);
     }
 
     /// The translation's `SFI0` features and `ISG1` rows.
@@ -1562,6 +1656,29 @@ mod barycentric_tests {
             v.validate(&mut shader.dxil.clone()).unwrap();
         }
         let _ = shader;
+    }
+
+    #[test]
+    fn pixel_first_lane_reads_select_the_helper_lanes_value() {
+        let [e0, e1] = exp_mrt0(2);
+        let words = [
+            0x7E00_0500, // v_readfirstlane_b32 s0, v0
+            0x7E04_0200, // v_mov_b32 v2, s0
+            e0, e1, 0xBF81_0000,
+        ];
+        let shader = pixel(&words, PERSP_CENTER).unwrap();
+        let c = Container::parse(&shader.dxil).unwrap();
+        let part = c.part(FourCC::DXIL).unwrap();
+        // The writer uses VBR6 for each ASCII operand in the symbol record.
+        let bits: Vec<_> = part.data.iter().flat_map(|&b| (0..8).map(move |k| (b >> k) & 1)).collect();
+        for op in ["dx.op.isHelperLane.i1", "dx.op.waveReadLaneFirst.i32"] {
+            let name: Vec<_> = op.bytes().flat_map(|b| {
+                let word = u16::from(b & 31) | 32 | (u16::from(b >> 5) << 6);
+                (0..12).map(move |k| ((word >> k) & 1) as u8)
+            }).collect();
+            assert!(bits.windows(name.len()).any(|s| s == name), "{op}");
+        }
+        validate(&shader);
     }
 
     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as

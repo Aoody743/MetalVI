@@ -64,6 +64,31 @@ impl SigElement {
     }
 }
 
+/// Gives the elements of a row whose interpolation mode nothing decided
+/// (float elements, unless `read` and read) the mode the row's other
+/// elements agree on: DXIL wants one mode per row, and the console's
+/// signature, packed by the source's modes, had one (an int or a system
+/// value beside a float means the float was `nointerpolation`).
+/// (After VIctory 13091f6e.)
+pub(crate) fn same_mode_per_row(elements: &mut [SigElement], read: bool) {
+    let free = |e: &SigElement| e.kind == 0 && e.comp == 9 && !(read && e.usage != 0);
+    let mut rows: Vec<u32> = elements.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    for row in rows {
+        let decided = |e: &&SigElement| e.row == Some(row) && !free(e) && e.interp != 0;
+        let mut modes = elements.iter().filter(decided).map(|e| e.interp);
+        let Some(mode) = modes.next() else { continue };
+        if modes.any(|m| m != mode) {
+            continue;
+        }
+        let undecided = |e: &&mut SigElement| e.row == Some(row) && free(e);
+        for e in elements.iter_mut().filter(undecided) {
+            e.interp = mode;
+        }
+    }
+}
+
 /// `ISG1`/`OSG1`: 32-byte rows, then the names.
 pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     let mut out = Vec::new();
@@ -90,7 +115,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -407,6 +432,99 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_vertex_outputs_preserve_name_order_and_declared_interpolation() {
+        let integer = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 2,
+            cols: 2,
+            usage: 3,
+            half: false,
+        };
+        let flat_float = SigElement {
+            name: "COLOR".into(),
+            index: 0,
+            comp: 9,
+            col: 0,
+            ..integer.clone()
+        };
+        let smooth_float = SigElement {
+            index: 2,
+            row: Some(1),
+            interp: 2,
+            comp: 9,
+            ..integer.clone()
+        };
+        let outputs = [integer, flat_float, smooth_float];
+        let mut recovered = super::super::signature(&signature(&outputs, false)).unwrap();
+        // DXC orders the row by semantic-name offset even though TEXCOORD
+        // occupies z/w and COLOR occupies x/y.
+        assert_eq!(recovered[0].name, "TEXCOORD");
+        assert_eq!(recovered[1].name, "COLOR");
+        // PSV records can be in a different order again.
+        let psv = psv(&Psv {
+            stage: 1,
+            flag: false,
+            inputs: &[],
+            outputs: &[outputs[2].clone(), outputs[1].clone(), outputs[0].clone()],
+            prims: &[],
+            mesh: None,
+            geometry: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+        });
+        recovered[1].interp = 2;
+        super::super::vertex_output_interpolation(&psv, &mut recovered).unwrap();
+        assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
+        assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
+            .is_err());
+    }
+
+    fn el(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    /// An unread float beside the front face (constant) takes the row's
+    /// mode; a read float keeps its own in an input signature; a row whose
+    /// decided elements disagree, and other rows, are left alone.
+    #[test]
+    fn a_row_keeps_one_interpolation_mode() {
+        let mut inputs = vec![
+            el("TEXCOORD", 0, 9, 2, 0, 0, 0),
+            el("SV_IsFrontFace", 13, 5, 1, 0, 1, 1),
+            el("TEXCOORD", 0, 9, 2, 1, 0, 1),
+            el("SV_IsFrontFace", 13, 5, 1, 1, 1, 1),
+            el("COLOR", 0, 9, 2, 2, 0, 0),
+            el("COLOR", 0, 4, 1, 2, 1, 1),
+            el("COLOR", 0, 5, 4, 2, 2, 1),
+            el("NORMAL", 0, 9, 2, 3, 0, 1),
+        ];
+        same_mode_per_row(&mut inputs, true);
+        let modes: Vec<u8> = inputs.iter().map(|e| e.interp).collect();
+        assert_eq!(modes, [1, 1, 2, 1, 2, 1, 4, 2]);
+        // Outputs: what is written does not decide.
+        let mut outputs = vec![el("TEXCOORD", 0, 9, 2, 0, 0, 1), el("TEXCOORD", 0, 5, 1, 0, 1, 1)];
+        same_mode_per_row(&mut outputs, false);
+        assert_eq!(outputs.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1]);
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {

@@ -768,7 +768,7 @@ impl State {
     ) -> u32 {
         use victory_shader::emit::{USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         // Set between the parts of a large dispatch (`group_base`).
-        if kind == USER_GROUP_BASE {
+        if kind == USER_GROUP_BASE || kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
             return 0;
         }
         if kind == USER_MEMORY_BASE {
@@ -1879,7 +1879,7 @@ impl State {
     }
 
     /// Runs a dispatch on the host.
-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -1915,9 +1915,26 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        #[cfg(windows)]
-        if crate::backend::metal::mode() == crate::backend::metal::Mode::Compute {
-            if self.metal_dispatch(p, [x, y, z]) {
+        let stage = p.stages[0].translated();
+        let kind = victory_shader::emit::USER_DISPATCH_THREADS_X;
+        let tail_word = compute_word(p, kind);
+        let has_guard = stage.host.user_data.iter().any(|u| u.root == RootType::Other(kind));
+        let metal = crate::backend::metal::mode() == crate::backend::metal::Mode::Compute;
+        let Some(([x, y, z], limit)) = crate::dispatch_dims::plan(
+            [x, y, z], stage.threads, flags, if metal { has_guard } else { tail_word.is_some() },
+        ) else {
+            once!(pipeline = %p.name, "unsupported DispatchX thread dimensions");
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            if crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_off("a DispatchX thread tail could not be represented");
+            }
+            return;
+        };
+        if [x, y, z].contains(&0) {
+            return;
+        }
+        if metal {
+            if self.metal_dispatch(p, [x, y, z], limit) {
                 DISPATCHED.fetch_add(1, Ordering::Relaxed);
             } else {
                 DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1935,6 +1952,11 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        if limit != 0 {
+            let (param, word) = tail_word.expect("supported guarded dispatch");
+            // SAFETY: bind set this pipeline's root signature on the open list.
+            unsafe { list.list.SetComputeRoot32BitConstant(param, limit, word) };
+        }
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -1967,7 +1989,7 @@ impl State {
     /// the list ([`State::metal`]) and run at its submission. False if it
     /// cannot run.
     #[cfg(windows)]
-    fn metal_dispatch(&mut self, p: &crate::pipeline::host::HostPipeline, groups: [u32; 3]) -> bool {
+    fn metal_dispatch(&mut self, p: &crate::pipeline::host::HostPipeline, groups: [u32; 3], limit: u32) -> bool {
         use crate::backend::metal::backend;
         use victory_shader::emit::{USER_DATA_SPACE, USER_GROUP_BASE};
         use crate::backend::metal::{Drop, count};
@@ -1991,6 +2013,7 @@ impl State {
         for u in &host.user_data {
             let v = match u.root {
                 RootType::Other(kind) if kind == USER_GROUP_BASE => 0, // Metal needs no split dispatches
+                RootType::Other(kind) if kind == victory_shader::emit::USER_DISPATCH_THREADS_X => limit,
                 // Metal's one-view tables begin at the title's address itself.
                 RootType::Other(kind) if kind == victory_shader::emit::USER_VIEW_BIAS => 0,
                 RootType::Other(kind)
@@ -2025,7 +2048,7 @@ impl State {
         let mut tables = Vec::new();
         {
             use crate::backend::metal::{RootSlot, root_layout};
-            let mut chunks = m.chunks.lock().unwrap_or_else(|e| e.into_inner());
+            let mut chunks = m.chunks();
             for (i, r) in root_layout(host).into_iter().enumerate() {
                 let slot = match r {
                     RootSlot::Constants(_) => continue,
@@ -2901,9 +2924,13 @@ impl State {
 /// group (`victory_shader::emit::USER_GROUP_BASE`): the root parameter of
 /// its user data and the dword in it.
 fn group_base(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    compute_word(p, victory_shader::emit::USER_GROUP_BASE)
+}
+
+fn compute_word(p: &crate::pipeline::host::HostPipeline, kind: u32) -> Option<(u32, u32)> {
     let stage = p.stages.first().filter(|_| p.compute)?;
     let (param, _) = stage.user_data?;
-    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+    let base = RootType::Other(kind);
     let word = stage.translated().host.user_data.iter().find(|u| u.root == base)?;
     Some((param, word.index))
 }
