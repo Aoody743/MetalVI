@@ -1705,6 +1705,17 @@ fn host_texture(
     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
         d.format = family(d.format);
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        tracing::debug!(
+            width = d.width,
+            height = d.height,
+            console_format = desc.format,
+            format = d.format,
+            flags = d.flags,
+            "host texture created"
+        );
+    }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
     let clear_value = (!clear.is_null()).then(|| {

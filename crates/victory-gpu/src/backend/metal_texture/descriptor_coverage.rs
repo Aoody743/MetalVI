@@ -177,6 +177,7 @@ fn srv(ty: u32, mip: u32, count: u32, slice: u32, slices: u32, clamp: f32) -> [u
             words[7] = slices;
             8
         }
+        4 => 7,
         5 => {
             words[6] = slice;
             words[7] = slices;
@@ -309,6 +310,7 @@ fn gpu_descriptor_coverage() -> std::result::Result<(), Box<dyn std::error::Erro
         {
             println!("PASS {name}");
         } else if !strict
+            && name.starts_with("srv sample level")
             && name.ends_with("clamp")
             && actual
                 .iter()
@@ -520,12 +522,20 @@ fn gpu_descriptor_coverage() -> std::result::Result<(), Box<dyn std::error::Erro
     )?;
     assert!(make_texture_entry(&d3, Some(&uav(8, 1, 1, 2)), true).is_none());
     probe(
-        "uav 3d partial w isolated",
+        "uav 3d partial w slice 0",
         &d3,
         Some(uav(8, 1, 1, 2)),
         14,
-        [0; 4],
-        [0.0; 4],
+        [0, 0, 0, 0],
+        norm(rgba(1, 0, 0, 0, 1)),
+    )?;
+    probe(
+        "uav 3d partial w slice 1",
+        &d3,
+        Some(uav(8, 1, 1, 2)),
+        14,
+        [0, 0, 1, 0],
+        norm(rgba(1, 0, 0, 0, 2)),
     )?;
     probe(
         "uav 3d partial w preserves source",

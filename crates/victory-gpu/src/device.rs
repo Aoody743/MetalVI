@@ -346,14 +346,11 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
+/// Device method 0x1c8 (`SLOT`, `DeserializeGraphicsPipelineStateX`).
+/// The title calls it at `title+0x2477578` as `(this, description, interface
+/// id, out)` to populate its precompiled graphics PSO cache; on `E_NOTIMPL`
+/// (`out` nulled), the lookup at `title+0x24799a7` misses the cache and falls
+/// back to `create_stream` (`0x2b0`) with the full pipeline state stream.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
@@ -363,8 +360,8 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     out: *mut This,
 ) -> HRESULT {
     use std::sync::atomic::{AtomicU32, Ordering};
-    static CALLS: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
-    let calls = CALLS[usize::from(SLOT == 0x218)].fetch_add(1, Ordering::Relaxed) + 1;
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
@@ -438,7 +435,7 @@ static FUNCTIONS: Table<160> = {
     f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::deserialize_compute_x as *const (); // 0x218 DeserializeComputePipelineStateX
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
@@ -583,5 +580,36 @@ mod tests {
         assert_eq!(query(&levels, 0x18), (S_OK, 0xc100));
         assert_eq!(query(&levels, 0x10).0, E_INVALIDARG);
         assert_eq!(query(&levels[4..], 0x18).0, UNSUPPORTED);
+    }
+
+    #[test]
+    fn device_slot_218_dispatches_to_deserialize_compute_x() {
+        use pipeline::deserialize_x::{DeserializedComputeDesc, RawBlob};
+        type DeserializeCompute =
+            extern "system" fn(This, *const DeserializedComputeDesc, *const Iid, *mut This) -> HRESULT;
+        let dev = device();
+        let method = slot::<DeserializeCompute>(dev, 0x218);
+
+        let mut out: This = std::ptr::dangling();
+        assert_eq!(
+            method(dev, std::ptr::null(), std::ptr::null(), &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+
+        let zero_blob = RawBlob {
+            data: std::ptr::null(),
+            size: 0,
+        };
+        let desc = DeserializedComputeDesc {
+            root: std::ptr::null(),
+            state: zero_blob,
+            header: zero_blob,
+            code: zero_blob,
+            aux: zero_blob,
+        };
+        let mut out: This = std::ptr::dangling();
+        assert_eq!(method(dev, &desc, std::ptr::null(), &mut out), E_NOTIMPL);
+        assert!(out.is_null());
     }
 }

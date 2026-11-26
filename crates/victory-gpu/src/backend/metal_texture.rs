@@ -348,12 +348,105 @@ impl MetalBackend {
 
     fn make_entry_or_sink(&self, t: &MetalTexture, words: Option<&[u32]>, unordered: bool) -> Option<(victory_metal::Object, DescriptorEntry)> {
         if let Some(w) = words.filter(|w| unordered && partial_3d_uav(w, t)) {
-            fail("partial 3D UAV W range", Some(&t.desc), Some(w));
-            // An invalid resource ID may fault. Do not share the writeable
-            // sink with unrelated resources or valid null texture entries.
-            return self.allocate_null_texture(Some(w), WMTTextureType::WMTTextureType3D, 1, view_format(t, w[0]));
+            return self.allocate_partial_3d_uav(t, w);
         }
         make_texture_entry(t, words, unordered)
+    }
+
+    /// Staging 3D texture for a partial-W-range 3D UAV: Metal 3D texture views
+    /// can select a mip level but not a depth slice range, so we copy
+    /// `[FirstWSlice .. FirstWSlice + WSize)` of `MipSlice` into a dedicated
+    /// 3D texture of that depth. Writes stay isolated to the staging texture.
+    fn allocate_partial_3d_uav(&self, t: &MetalTexture, w: &[u32]) -> Option<(victory_metal::Object, DescriptorEntry)> {
+        let format = view_format(t, w[0]);
+        let mip = w[2];
+        if mip >= t.mips {
+            fail("partial 3D UAV mip out of range", Some(&t.desc), Some(w));
+            return self.allocate_null_texture(Some(w), WMTTextureType::WMTTextureType3D, 1, format);
+        }
+        let depth = u32::from(t.desc.depth_or_array_size).checked_shr(mip).unwrap_or(0).max(1);
+        let first_w = w[3];
+        if first_w >= depth || w[4] == 0 {
+            fail("partial 3D UAV W range empty", Some(&t.desc), Some(w));
+            return self.allocate_null_texture(Some(w), WMTTextureType::WMTTextureType3D, 1, format);
+        }
+        let w_size = if w[4] == u32::MAX { depth - first_w } else { w[4].min(depth - first_w) };
+        let mw = (t.desc.width as u32 >> mip).max(1);
+        let mh = (t.desc.height >> mip).max(1);
+        let desc = TextureDescriptor {
+            pixel_format: t.pixel,
+            width: mw,
+            height: mh,
+            depth: w_size,
+            array_length: 1,
+            type_: WMTTextureType::WMTTextureType3D,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            usage: WMTTextureUsage(1 | 2 | 0x10),
+            options: sys::WMTResourceOptions(0x20),
+        };
+        let _pool = victory_metal::Pool::new();
+        let staging = match self.device.new_texture(&desc) {
+            Ok(s) => s,
+            Err(_) => {
+                fail("partial 3D UAV staging texture", Some(&t.desc), Some(w));
+                return None;
+            }
+        };
+        let cb = self.queue.command_buffer().ok()?;
+        let mut blit = cb.blit_encoder().ok()?;
+        blit.copy_from_texture_to_texture(
+            &t.texture,
+            0,
+            mip,
+            [0, 0, u64::from(first_w)],
+            [u64::from(mw), u64::from(mh), u64::from(w_size)],
+            &staging,
+            0,
+            0,
+            [0, 0, 0],
+        );
+        blit.finish();
+        cb.commit();
+        cb.wait().ok()?;
+        let chunks = self.chunks();
+        chunks.residency().add(&[staging.handle()]);
+        chunks.residency().commit();
+        if format == t.pixel {
+            let id = staging.gpu_resource_id();
+            if id == 0 {
+                fail("partial 3D UAV staging id", Some(&t.desc), Some(w));
+                return None;
+            }
+            return Some((staging.into_object(), DescriptorEntry::texture(id, 0.0, 0)));
+        }
+        let mut id = 0u64;
+        // SAFETY: `staging` is a live 3D texture with PixelFormatView usage; the view retains it.
+        let view = unsafe {
+            sys::MTLTexture_newTextureView(
+                staging.handle(),
+                format,
+                WMTTextureType::WMTTextureType3D,
+                0,
+                1,
+                0,
+                1,
+                identity(),
+                &mut id,
+            )
+        };
+        let Some(view) = victory_metal::Object::adopt(view) else {
+            fail("partial 3D UAV staging view failed", Some(&t.desc), Some(w));
+            return None;
+        };
+        if id == 0 {
+            id = view.gpu_resource_id();
+        }
+        if id == 0 {
+            fail("partial 3D UAV staging view id", Some(&t.desc), Some(w));
+            return None;
+        }
+        Some((view, DescriptorEntry::texture(id, 0.0, 0)))
     }
 }
 
@@ -371,6 +464,8 @@ fn make_texture_entry(t: &MetalTexture, words: Option<&[u32]>, unordered: bool) 
     };
     let type_ = type_.unwrap_or_else(|| base_type(t));
     let levels = (levels.0.min(t.mips - 1), levels.1.min(t.mips - levels.0.min(t.mips - 1)).max(1));
+    // D3D12 ResourceMinLODClamp is relative to resource mip 0; Metal views rebase mip 0 to levels.0.
+    let min_lod = (min_lod - levels.0 as f32).max(0.0);
     let slices = (slices.0.min(t.slices - 1), slices.1.min(t.slices - slices.0.min(t.slices - 1)).max(1));
     let type_ = view_type(t, type_, slices.1);
     // No swizzle on depth formats (not something to risk an assertion on).

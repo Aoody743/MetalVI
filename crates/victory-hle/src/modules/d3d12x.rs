@@ -52,6 +52,43 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub use victory_gpu::pipeline::{save_pipeline_cache, warm};
 
+/// Summary of an offline Metal Shader Converter warm-up pass.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MetalWarmSummary {
+    pub available: bool,
+    pub converted: usize,
+    pub already_cached: usize,
+    pub failed: usize,
+    pub output_files: usize,
+}
+
+/// Pre-populates `VICTORY_METAL_CACHE` (or `<VICTORY_CACHE_DIR>/metal`) with
+/// `.vmsc` files from the translated `VSH1` entries in `shader_dir`.
+#[cfg(windows)]
+pub fn warm_metal(shader_dir: &std::path::Path, jobs: usize) -> Result<MetalWarmSummary, String> {
+    if !victory_gpu::metal_warm::available() {
+        return Ok(MetalWarmSummary::default());
+    }
+    let report = victory_gpu::metal_warm::warm_shader_cache(
+        shader_dir,
+        victory_gpu::metal_warm::WarmOptions {
+            jobs,
+            limit: None,
+            verify_sample: 0,
+            progress_every: 1000,
+        },
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    Ok(MetalWarmSummary {
+        available: true,
+        converted: report.total_converted(),
+        already_cached: report.total_already_cached(),
+        failed: report.total_failed(),
+        output_files: report.output_files,
+    })
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

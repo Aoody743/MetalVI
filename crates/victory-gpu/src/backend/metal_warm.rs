@@ -151,6 +151,11 @@ fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Whether `victorymetal.dll` is loaded/available for offline MSC warm-up.
+pub fn available() -> bool {
+    victory_metal::sys::available()
+}
+
 /// Converts one decoded [`HostShader`] into its Metal cache `.vmsc` file.
 ///
 /// Callers invoking this from multiple threads must ensure no two threads

@@ -306,11 +306,29 @@ pub fn run(
     Ok(())
 }
 
+fn is_metal_warm(metal_flag: bool, victory_metal_env: Option<&str>) -> bool {
+    metal_flag || victory_metal_env == Some("compute")
+}
+
 /// `victory warm`: fills the caches a run reads (`Command::Warm`).
-pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
+pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, metal: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
     let cfg = victory_core::Config::load()?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let shader_cache_dir = cfg.cache_subdir("shaders")?;
+    let metal_mode = is_metal_warm(metal, std::env::var("VICTORY_METAL").ok().as_deref());
+    if metal_mode {
+        if std::env::var("VICTORY_METAL").as_deref() != Ok("compute") {
+            // SAFETY: called single-threaded before worker threads spawn.
+            unsafe { std::env::set_var("VICTORY_METAL", "compute") };
+        }
+        // Match `victory_gpu::host::Host::new` for Metal mode so cache keys in
+        // `shader_cache::build` (wave 32, no 64-bit image atomics, no
+        // attributeAtVertex) match live Metal runs.
+        victory_shader::emit::set_host_max_wave(32);
+        victory_shader::emit::set_host_image_atomic64(false);
+        victory_shader::emit::set_host_attribute_at_vertex(false);
+    }
+    victory_hle::modules::d3d12x::use_shader_cache(shader_cache_dir.clone());
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
     let seen = Mutex::new(HashSet::new());
     let [done, refused, made, unmade] = [const { AtomicUsize::new(0) }; 4];
@@ -348,8 +366,21 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 _ => None,
                             });
                             let Some(stage) = stage else { continue };
-                            let compute = pipelines && stage == "compute";
-                            let (translated, pipeline) = victory_hle::modules::d3d12x::warm(stage, bytes, compute);
+                            let compute = !metal_mode && pipelines && stage == "compute";
+                            // A translator panic refuses this shader only (it ended
+                            // the whole warm before); the container is kept for a repro.
+                            let (translated, pipeline) = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                victory_hle::modules::d3d12x::warm(stage, bytes, compute)
+                            })) {
+                                Ok(r) => r,
+                                Err(_) => {
+                                    let hash = blake3::hash(bytes);
+                                    let dir = shader_cache_dir.join("panics");
+                                    let _ = std::fs::create_dir_all(&dir);
+                                    let _ = std::fs::write(dir.join(format!("{}.bin", &hash.to_hex()[..16])), bytes);
+                                    (false, None)
+                                }
+                            };
                             let count = if translated { &done } else { &refused };
                             let n = count.fetch_add(1, Ordering::Relaxed) + 1;
                             match pipeline {
@@ -366,15 +397,34 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             });
         }
     }
-    victory_hle::modules::d3d12x::save_pipeline_cache();
+    if !metal_mode {
+        victory_hle::modules::d3d12x::save_pipeline_cache();
+    }
     println!(
-        "warm         {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
+        "warm{}  {} translated, {} refused; {} compute pipelines, {} refused; {:.0} s",
+        if metal_mode { " (metal)" } else { "        " },
         done.into_inner(),
         refused.into_inner(),
         made.into_inner(),
         unmade.into_inner(),
         started.elapsed().as_secs_f64()
     );
+    if metal_mode && pipelines {
+        match victory_hle::modules::d3d12x::warm_metal(&shader_cache_dir, threads) {
+            Ok(summary) if summary.available => {
+                println!(
+                    "warm-metal   {} converted, {} cached, {} failed; {} .vmsc files",
+                    summary.converted, summary.already_cached, summary.failed, summary.output_files
+                );
+            }
+            Ok(_) => {
+                println!("warm-metal   skipped (victorymetal.dll not available; run victory-warm-metal.exe under Wine to populate .vmsc)");
+            }
+            Err(e) => {
+                anyhow::bail!("Metal MSC warm-up failed: {e}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -854,4 +904,20 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::is_metal_warm;
+
+    #[test]
+    fn metal_warm_detects_flag_or_env() {
+        assert!(!is_metal_warm(false, None));
+        assert!(!is_metal_warm(false, Some("0")));
+        assert!(!is_metal_warm(false, Some("off")));
+        assert!(is_metal_warm(true, None));
+        assert!(is_metal_warm(true, Some("0")));
+        assert!(is_metal_warm(false, Some("compute")));
+        assert!(is_metal_warm(true, Some("compute")));
+    }
 }

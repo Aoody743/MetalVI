@@ -66,4 +66,35 @@ export VICTORY_CACHE_DIR="${VICTORY_CACHE_DIR:-$(to_wine_z "$CACHE_UNIX")}"
 export VICTORY_DATA_DIR="${VICTORY_DATA_DIR:-$(to_wine_z "$DATA_UNIX")}"
 unset VICTORY_INPLACE
 
+# Pre-warm Metal shader caches when launching on the Metal path (or when
+# VICTORY_WARM=1/force); with VICTORY_WARM=0 still warns if cache is cold.
+if [[ -f "$SCRIPT_DIR/macos/warm-metal.sh" ]]; then
+  _warm_needed=0
+  if [[ "${VICTORY_WARM:-}" == "0" ]]; then
+    [[ -n "${VICTORY_METAL:-}" && "${VICTORY_METAL:-}" != "0" ]] && _warm_needed=1
+  elif [[ "${VICTORY_WARM:-}" == "1" || "${VICTORY_WARM:-}" == "force" ]]; then
+    _warm_needed=1
+  elif [[ -n "${VICTORY_METAL:-}" && "${VICTORY_METAL:-}" != "0" ]]; then
+    _warm_needed=1
+  fi
+  if [[ "$_warm_needed" == "1" ]]; then
+    _skip_subcmd=0
+    if [[ "${VICTORY_WARM:-}" != "force" ]]; then
+      for _arg in "$@"; do
+        case "$_arg" in
+          warm|inspect|census|config|shader-info|lib-exports|-h|--help|-V|--version)
+            _skip_subcmd=1
+            break
+            ;;
+        esac
+      done
+    fi
+    if [[ "$_skip_subcmd" == "0" ]]; then
+      # shellcheck source=macos/warm-metal.sh
+      source "$SCRIPT_DIR/macos/warm-metal.sh"
+      WINE_ROOT="$WINE_ROOT" metalvi_warm_metal --exe-hint "${1:-}"
+    fi
+  fi
+fi
+
 exec "$WINE_ROOT/bin/wine" "$@"

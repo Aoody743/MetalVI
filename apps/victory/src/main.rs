@@ -86,15 +86,21 @@ enum Command {
         jobs: Option<usize>,
     },
     /// Translate the shaders of a title's archives into the cache and make
-    /// their compute pipelines, so that a run finds them there.
+    /// their compute pipelines (or Metal `.vmsc` files with `--metal` /
+    /// `VICTORY_METAL=compute`), so that a run finds them there.
     Warm {
         paths: Vec<PathBuf>,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
-        /// Only translate: no host pipelines.
+        /// Only translate: no host pipelines (and no Metal `.vmsc` conversion).
         #[arg(long)]
         no_pipelines: bool,
+        /// Warm for the Metal backend (wave 32, no 64-bit image atomics, no
+        /// attributeAtVertex; also warms MSC `.vmsc` output when victorymetal
+        /// is available). Implied by `VICTORY_METAL=compute`.
+        #[arg(long)]
+        metal: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -174,7 +180,12 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Warm { paths, jobs, no_pipelines } => translate::warm(paths, jobs, !no_pipelines),
+        Command::Warm {
+            paths,
+            jobs,
+            no_pipelines,
+            metal,
+        } => translate::warm(paths, jobs, !no_pipelines, metal),
         Command::Run {
             exe,
             unimplemented,

@@ -122,9 +122,10 @@ pub use rect::rect_list_gs;
 pub use shader::{
     ATTR_TABLE_ROWS, ATTR_TABLE_VERTEX_STRIDE, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE,
     SAMPLER_SPACE, SLOT_ATTR_SCRATCH, SLOT_ATTR_TABLE, SLOT_FAULTS, SLOT_MEMORY, SLOT_PRIM_IBO,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_DISPATCH_THREADS_X, USER_GROUP_BASE,
-    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_INTEGER, VIEW_SIGNED,
-    VIEW_STRIDE_BITS, set_view_heap_limit, view_heap_limit,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_WAVE_SCRATCH, USER_DATA_SPACE, USER_DISPATCH_THREADS_X,
+    USER_GROUP_BASE, USER_GROUP_COUNT_X, USER_GROUP_COUNT_Y, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, WAVE_SCRATCH_GROUP_DWORDS,
+    set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -1872,8 +1873,20 @@ mod wave64_lower_tests {
         ]);
         let native = wave64_cs(&words, 1024, 64);
         let shader = emit_wave32(&native, true).expect("emit");
-        let range = psv_wave_range(&shader);
-        assert!(range == (32, 32) || range == (64, 64), "unexpected wave range {range:?}");
+        assert_eq!(psv_wave_range(&shader), (32, 32));
+        assert!(shader.root_uavs.contains(&SLOT_WAVE_SCRATCH));
+        assert!(
+            shader
+                .user_data
+                .iter()
+                .any(|u| u.root == crate::native::RootType::Other(USER_GROUP_COUNT_X))
+        );
+        assert!(
+            shader
+                .user_data
+                .iter()
+                .any(|u| u.root == crate::native::RootType::Other(USER_GROUP_COUNT_Y))
+        );
         // Verify @lds array length in the emitted DXIL bitcode does not exceed 8192 dwords.
         let parsed = Container::parse(&shader.dxil).unwrap();
         let bitcode = parsed.part(FourCC::DXIL).unwrap().data;

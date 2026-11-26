@@ -65,6 +65,15 @@ pub const SLOT_ATTR_TABLE: u8 = 251;
 /// Plan B (F20/F41): VS root UAV scratch table mirroring `Target::Param`
 /// outputs by `SV_VertexID` with the same [`ATTR_TABLE_VERTEX_STRIDE`] layout.
 pub const SLOT_ATTR_SCRATCH: u8 = 250;
+/// Root UAV `u<SLOT_WAVE_SCRATCH>` in [`ROOT_CBV_SPACE`]: per-threadgroup
+/// scratch buffer used by wave64-on-wave32 helpers (`halves`, `half_sync`,
+/// `exchange`) when the shader's own LDS cannot fit them within 32 KiB.
+/// Each threadgroup owns [`WAVE_SCRATCH_GROUP_DWORDS`] dwords.
+pub const SLOT_WAVE_SCRATCH: u8 = 249;
+/// Dwords reserved per threadgroup in [`SLOT_WAVE_SCRATCH`]: 1 for `wave_base`
+/// (`halves`), up to 16 for `half_sync` counters (1024 threads / 64), and
+/// up to 32 for `exchange` slots (rounded up to 64 dwords = 256 bytes).
+pub const WAVE_SCRATCH_GROUP_DWORDS: u32 = 64;
 /// Signature rows reserved per vertex in [`SLOT_ATTR_TABLE`] / [`SLOT_ATTR_SCRATCH`].
 pub const ATTR_TABLE_ROWS: u32 = 32;
 /// Bytes per vertex in [`SLOT_ATTR_TABLE`] / [`SLOT_ATTR_SCRATCH`] (`32 * 4 * 4`).
@@ -104,6 +113,12 @@ pub const USER_GROUP_BASE: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host sets: the X and Y
+/// threadgroup counts of the compute dispatch, used to linearize
+/// `(groupId.x, groupId.y, groupId.z)` into [`SLOT_WAVE_SCRATCH`].
+pub const USER_GROUP_COUNT_X: u32 = 0x107;
+/// See [`USER_GROUP_COUNT_X`].
+pub const USER_GROUP_COUNT_Y: u32 = 0x108;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

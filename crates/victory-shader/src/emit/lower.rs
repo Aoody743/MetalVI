@@ -297,6 +297,11 @@ struct Lower<'a> {
     /// Per-console-wave bounded LDS atomic barrier (`(base_dword, n_waves)`) so two host
     /// halves of one console wave can meet inside per-wave branches and groups > 64 threads.
     half_sync_slot: Option<(u32, u32)>,
+    /// True when wave64-on-wave32 helper scratch (`halves`, `half_sync_slot`, `exchange`)
+    /// does not fit in `@lds` within 8192 dwords and is spilled to [`super::shader::SLOT_WAVE_SCRATCH`].
+    wave_scratch_uav: bool,
+    /// Per-threadgroup base dword in [`super::shader::SLOT_WAVE_SCRATCH`], made in the entry block.
+    wave_scratch_base: Option<V>,
     /// This thread's console wave index (`console_thread >> 6`), made in the entry block.
     cwave: Option<V>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -1357,6 +1362,8 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         // per-console-wave bounded LDS atomic barrier for two host waves of 32
         let mut half_sync_slot: Option<(u32, u32)> = None;
+        // true when wave64-on-wave32 helper scratch is spilled to `SLOT_WAVE_SCRATCH`
+        let mut wave_scratch_uav = false;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1436,19 +1443,33 @@ impl<'a> Lower<'a> {
                             let halves_dwords = u32::from(s.lds_dwords < 8192);
                             let fits_lds =
                                 s.lds_dwords + sync_dwords + exch_dwords + halves_dwords <= 8192;
-                            if fits_lds || LOCAL_WAVES.get() {
+                            let spill_scratch = !fits_lds
+                                && !LOCAL_WAVES.get()
+                                && (use_half_sync || group <= 32);
+                            if fits_lds || spill_scratch || LOCAL_WAVES.get() {
                                 wave = 32;
                                 split_lds = s.lds_dwords > 0 && group > 32;
-                                if fits_lds && sync_dwords > 0 {
-                                    half_sync_slot = Some((s.lds_dwords, n_waves));
-                                    s.lds_dwords += sync_dwords;
-                                }
-                                if crosses {
-                                    let slot = if fits_lds { s.lds_dwords } else { 0 };
-                                    exchange = Some((slot, group <= 32, all));
-                                    if fits_lds {
+                                wave_scratch_uav = spill_scratch;
+                                if fits_lds {
+                                    if sync_dwords > 0 {
+                                        half_sync_slot = Some((s.lds_dwords, n_waves));
+                                        s.lds_dwords += sync_dwords;
+                                    }
+                                    if crosses {
+                                        exchange = Some((s.lds_dwords, group <= 32, all));
                                         s.lds_dwords += exch_dwords;
                                     }
+                                } else if spill_scratch {
+                                    let mut off = 1; // dword 0 reserved for `halves` (`wave_base`)
+                                    if sync_dwords > 0 {
+                                        half_sync_slot = Some((off, n_waves));
+                                        off += sync_dwords;
+                                    }
+                                    if crosses {
+                                        exchange = Some((off, group <= 32, all));
+                                    }
+                                } else if crosses {
+                                    exchange = Some((0, group <= 32, all));
                                 }
                             }
                         }
@@ -1493,10 +1514,14 @@ impl<'a> Lower<'a> {
                     eprintln!("WAVE64-WHY group={group} lds={} [{}]", s.lds_dwords > 0, why.join(", "));
                 }
             }
-            if wave == 32 && x.native.wave64 && s.lds_dwords < 8192 {
-                // console threads go to host waves in the order the waves take them (`wave_base`)
-                halves = Some(s.lds_dwords);
-                s.lds_dwords += 1;
+            if wave == 32 && x.native.wave64 {
+                if wave_scratch_uav {
+                    halves = Some(0);
+                } else if s.lds_dwords < 8192 {
+                    // console threads go to host waves in the order the waves take them (`wave_base`)
+                    halves = Some(s.lds_dwords);
+                    s.lds_dwords += 1;
+                }
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1658,6 +1683,8 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             half_sync_slot,
+            wave_scratch_uav,
+            wave_scratch_base: None,
             cwave: None,
             flat: None,
             no_barrier,
@@ -3891,6 +3918,122 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Per-threadgroup base dword in [`super::shader::SLOT_WAVE_SCRATCH`], made in the entry block.
+    fn wave_scratch_base(&mut self) -> V {
+        if let Some(v) = self.wave_scratch_base {
+            return v;
+        }
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let (zero, one, two) = (self.s.m.i32(0), self.s.m.i32(1), self.s.m.i32(2));
+        let gx = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[zero]);
+        let gy = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[one]);
+        let gz = self.s.op(e, "groupId.i32", Attr::ReadNone, i32t, 94, &[two]);
+        let cx_raw = self.host_word(RootType::Other(super::shader::USER_GROUP_COUNT_X), 0, 0);
+        let cy_raw = self.host_word(RootType::Other(super::shader::USER_GROUP_COUNT_Y), 0, 0);
+        let cx_z = self.s.m.cmp(e, pred::EQ, cx_raw, zero);
+        let cy_z = self.s.m.cmp(e, pred::EQ, cy_raw, zero);
+        let cx = self.s.m.select(e, cx_z, one, cx_raw);
+        let cy = self.s.m.select(e, cy_z, one, cy_raw);
+        let gxy = self.s.m.bin(e, Bin::Mul, gy, cx);
+        let gx_gy = self.s.m.bin(e, Bin::Add, gx, gxy);
+        let cxy = self.s.m.bin(e, Bin::Mul, cx, cy);
+        let gz_cxy = self.s.m.bin(e, Bin::Mul, gz, cxy);
+        let flat_g = self.s.m.bin(e, Bin::Add, gx_gy, gz_cxy);
+        let shift = self.s.m.i32(super::shader::WAVE_SCRATCH_GROUP_DWORDS.trailing_zeros());
+        let base = self.s.m.bin(e, Bin::Shl, flat_g, shift);
+        let _ = self.s.root_uav_handle(super::shader::SLOT_WAVE_SCRATCH);
+        self.wave_scratch_base = Some(base);
+        base
+    }
+
+    fn wave_scratch_byte_offset(&mut self, block: usize, dword_idx: V) -> (V, V) {
+        let base = self.wave_scratch_base();
+        let idx = self.s.m.bin(block, Bin::Add, base, dword_idx);
+        let two = self.s.m.i32(2);
+        let byte_off = self.s.m.bin(block, Bin::Shl, idx, two);
+        let uav = self.s.root_uav_handle(super::shader::SLOT_WAVE_SCRATCH);
+        (uav, byte_off)
+    }
+
+    fn scratch_store(&mut self, block: usize, dword_idx: V, val: V) {
+        if self.wave_scratch_uav {
+            let (uav, byte_off) = self.wave_scratch_byte_offset(block, dword_idx);
+            let code_v = self.s.m.i32(8); // Swap: device-coherent write
+            let iu = self.s.m.undef(self.s.t.i32);
+            self.s.op(
+                block,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                78,
+                &[uav, code_v, byte_off, iu, iu, val],
+            );
+        } else {
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(block, lds, dword_idx);
+            self.s.m.store(block, ptr, val);
+        }
+    }
+
+    fn scratch_load(&mut self, block: usize, dword_idx: V) -> V {
+        if self.wave_scratch_uav {
+            let (uav, byte_off) = self.wave_scratch_byte_offset(block, dword_idx);
+            let code_v = self.s.m.i32(2); // Or with 0: device-coherent read
+            let zero = self.s.m.i32(0);
+            let iu = self.s.m.undef(self.s.t.i32);
+            self.s.op(
+                block,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                78,
+                &[uav, code_v, byte_off, iu, iu, zero],
+            )
+        } else {
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(block, lds, dword_idx);
+            self.s.m.load(block, ptr)
+        }
+    }
+
+    fn scratch_atomic(&mut self, block: usize, op: Rmw, dword_idx: V, val: V) -> V {
+        if self.wave_scratch_uav {
+            let (uav, byte_off) = self.wave_scratch_byte_offset(block, dword_idx);
+            let code = match op {
+                Rmw::Add => 0,
+                Rmw::And => 1,
+                Rmw::Or => 2,
+                _ => unreachable!("unsupported scratch atomic op"),
+            };
+            let code_v = self.s.m.i32(code);
+            let iu = self.s.m.undef(self.s.t.i32);
+            self.s.op(
+                block,
+                "atomicBinOp.i32",
+                Attr::NoUnwind,
+                self.s.t.i32,
+                78,
+                &[uav, code_v, byte_off, iu, iu, val],
+            )
+        } else {
+            let lds = self.s.lds();
+            let ptr = self.s.m.element(block, lds, dword_idx);
+            self.s.m.atomic(block, op, ptr, val)
+        }
+    }
+
+    fn scratch_fence_mode(&self) -> u32 {
+        if self.wave_scratch_uav { 4 | 8 } else { 8 }
+    }
+
+    fn scratch_sync_mode(&self) -> u32 {
+        if self.wave_scratch_uav {
+            meeting_mode() | 4
+        } else {
+            meeting_mode()
+        }
+    }
+
     /// Zeroes per-console-wave `half_sync` slots (and `halves` if present) once in the entry block.
     fn init_half_sync(&mut self) {
         let Some((base, _n_waves)) = self.half_sync_slot else {
@@ -3902,16 +4045,15 @@ impl<'a> Lower<'a> {
         let w = self.s.m.bin(e, Bin::LShr, flat, six);
         let base_v = self.s.m.i32(base);
         let idx = self.s.m.bin(e, Bin::Add, base_v, w);
-        let lds = self.s.lds();
-        let ptr = self.s.m.element(e, lds, idx);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
+        self.scratch_store(e, idx, zero);
         if let Some(hslot) = self.halves {
             let hk = self.s.m.i32(hslot);
-            let hptr = self.s.m.element(e, lds, hk);
-            self.s.m.store(e, hptr, zero);
+            self.scratch_store(e, hk, zero);
         }
-        self.group_sync(e);
+        let mode = self.s.m.i32(self.scratch_sync_mode());
+        let void = self.s.t.void;
+        self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// A console wave64 program in host waves of 32: the first console thread of this host wave
@@ -3925,20 +4067,19 @@ impl<'a> Lower<'a> {
             return Some(v);
         }
         let (e, i32t) = (self.s.entry, self.s.t.i32);
-        let lds = self.s.lds();
         let k = self.s.m.i32(slot);
         let zero = self.s.m.i32(0);
         if self.half_sync_slot.is_none() {
-            let ptr = self.s.m.element(e, lds, k);
-            self.s.m.store(e, ptr, zero);
-            self.group_sync(e);
+            self.scratch_store(e, k, zero);
+            let mode = self.s.m.i32(self.scratch_sync_mode());
+            let void = self.s.t.void;
+            self.s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
         }
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
         let add = self.s.m.select(e, first, k32, zero);
-        let ptr = self.s.m.element(e, lds, k);
-        let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+        let old = self.scratch_atomic(e, Rmw::Add, k, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
@@ -4011,7 +4152,6 @@ impl<'a> Lower<'a> {
         let i32t = self.s.t.i32;
         let i1t = self.s.t.i1;
         let void = self.s.t.void;
-        let lds = self.s.lds();
         let w = if n_waves == 1 {
             self.s.m.i32(0)
         } else {
@@ -4019,7 +4159,7 @@ impl<'a> Lower<'a> {
         };
         let base_v = self.s.m.i32(sync_base);
         let sync_idx = self.s.m.bin(at, Bin::Add, base_v, w);
-        let fence_mode = self.s.m.i32(8); // TGSM memory fence only (no group exec sync bit 1)
+        let fence_mode = self.s.m.i32(self.scratch_fence_mode()); // TGSM (+ UAV when spilled) memory fence only (no group exec sync bit 1)
         self.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[fence_mode]);
 
         let (arr_do, arr_join, spin_hdr, spin_poll, poll_do, poll_join, spin_done) = (
@@ -4038,8 +4178,7 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.s.m.terminate(at, Term::CondBr(is_first, arr_do, arr_join));
 
-        let ptr = self.s.m.element(arr_do, lds, sync_idx);
-        let old = self.s.m.atomic(arr_do, Rmw::Add, ptr, one);
+        let old = self.scratch_atomic(arr_do, Rmw::Add, sync_idx, one);
         self.s.m.terminate(arr_do, Term::Br(arr_join));
 
         let old_phi = self.s.m.phi(arr_join, i32t);
@@ -4066,8 +4205,7 @@ impl<'a> Lower<'a> {
         let is_first_p = self.s.op(spin_poll, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
         self.s.m.terminate(spin_poll, Term::CondBr(is_first_p, poll_do, poll_join));
 
-        let pptr = self.s.m.element(poll_do, lds, sync_idx);
-        let loaded = self.s.m.atomic(poll_do, Rmw::Or, pptr, zero);
+        let loaded = self.scratch_atomic(poll_do, Rmw::Or, sync_idx, zero);
         self.s.m.terminate(poll_do, Term::Br(poll_join));
 
         let lphi = self.s.m.phi(poll_join, i32t);
@@ -4117,16 +4255,12 @@ impl<'a> Lower<'a> {
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
         let index = self.s.m.bin(at, Bin::Add, pair, half);
-        let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        self.scratch_store(at, index, mine);
         let at2 = self.half_sync_at(at);
         let one = self.s.m.i32(1);
         let k1 = self.s.m.bin(at2, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at2, lds, pair);
-        let p1 = self.s.m.element(at2, lds, k1);
-        let lo = self.s.m.load(at2, p0);
-        let hi = self.s.m.load(at2, p1);
+        let lo = self.scratch_load(at2, pair);
+        let hi = self.scratch_load(at2, k1);
         // the slots are written again only after every thread read them
         let at3 = self.half_sync_at(at2);
         (lo, hi, at3)
@@ -8113,13 +8247,10 @@ impl<'a> Lower<'a> {
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
                     let k = self.exchange_pair(slot);
                     let at = self.begin_guarded(Some(is));
-                    let lds = self.s.lds();
-                    let ptr = self.s.m.element(self.cur, lds, k);
-                    self.s.m.store(self.cur, ptr, a);
+                    self.scratch_store(self.cur, k, a);
                     self.end_guarded(at, &[]);
                     let c2 = self.half_sync_at(self.cur);
-                    let ptr = self.s.m.element(c2, lds, k);
-                    let r = self.s.m.load(c2, ptr);
+                    let r = self.scratch_load(c2, k);
                     let _ = self.half_sync_at(c2);
                     return int(self, r);
                 }

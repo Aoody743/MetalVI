@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{
+    self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid,
+};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -597,6 +599,8 @@ pub(crate) extern "system" fn create_compute(
 /// extensions `(desc, extension count, extensions, iid, out)`.
 /// shortcut: the extensions (console shader settings) are ignored, as is
 /// the rest of the description.
+pub(crate) mod deserialize_x;
+
 pub(crate) extern "system" fn create_compute_x(
     this: This,
     desc: *const ComputeHead,
@@ -606,6 +610,99 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Safely copies a caller-supplied blob up to `MAX` bytes for diagnostics.
+fn read_blob<const MAX: usize>(blob: deserialize_x::RawBlob) -> Option<Vec<u8>> {
+    if blob.data.is_null() || blob.size == 0 || blob.size > MAX {
+        return None;
+    }
+    let mut bytes = vec![0u8; blob.size];
+    #[cfg(windows)]
+    {
+        crate::host::read_into(blob.data, &mut bytes).then_some(bytes)
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: non-null caller pointer of `blob.size` bytes.
+        bytes.copy_from_slice(unsafe { std::slice::from_raw_parts(blob.data, blob.size) });
+        Some(bytes)
+    }
+}
+
+/// Device method `0x218` (`ID3D12Device::DeserializeComputePipelineStateX`).
+///
+/// Takes a 72-byte [`deserialize_x::DeserializedComputeDesc`] holding precompiled
+/// console `FSPX` compute sections (hardware state, header, 256-byte-aligned
+/// GFX10 ISA, and auxiliary binding metadata) rather than a DXBC container.
+///
+/// Intentionally returns `E_NOTIMPL` (with `*out = null`) so both the title
+/// (`title+0x247fe25` -> `title+0x247fe66`) and `amd_fidelityfx_upscaler_xbox.dll`
+/// immediately take their built-in fallback to slot `0x1f0`
+/// (`CreateComputePipelineStateX`) with the full DXBC+FSSM container. That
+/// keeps disk shader-cache keys, shader-name filters (`too_dear`,
+/// `without_structures`), and `of_builder` intact.
+pub(crate) extern "system" fn deserialize_compute_x(
+    _: This,
+    desc: *const deserialize_x::DeserializedComputeDesc,
+    _iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // SAFETY: caller provides `desc` and `out` (either may be null).
+    let Some(desc) = (unsafe { deserialize_x::prepare_call(desc, out.cast()) }) else {
+        return E_INVALIDARG;
+    };
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls == 1 {
+        let s = deserialize_x::summarize_deserialized_compute(desc);
+        let state = read_blob::<{ deserialize_x::DESERIALIZED_STATE_SIZE }>(desc.state)
+            .and_then(|b| deserialize_x::parse_compute_state(&b));
+        let aux = read_blob::<0x4000>(desc.aux).and_then(|b| deserialize_x::parse_aux_summary(&b));
+        tracing::info!(
+            calls,
+            has_root = s.has_root,
+            state_size = s.state_size,
+            state_ok = s.state_ok,
+            header_size = s.header_size,
+            header_ok = s.header_ok,
+            code_size = s.code_size,
+            code_aligned = s.code_aligned,
+            aux_size = s.aux_size,
+            aux_records = ?s.aux_record_count,
+            state_tag = ?state.map(|st| st.words[0]),
+            threads = ?state.map(|st| st.threads),
+            vgprs = ?state.map(|st| st.vgprs()),
+            user_sgprs = ?state.map(|st| st.user_sgprs()),
+            lds_bytes = ?state.map(|st| st.lds_bytes()),
+            aux_version = ?aux.map(|a| a.version),
+            aux_payload = ?aux.map(|a| a.payload_size),
+            aux_code_dwords = ?aux.map(|a| a.code_dwords),
+            aux_total = ?aux.map(|a| a.record_count),
+            aux_root = ?aux.map(|a| a.root_records),
+            aux_res = ?aux.map(|a| a.resource_records),
+            aux_hash = ?aux.map(|a| a.hash_records),
+            aux_other = ?aux.map(|a| a.other_records),
+            "DeserializeComputePipelineStateX (0x218): returning E_NOTIMPL so callers fall back to CreateComputePipelineStateX (0x1f0) with full DXBC"
+        );
+    } else if calls.is_power_of_two() {
+        let s = deserialize_x::summarize_deserialized_compute(desc);
+        tracing::debug!(
+            calls,
+            has_root = s.has_root,
+            state_size = s.state_size,
+            state_ok = s.state_ok,
+            header_size = s.header_size,
+            header_ok = s.header_ok,
+            code_size = s.code_size,
+            code_aligned = s.code_aligned,
+            aux_size = s.aux_size,
+            aux_records = ?s.aux_record_count,
+            "DeserializeComputePipelineStateX (0x218) fallback count"
+        );
+    }
+    E_NOTIMPL
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
@@ -863,5 +960,57 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn deserialize_compute_x_validates_zeroes_out_and_triggers_fallback() {
+        use deserialize_x::{
+            DESERIALIZED_HEADER_SIZE, DESERIALIZED_STATE_SIZE, DeserializedComputeDesc, RawBlob,
+        };
+
+        #[repr(align(256))]
+        struct AlignedCode([u8; 0x180]);
+        let code = AlignedCode([0u8; 0x180]);
+        let state = [0u8; DESERIALIZED_STATE_SIZE];
+        let header = [0u8; DESERIALIZED_HEADER_SIZE];
+        let aux = [0u8; 0x118];
+        let desc = DeserializedComputeDesc {
+            root: std::ptr::dangling(),
+            state: RawBlob {
+                data: state.as_ptr(),
+                size: state.len(),
+            },
+            header: RawBlob {
+                data: header.as_ptr(),
+                size: header.len(),
+            },
+            code: RawBlob {
+                data: code.0.as_ptr(),
+                size: code.0.len(),
+            },
+            aux: RawBlob {
+                data: aux.as_ptr(),
+                size: aux.len(),
+            },
+        };
+
+        let mut out: This = std::ptr::dangling();
+        assert_eq!(
+            deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut out),
+            E_NOTIMPL
+        );
+        assert!(out.is_null());
+
+        let mut out: This = std::ptr::dangling();
+        assert_eq!(
+            deserialize_compute_x(std::ptr::null(), std::ptr::null(), &PIPELINE_IIDS[0], &mut out),
+            E_INVALIDARG
+        );
+        assert!(out.is_null());
+
+        assert_eq!(
+            deserialize_compute_x(std::ptr::null(), &desc, &PIPELINE_IIDS[0], std::ptr::null_mut()),
+            E_NOTIMPL
+        );
     }
 }
