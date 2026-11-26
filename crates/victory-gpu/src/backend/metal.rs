@@ -735,6 +735,10 @@ impl MetalBackend {
         if !ok {
             return false;
         }
+        // GPU-written ocean textures back into title memory (F44).
+        if ops.iter().any(|o| matches!(**o, MetalOp::Dispatch(_))) {
+            self.writeback_all(&cb);
+        }
         cb.commit();
         match cb.wait() {
             Ok(()) => true,
