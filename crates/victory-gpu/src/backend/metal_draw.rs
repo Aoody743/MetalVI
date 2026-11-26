@@ -248,6 +248,14 @@ impl MetalBackend {
                 Err(e) => tracing::warn!(error = %e, "Metal: the debug fragment did not compile"),
             }
         }
+        // `VICTORY_METAL_LOG_PIPELINE=<text>`: the colour state of pipelines
+        // whose name contains <text>.
+        if let Ok(want) = std::env::var("VICTORY_METAL_LOG_PIPELINE")
+            && !want.is_empty()
+            && p.name.contains(&want)
+        {
+            tracing::info!(pipeline = %p.name, color0 = ?desc.colors[0], color1 = ?desc.colors[1], "Metal: pipeline colour state");
+        }
         let frag = fragment.as_ref().map(|(l, n)| (l, n.as_str()));
         let make = |desc: &victory_metal::render::RenderPipelineDesc| match (geometry_config, &vertex, &mesh, &stage_in) {
             (Some(cfg), Some((vl, vn)), Some((ml, mn)), Some(sin)) => {
@@ -704,10 +712,24 @@ impl MetalBackend {
                         out.extend_from_slice(&rgb8(format, p));
                     }
                 }
+                // Alpha of 8-bit RGBA/BGRA (the PPM has none): its mean and how
+                // many pixels have any.
+                let alpha = matches!(format, 70 | 71 | 80 | 81).then(|| {
+                    let (mut sum, mut any, mut n) = (0u64, 0u64, 0u64);
+                    for y in (0..h as usize).step_by(7) {
+                        for x in (0..w as usize).step_by(7) {
+                            let a = data[y * row as usize + x * 4 + 3];
+                            sum += u64::from(a);
+                            any += u64::from(a != 0);
+                            n += 1;
+                        }
+                    }
+                    (sum / n.max(1), any * 100 / n.max(1))
+                });
                 let path = std::path::Path::new(&dir).join(format!("{name}.ppm"));
                 let _ = crate::make_dir(std::path::Path::new(&dir));
                 if std::fs::write(&path, out).is_ok() {
-                    tracing::info!(path = %path.display(), "Metal: a render target captured");
+                    tracing::info!(path = %path.display(), alpha = ?alpha, "Metal: a render target captured");
                 }
             }
         }
