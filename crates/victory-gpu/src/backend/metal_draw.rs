@@ -489,6 +489,8 @@ pub(crate) struct MetalClear {
     pub(crate) stencil: Option<u8>,
     /// The depth texture has a stencil plane.
     pub(crate) has_stencil: bool,
+    /// Rectangles to clear (F49); empty: the whole view.
+    pub(crate) rects: Vec<victory_metal::clear_resolve::ClearRect>,
 }
 
 /// Why draws did not go to Metal, counted for the log.

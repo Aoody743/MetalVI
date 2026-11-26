@@ -477,6 +477,30 @@ impl MetalBackend {
                     }
                     i += 1;
                 }
+                MetalOp::Clear(c) if !c.rects.is_empty() => {
+                    // Rectangles: F49's quad-per-rectangle clear.
+                    static CR: OnceLock<Option<victory_metal::clear_resolve::ClearResolve>> = OnceLock::new();
+                    if let Some(cr) = CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device).ok()) {
+                        let target = victory_metal::clear_resolve::ClearTarget {
+                            texture: &c.target.texture,
+                            pixel_format: sys::WMTPixelFormat(c.target.pixel),
+                            level: c.target.level,
+                            slice: c.target.slice,
+                            samples: c.target.samples,
+                        };
+                        let value = match c.color {
+                            Some(v) => victory_metal::clear_resolve::ClearValue::Color(v.map(|x| x as f32)),
+                            None => victory_metal::clear_resolve::ClearValue::DepthStencil { depth: c.depth, stencil: c.stencil },
+                        };
+                        if let Err(e) = cr.clear_rects(&cb, &target, &c.rects, value) {
+                            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                tracing::info!(error = %e, "Metal: a rectangle clear left out");
+                            }
+                        }
+                    }
+                    i += 1;
+                }
                 MetalOp::Clear(c) => {
                     let clear = sys::WMTLoadAction::WMTLoadActionClear;
                     let mut pass = RenderPass { width: c.target.width, height: c.target.height, samples: c.target.samples, ..Default::default() };

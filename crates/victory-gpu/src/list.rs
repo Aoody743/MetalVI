@@ -1304,8 +1304,8 @@ extern "system" fn clear_rtv(
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
         }
-        if crate::backend::metal_draw::draws_on() && rects.is_none() {
-            metal_clear(this, record, false, Some(color.map(f64::from)), None, None);
+        if crate::backend::metal_draw::draws_on() {
+            metal_clear(this, record, false, Some(color.map(f64::from)), None, None, metal_rects(rects));
         }
     }
     #[cfg(not(windows))]
@@ -1322,6 +1322,7 @@ fn metal_clear(
     color: Option<[f64; 4]>,
     depth: Option<f32>,
     stencil: Option<u8>,
+    rects: Vec<victory_metal::clear_resolve::ClearRect>,
 ) {
     use crate::backend::metal_draw::{MetalClear, level_slice};
     let Some(m) = crate::backend::metal::backend() else { return };
@@ -1339,7 +1340,18 @@ fn metal_clear(
         depth,
         stencil,
         has_stencil,
+        rects,
     })));
+}
+
+/// The title's clear rectangles for the Metal clear (empty: the whole view).
+#[cfg(windows)]
+fn metal_rects(rects: Option<&[windows::Win32::Foundation::RECT]>) -> Vec<victory_metal::clear_resolve::ClearRect> {
+    rects
+        .unwrap_or(&[])
+        .iter()
+        .map(|r| victory_metal::clear_resolve::ClearRect { left: r.left, top: r.top, right: r.right, bottom: r.bottom })
+        .collect()
 }
 
 /// `ClearDepthStencilView(handle, flags, depth, stencil, count, rects)`;
@@ -1384,8 +1396,8 @@ extern "system" fn clear_dsv(
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
-        if crate::backend::metal_draw::draws_on() && rects.is_none() && flags & 3 != 0 {
-            metal_clear(this, record, true, None, (flags & 1 != 0).then_some(depth), (flags & 2 != 0).then_some(stencil));
+        if crate::backend::metal_draw::draws_on() && flags & 3 != 0 {
+            metal_clear(this, record, true, None, (flags & 1 != 0).then_some(depth), (flags & 2 != 0).then_some(stencil), metal_rects(rects));
         }
     }
     #[cfg(not(windows))]
