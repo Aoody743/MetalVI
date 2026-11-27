@@ -38,3 +38,6 @@ pub mod metal_copy;
 pub mod metal_render_map;
 #[cfg(windows)]
 pub mod metal_warm;
+// Stage 3: the execution timeline behind the title's queues (opt-in).
+#[cfg(windows)]
+pub mod metal_exec;

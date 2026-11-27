@@ -2032,6 +2032,15 @@ impl ValueWait {
         self.holds_for(u64::from_le_bytes(raw))
     }
 
+    /// The wait as an execution-timeline tag: address, reference, and
+    /// whether it is "at least" (the one comparison a GPU event wait can
+    /// stand for).
+    #[cfg(windows)]
+    pub(crate) fn as_tag(&self) -> (u64, u64, bool) {
+        let reference = if self.wide { self.reference } else { self.reference & 0xFFFF_FFFF };
+        (self.address, reference, self.comparison == 7)
+    }
+
     /// Where the value waited for is: address and bytes.
     #[cfg(windows)]
     pub(crate) fn place(&self) -> (usize, usize) {

@@ -299,6 +299,16 @@ fn complete_checked(
     Ok(())
 }
 
+/// Whether the process-wide fuse has tripped (for the execution timeline).
+pub(crate) fn fuse_tripped() -> bool {
+    fuse::tripped()
+}
+
+/// The measured GPU time per command buffer that trips the fuse.
+pub(crate) fn fuse_limit_ns() -> u64 {
+    fuse::limit_ns()
+}
+
 pub(crate) fn stop_submissions(reason: &'static str) {
     fuse::stop();
     tracing::error!(%reason, "Metal safety stop: submission failed");
