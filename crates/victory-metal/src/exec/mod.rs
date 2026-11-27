@@ -880,7 +880,11 @@ impl Encoder {
             lock(&inner.stats).budget_stalls += 1;
             return false;
         }
-        let ready = self.ready(front);
+        let ready = match self.ready(front) {
+            // Host work cannot carry GPU waits: it waits until they are met.
+            Ready::Now(w) if front_host && !w.is_empty() => Ready::Held,
+            r => r,
+        };
         let gpu_waits = match ready {
             Ready::Now(w) => w,
             Ready::Held => {

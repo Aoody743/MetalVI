@@ -778,3 +778,30 @@ fn host_segments_run_in_order() {
     assert_eq!(t.fence_value(F0), 1);
     assert_eq!(t.stats().host_runs, 1);
 }
+
+/// A host segment whose wait could be a GPU wait (its producer is in
+/// flight) waits on the CPU instead, and sees the producer's result.
+#[test]
+#[ignore = "requires Metal"]
+fn host_segment_waits_on_the_cpu() {
+    let _pool = Pool::new();
+    let g: &'static Gpu = Box::leak(Box::new(Gpu::new()));
+    g.set(0, 1);
+    let spin = g.spin(1_000_000);
+    let t = g.timeline(cfg(false));
+    let memory = Arc::new(AtomicU64::new(0));
+    let mw = memory.clone();
+    t.submit(1, vec![Segment::new("producer", Work::Compute(vec![g.spin_item(&spin, 64, 3), ComputeItem::Barrier, g.spin_item(&spin, 64, 4), ComputeItem::Barrier, g.add(1, 0, 1)]))
+        .write(Some((0x7a9, 5)), move || mw.store(5, Ordering::Release))]).unwrap();
+    let m = memory.clone();
+    t.submit(0, vec![Segment::new("host", Work::Host(Box::new(move || {
+        g.set(3, g.get(1) + 100);
+        true
+    })))
+    .wait_tag(0x7a9, 5, true, Arc::new(move || m.load(Ordering::Acquire) >= 5))]).unwrap();
+    t.drain(SECOND).unwrap();
+    assert_eq!(g.get(3), 102);
+    let s = t.stats();
+    assert_eq!(s.gpu_tag_waits, 0);
+    assert_eq!(s.cpu_held, 1, "{s:?}");
+}
