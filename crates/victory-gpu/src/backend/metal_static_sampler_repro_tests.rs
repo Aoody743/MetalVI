@@ -513,6 +513,10 @@ fn over_window_estimate_runs_alone() { run_order_probe(Some("estimated-time")); 
 #[test]
 fn budget_boundary_preserves_order() { run_order_probe(Some("split-time")); }
 
+#[test]
+#[ignore = "trips process-wide fuse; run alone"]
+fn measured_fuse_stops_batch_before_next_operation() { run_order_probe(Some("measured-time")); }
+
 fn run_order_probe(fault: Option<&'static str>) {
     let dxil = std::fs::read(dxil_dir().expect("F85 DXIL fixtures required").join("cs_order.dxil")).unwrap();
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
@@ -555,6 +559,13 @@ fn run_order_probe(fault: Option<&'static str>) {
     work::FAULT.set(fault);
     if fault == Some("estimated-time") {
         mp.cost_ns.store(work::WINDOW_NS + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if fault == Some("measured-time") {
+        super::fuse::TEST_ONE_NS.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!backend.run(&ops));
+        assert!(backend.submissions_stopped());
+        assert_eq!(unsafe { mem.cast::<u32>().read() }, 1, "only the first dispatch may execute");
+        return;
     }
     if fault == Some("split-time") {
         mp.cost_ns.store(30_000_000, std::sync::atomic::Ordering::Relaxed);

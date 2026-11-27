@@ -97,7 +97,7 @@ vertex float4 vs(uint id [[vertex_id]]) {
         })
         .unwrap();
     let pso = Arc::new(MetalGraphics {
-        cost_ns: Default::default(),
+        cost_ns: 1.into(),
         name: "F76 synthetic depth draw".into(),
         pso,
         dss,
@@ -173,12 +173,16 @@ vertex float4 vs(uint id [[vertex_id]]) {
             rects: Vec::new(),
         }))
     };
+    let splits = || super::work::SPLITS.load(std::sync::atomic::Ordering::Relaxed);
+    let before = splits();
+    let draw = Arc::new(MetalOp::Draw(draw));
     assert!(backend.run(&[
         clear(attachment.clone(), None, Some(0.125)),
         copy(&original, &cleared),
         clear(input_attachment, Some([0.75, 0.0, 0.0, 0.0]), None),
         copy(&input, &original),
-        Arc::new(MetalOp::Draw(draw)),
+        draw.clone(),
+        draw,
         copy(&original, &output),
         Arc::new(MetalOp::Clear(MetalClear {
             target: attachment.clone(),
@@ -195,6 +199,9 @@ vertex float4 vs(uint id [[vertex_id]]) {
         })),
         copy(&original, &input),
     ]));
+    if std::env::var("VICTORY_METAL_PASS_DISPATCHES").as_deref() == Ok("1") {
+        assert_eq!(splits() - before, 8, "each of the nine operations needs its own buffer");
+    }
 
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,

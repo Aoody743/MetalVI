@@ -82,6 +82,48 @@ pub(super) fn prefix(ops: &[Arc<MetalOp>], max_ops: usize) -> usize {
     fit(ops.iter().take(max_ops).map(|op| estimate(op).unwrap_or(WINDOW_NS)))
 }
 
+pub(super) fn trace_ops(batch: u64, ops: &[Arc<MetalOp>]) {
+    if !tracing::enabled!(tracing::Level::DEBUG) { return; }
+    let frame = crate::frame::current();
+    for (op_index, op) in ops.iter().enumerate() {
+        let kind = match &**op {
+            MetalOp::Dispatch(c) => {
+                tracing::debug!(frame, batch, op_index, kind = "dispatch",
+                    pipeline = %c.pso.name, groups = ?c.groups, threads = ?c.pso.threadgroup, "Metal: recorded operation");
+                continue;
+            }
+            MetalOp::DispatchIndirect(c) => {
+                tracing::debug!(frame, batch, op_index, kind = "dispatch indirect",
+                    pipeline = %c.pso.name, threads = ?c.pso.threadgroup, max_records = c.max,
+                    stride = c.stride, counted = c.count.is_some(), "Metal: recorded operation");
+                continue;
+            }
+            MetalOp::Draw(d) => {
+                let (kind, groups, count, instances, max_records) = match &d.kind {
+                    DrawKind::Vertices { count, instances, .. } => ("draw", None, Some(u64::from(*count)), Some(*instances), None),
+                    DrawKind::Indexed { count, instances, .. } => ("draw indexed", None, Some(u64::from(*count)), Some(*instances), None),
+                    DrawKind::Generated { indices, instances, .. } => ("draw generated", None, Some(indices.len() as u64), Some(*instances), None),
+                    DrawKind::Mesh { groups } => ("draw mesh", Some(*groups), None, None, None),
+                    DrawKind::Geometry { draw, .. } => ("draw geometry", Some(draw.groups),
+                        Some(u64::from(u32::from_le_bytes(draw.args[..4].try_into().unwrap()))),
+                        Some(u32::from_le_bytes(draw.args[4..8].try_into().unwrap())), None),
+                    DrawKind::Indirect { max, .. } => ("draw indirect", None, None, None, Some(*max)),
+                };
+                tracing::debug!(frame, batch, op_index, kind, pipeline = %d.pso.name,
+                    ?groups, ?count, ?instances, ?max_records, width = d.targets.width, height = d.targets.height,
+                    layers = 1, samples = d.targets.samples, "Metal: recorded operation");
+                continue;
+            }
+            MetalOp::Clear(_) => "clear",
+            MetalOp::Copy(_) => "texture copy",
+            MetalOp::FloatRowReadback { .. } => "readback",
+            MetalOp::BufferCopy { .. } => "CPU buffer copy",
+            MetalOp::Resolve(_) => "resolve",
+        };
+        tracing::debug!(frame, batch, op_index, kind, "Metal: recorded operation");
+    }
+}
+
 fn fit(costs: impl Iterator<Item = u64>) -> usize {
     let mut used = 0u64;
     costs.enumerate().take_while(|&(i, cost)| {

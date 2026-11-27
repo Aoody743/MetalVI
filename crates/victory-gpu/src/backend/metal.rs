@@ -235,6 +235,7 @@ fn complete_checked(
     label: &'static str,
 ) -> victory_metal::Result<()> {
     let encoded = cb.encoded_work();
+    let command = cb.handle();
     work::report_large(label, encoded);
     let estimated_ns = work::reservation(ops);
     if !fuse::commit_if_open(cb) {
@@ -249,15 +250,15 @@ fn complete_checked(
     drop(watch);
     if let Err(e) = result {
         fuse::stop();
-        tracing::error!(%label, error = %e, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
+        tracing::error!(%label, command, error = %e, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
         return Err(e);
     }
     let gpu_ns = cb.gpu_time_ns();
-    tracing::debug!(%label, ops = ops.len(), estimated_ns, gpu_ns, ?encoded, "Metal: command buffer completed");
+    tracing::debug!(%label, command, ops = ops.len(), estimated_ns, gpu_ns, ?encoded, "Metal: command buffer completed");
     let limit_ns = fuse::limit_ns();
     if (has_work || !ops.is_empty() || encoded != Default::default()) && fuse::unsafe_timing(gpu_ns, limit_ns) {
         fuse::stop();
-        tracing::error!(%label, gpu_ns, limit_ns, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
+        tracing::error!(%label, command, gpu_ns, limit_ns, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
         return Err(victory_metal::Error("Metal safety stop: unsafe GPU duration".into()));
     }
     work::observe(ops, gpu_ns);
@@ -642,6 +643,9 @@ impl MetalBackend {
             }
             return self.run_batch(&ops[start..]);
         }
+        static BATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let batch = BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        work::trace_ops(batch, ops);
         let started = std::time::Instant::now();
         super::metal_texture::drain_remap_partial();
         if !self.flush_uploads() {
@@ -1280,6 +1284,7 @@ impl MetalBackend {
                 // (`split_compute_runs_in_order`).
                 let value = SPLIT_VALUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 cb.encode_signal_event(split_event, value);
+                tracing::debug!(batch, command = cb.handle(), first = cb_start, end = i, reason, "Metal: command buffer operations");
                 let result = submit_checked(&cb, &ops[cb_start..i], true, "bounded pass");
                 work::report(&cb, clamp_counter.take());
                 if let Err(e) = result {
@@ -1308,6 +1313,7 @@ impl MetalBackend {
         let encoded_at = started.elapsed();
         self.commit_residency();
         let committed_at = started.elapsed();
+        tracing::debug!(batch, command = cb.handle(), first = cb_start, end = ops.len(), reason = "batch end", "Metal: command buffer operations");
         let waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
         work::report(&cb, clamp_counter.take());
         let waited_at = started.elapsed();
