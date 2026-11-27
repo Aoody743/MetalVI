@@ -1,5 +1,6 @@
 use crate::backend::metal_draw::DrawKind;
 use super::MetalOp;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -50,8 +51,35 @@ fn profile(op: &MetalOp) -> Option<(&AtomicU64, u64)> {
     Some((cost, units.max(1)))
 }
 
+fn indirect(op: &MetalOp) -> bool {
+    matches!(op, MetalOp::DispatchIndirect(_)) || matches!(op, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }))
+}
+
+/// Indirect operations whose GPU time was measured alone in a command buffer: the
+/// longest such time by pipeline (its `cost_ns` cell's address). An indirect
+/// operation's count comes from the GPU, so no per-unit cost is learnt from it;
+/// without this it kept the bootstrap estimate (a whole window) for ever and ran
+/// alone, waited for, every time: ~3400 of 4150 command buffers of a 3D stall
+/// batch, at ~0.65 ms each (submit-overhead-20261128). The estimate is twice the
+/// longest time seen; the clamp bounds its records and the fuse its measured time.
+/// Off unless `VICTORY_METAL_INDIRECT_LEARN=1`: one run with it
+/// (stage-r-m3c-learn-20261128-041531) halved the stall batches (4225 ops in
+/// 1.16 s against 2.37 s) but stalled elsewhere before 3D; not yet shown better.
+static INDIRECT_MAX_NS: std::sync::Mutex<Option<HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+
+fn indirect_learn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_LEARN").as_deref() == Ok("1"))
+}
+
 fn estimate(op: &MetalOp) -> Option<u64> {
     let (cost, units) = profile(op)?;
+    if indirect(op) {
+        let seen = indirect_learn()
+            .then(|| INDIRECT_MAX_NS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&(std::ptr::from_ref(cost) as usize)).copied())
+            .flatten();
+        return Some(seen.map_or(WINDOW_NS, |ns| ns.saturating_mul(2).max(100_000)));
+    }
     let measured = cost.load(Ordering::Relaxed);
     // Bootstrap only. Neither an estimate nor an observed time is a WCET.
     Some(if measured == 0 { WINDOW_NS } else { units.saturating_mul(measured).max(100_000) })
@@ -64,10 +92,21 @@ pub(super) fn reservation(ops: &[Arc<MetalOp>]) -> u64 {
 
 pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
     let Some((cost, _)) = ops.first().and_then(|op| profile(op)) else { return };
+    // An indirect operation alone in its command buffer: its whole time.
+    if let [op] = ops
+        && indirect(op)
+        && ns != 0
+        && indirect_learn()
+    {
+        let mut map = INDIRECT_MAX_NS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = map.get_or_insert_with(HashMap::new).entry(std::ptr::from_ref(cost) as usize).or_insert(0);
+        *e = (*e).max(ns);
+        return;
+    }
     // Do not attribute a mixed command buffer's time to a particular pipeline,
     // or learn from a GPU argument count that was only a reserved maximum.
     let units = ops.iter().try_fold(0u64, |sum, op| {
-        if matches!(&**op, MetalOp::DispatchIndirect(_)) || matches!(&**op, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. })) {
+        if indirect(op) {
             return None;
         }
         let (key, n) = profile(op)?;
