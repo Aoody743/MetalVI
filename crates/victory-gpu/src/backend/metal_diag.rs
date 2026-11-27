@@ -8,7 +8,7 @@
 //! (`metal_completion::QUEUE`) the report names the operations exactly.
 
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use victory_shader::emit::{DIAG_DWORDS, DIAG_HALF_SYNC_TIMEOUTS, DIAG_LOOP_BUDGET, DIAG_SITES};
+use victory_shader::emit::{DIAG_DWORDS, DIAG_HALF_SYNC_TIMEOUTS, DIAG_LOOP_BUDGET, DIAG_LOOP_DWORDS, DIAG_LOOPS, DIAG_SITES};
 
 /// The mapping of the buffer, once made.
 static PTR: AtomicPtr<u32> = AtomicPtr::new(std::ptr::null_mut());
@@ -90,7 +90,7 @@ pub(crate) fn report(label: &str, command: usize, describe: impl FnOnce() -> Str
     if timeouts != 0 {
         let sites: Vec<String> = counts
             .iter()
-            .filter(|c| c.0 >= DIAG_SITES)
+            .filter(|c| (DIAG_SITES..DIAG_LOOPS).contains(&c.0))
             .map(|&(d, n)| format!("{}:{n}", d - DIAG_SITES))
             .collect();
         let total = HALF_SYNC_TIMEOUTS.fetch_add(u64::from(timeouts), Ordering::Relaxed) + u64::from(timeouts);
@@ -100,7 +100,14 @@ pub(crate) fn report(label: &str, command: usize, describe: impl FnOnce() -> Str
         let total = LOOP_BUDGET_STOPS.fetch_add(u64::from(budget), Ordering::Relaxed) + u64::from(budget);
         let n = BUDGET_REPORTS.fetch_add(1, Ordering::Relaxed);
         if n < 64 || n.is_power_of_two() {
-            tracing::warn!(%label, command, waves = budget, total, %ops, "Metal: a loop budget stopped shader waves");
+            // per loop: index, threads cut, header offset, the header's scalar joins
+            let mut loops = Vec::new();
+            for &(d, n) in counts.iter().filter(|c| c.0 >= DIAG_LOOPS && (c.0 - DIAG_LOOPS) % DIAG_LOOP_DWORDS == 0) {
+                let at = |i: u32| get(d + i);
+                let values: Vec<String> = (2..DIAG_LOOP_DWORDS).map(|i| format!("{:#x}", at(i))).collect();
+                loops.push(format!("loop{}:{n}@{:#x}[{}]", (d - DIAG_LOOPS) / DIAG_LOOP_DWORDS, at(1), values.join(" ")));
+            }
+            tracing::warn!(%label, command, threads = budget, total, loops = %loops.join(","), %ops, "Metal: a loop budget cut shader threads");
         }
     }
 }

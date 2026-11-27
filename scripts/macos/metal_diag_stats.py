@@ -5,7 +5,7 @@ Usage: metal_diag_stats.py <game.log>
 
 Prints half-wave sync timeouts by pipeline and site, and loop-budget stops by
 pipeline, as logged by victory-gpu's backend/metal_diag.rs after each command
-buffer ("Metal: half-wave sync timed out", "Metal: a loop budget stopped").
+buffer ("Metal: half-wave sync timed out", "Metal: a loop budget cut").
 """
 import collections
 import re
@@ -36,6 +36,7 @@ def main(path):
     buffers = collections.Counter()
     budget = collections.Counter()
     budget_lines = 0
+    loops = collections.defaultdict(list)
     with open(path, "rb") as f:
         for raw in f:
             line = ANSI.sub("", raw.decode("utf-8", "replace"))
@@ -48,11 +49,13 @@ def main(path):
                     for s in filter(None, f_.get("sites", "").split(",")):
                         site, count = s.split(":")
                         sites[p][int(site)] += int(count)
-            elif "a loop budget stopped" in line:
+            elif "a loop budget" in line:
                 f_ = fields(line)
                 budget_lines += 1
                 for p in pipelines(f_.get("ops")):
-                    budget[p] += int(f_.get("waves", 0))
+                    budget[p] += int(f_.get("threads", f_.get("waves", 0)))
+                    if f_.get("loops"):
+                        loops[p].append(f_["loops"])
     print(f"half-wave sync timeouts: {sum(timeouts.values())} host waves")
     for p, n in timeouts.most_common():
         top = ", ".join(f"{s}:{c}" for s, c in sorted(sites[p].items()))
@@ -60,6 +63,8 @@ def main(path):
     print(f"loop-budget stops: {sum(budget.values())} waves ({budget_lines} lines logged; the log is rate-limited after 64)")
     for p, n in budget.most_common(20):
         print(f"  {p}: {n}")
+        for rec in loops[p][:3]:
+            print(f"    {rec}")
 
 
 if __name__ == "__main__":

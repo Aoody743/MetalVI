@@ -40,17 +40,33 @@ const BODY: &[u32] = &[
 ];
 
 fn program() -> NativeProgram {
+    program_of(BODY, true)
+}
+
+/// A loop that never meets its exit (s0 = 0): `s20` counts up until it equals s0. The
+/// budget cuts it at 4,096 iterations; each thread stores what s20 reached.
+const RUNAWAY: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xBE94_0380, // s_mov_b32 s20, 0
+    0x8014_8114, // LOOP: s_add_u32 s20, s20, 1
+    0xBF06_0014, // s_cmp_eq_u32 s20, s0
+    0xBF84_FFFD, // s_cbranch_scc0 LOOP
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+];
+
+fn program_of(body: &[u32], wave64: bool) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
         125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
         0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
     ];
-    words.extend_from_slice(BODY);
+    words.extend_from_slice(body);
     words.push(0xBF81_0000); // END: s_endpgm
     NativeProgram {
         stage: HwStage::Cs,
-        wave64: true,
+        wave64,
         vgprs: 72,
         layout: vec![
             NativeRoot { root: RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
@@ -190,4 +206,25 @@ fn a_missing_half_times_out_at_every_other_site() {
             r.timeouts, r.sites, r.ms, base.ms, (r.ms - base.ms) * 1e6 / polls
         );
     }
+}
+
+#[test]
+fn a_loop_cut_by_the_budget_reports_its_header_and_counter() {
+    use victory_shader::emit::{DIAG_LOOP_BUDGET, DIAG_LOOPS};
+    let _pool = victory_metal::Pool::new();
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program_of(RUNAWAY, false)).expect("translate");
+    assert!(shader.root_uavs.contains(&victory_shader::emit::SLOT_DIAG));
+    let backend = MetalBackend::new().unwrap();
+    let r = run(&backend, &shader, 64, 1, 0);
+    let last = diag::LAST.lock().unwrap().clone();
+    eprintln!("REPRO runaway loop: stored {:?}.. diag {last:?}, GPU {:.3} ms", &r.out[..4], r.ms);
+    let get = |d: u32| last.iter().find(|c| c.0 == d).map_or(0, |c| c.1);
+    assert!(r.out.iter().all(|&v| v == 4096), "{:?}", r.out);
+    assert_eq!(get(DIAG_LOOP_BUDGET), 64, "every thread is cut once");
+    assert_eq!(get(DIAG_LOOPS), 64, "all at loop 0");
+    // the header is the s_add after the 4-dword prologue and 2 body dwords
+    assert_eq!(get(DIAG_LOOPS + 1), 6 * 4, "header offset");
+    // s20 as the header joined it on the iteration cut
+    assert_eq!(get(DIAG_LOOPS + 2), 4095, "s20 at the header when cut");
 }

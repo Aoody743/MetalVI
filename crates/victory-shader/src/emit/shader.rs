@@ -76,9 +76,13 @@ pub const SLOT_WAVE_SCRATCH: u8 = 249;
 ///
 /// - dword [`DIAG_HALF_SYNC_TIMEOUTS`]: a host wave that gave up waiting for
 ///   the other half of its console wave (`half_sync` reached its poll limit);
-/// - dword [`DIAG_LOOP_BUDGET`]: a thread a loop budget made leave;
+/// - dword [`DIAG_LOOP_BUDGET`]: a compute thread whose loop the budget cut;
 /// - dword [`DIAG_SITES`] + n: the timeouts at the program's `half_sync` site n
-///   (the last dword takes the sites past it).
+///   (dword [`DIAG_LOOPS`] - 1 takes the sites past it);
+/// - from dword [`DIAG_LOOPS`], [`DIAG_LOOP_DWORDS`] a compute loop (by header, in
+///   IR block order; the last takes the loops past it): the threads the budget cut
+///   there, the header's code offset, then up to [`DIAG_LOOP_VALUES`] scalar values
+///   the header joined on the iteration cut (the last wave's).
 pub const SLOT_DIAG: u8 = 248;
 /// Dwords of the [`SLOT_DIAG`] buffer.
 pub const DIAG_DWORDS: u32 = 1024;
@@ -88,6 +92,14 @@ pub const DIAG_HALF_SYNC_TIMEOUTS: u32 = 0;
 pub const DIAG_LOOP_BUDGET: u32 = 1;
 /// See [`SLOT_DIAG`].
 pub const DIAG_SITES: u32 = 16;
+/// See [`SLOT_DIAG`].
+pub const DIAG_LOOPS: u32 = 256;
+/// See [`SLOT_DIAG`].
+pub const DIAG_LOOP_DWORDS: u32 = 8;
+/// See [`SLOT_DIAG`].
+pub const DIAG_LOOP_VALUES: u32 = DIAG_LOOP_DWORDS - 2;
+/// See [`SLOT_DIAG`].
+pub const DIAG_LOOPS_MAX: u32 = (DIAG_DWORDS - DIAG_LOOPS) / DIAG_LOOP_DWORDS;
 /// Dwords reserved per threadgroup in [`SLOT_WAVE_SCRATCH`]: 1 for `wave_base`
 /// (`halves`), up to 16 for `half_sync` counters (1024 threads / 64), and
 /// up to 32 for `exchange` slots (rounded up to 64 dwords = 256 bytes).
