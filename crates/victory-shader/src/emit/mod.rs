@@ -604,7 +604,9 @@ fn widen(
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
             if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                let mut list: Vec<_> = wide.iter().map(|&b| format!("{b}@{:#x}", p.blocks[b].offset)).collect();
+                list.sort();
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide: {}", wide.len(), list.join(" "));
             }
             return r;
         }

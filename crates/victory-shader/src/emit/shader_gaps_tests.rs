@@ -249,3 +249,51 @@ fn a_buffer_view_read_only_for_its_record_count_gets_the_hosts() {
     lower::TEST_HOST_WAVE.set(was);
     r.expect("the record count from the host view");
 }
+
+/// A loop each lane leaves on its own (`a1bf269d5b19f025`'s counting loops): lane t runs the
+/// body t + 1 times, the latch takes EXEC back to the lanes still counting.
+fn counting_loop() -> NativeProgram {
+    native(
+        &[
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x4A04_0081, // v_add_nc_u32 v2, 1, v0
+            0xBE98_047E, // s_mov_b64 s[24:25], exec
+            0xBE94_047E, // s_mov_b64 s[20:21], exec
+            0xBF82_0001, // s_branch (to the header)
+            0x87FE_1416, // s_and_b64 exec, s[22:23], s[20:21]   (latch)
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1                (header)
+            0xBE96_047E, // s_mov_b64 s[22:23], exec
+            0x7DA4_0501, // v_cmpx_eq_u32 exec, v1, v2
+            0x8994_7E14, // s_andn2_b64 s[20:21], s[20:21], exec
+            0xBF85_FFFA, // s_cbranch_scc1 (to the latch)
+            0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+            0x7E00_0301, // v_mov_b32 v0, v1
+            STORE_V0[0],
+            STORE_V0[1],
+        ],
+        64,
+    )
+}
+
+#[test]
+fn the_body_of_a_loop_lanes_leave_on_their_own_is_not_code_every_lane_runs() {
+    let native = counting_loop();
+    let p = crate::spill::build(&native).expect("ir");
+    let st = structure::structure(&p).expect("structure");
+    let header = p
+        .blocks
+        .iter()
+        .position(|b| b.insts.iter().any(|i| i.name() == "v_cmpx_eq_u32"))
+        .expect("the loop");
+    let branch = (0..p.blocks.len())
+        .find(|&b| {
+            p.blocks[b]
+                .insts
+                .last()
+                .is_some_and(|i| i.name() == "s_cbranch_scc1")
+        })
+        .expect("the loop's branch");
+    // the two halves of a console wave run the header a different number of times: meeting
+    // there needs the loop taken wave-wide
+    assert_eq!(lower::branches_around(&st, &[header]), Some(vec![branch]));
+}
