@@ -798,6 +798,38 @@ fn counted_dispatch_clamp() {
 }
 
 #[test]
+fn trace_counted_dispatch_before_and_after_clamp() {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    let counter = ClampCounter::new(&device).unwrap();
+    let args = Shared::new(&device, &[9, 8, 2, 2, 2, 1]);
+    let count = Shared::new(&device, &[1]);
+    let cb = queue.command_buffer().unwrap();
+    let source = IndirectSource {
+        kind: IndirectKind::Dispatch,
+        records: (&args.0, 0),
+        stride: 12,
+        max_count: 2,
+        count: Some((&count.0, 0)),
+    };
+    let mut batch = translator.encode_bounded_with_trace(&device, &cb, &source, &counter, true).unwrap().unwrap();
+    let trace = batch.take_trace().unwrap();
+    cb.commit();
+    cb.wait().unwrap();
+    let records: Vec<_> = unsafe { trace.completed_records().collect() };
+    assert_eq!(records.len(), 2);
+    assert_eq!((records[0].raw_count, records[0].active), (1, true));
+    assert_eq!(records[0].before, [9, 8, 2, 0, 0]);
+    assert_eq!(records[0].after, [9, 3, 1, 0, 0]);
+    assert_eq!((records[1].raw_count, records[1].active), (1, false));
+    assert_eq!(records[1].before, [0; 5]);
+    assert_eq!(records[1].after, [0; 5]);
+    assert_eq!(unsafe { counter.completed_count() }, 1);
+}
+
+#[test]
 fn counted_draw_clamp() {
     check_work_clamp(IndirectKind::Draw, [300, 4, 7, 9, 3, 1, 0, 2], [128, 4, 7, 9, 0, 3, 1, 0, 2, 0]);
 }

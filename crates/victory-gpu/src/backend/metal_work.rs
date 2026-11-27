@@ -95,7 +95,8 @@ pub(super) fn trace_ops(batch: u64, ops: &[Arc<MetalOp>]) {
             MetalOp::DispatchIndirect(c) => {
                 tracing::debug!(frame, batch, op_index, kind = "dispatch indirect",
                     pipeline = %c.pso.name, threads = ?c.pso.threadgroup, max_records = c.max,
-                    stride = c.stride, counted = c.count.is_some(), "Metal: recorded operation");
+                    stride = c.stride, counted = c.count.is_some(), records_va = c.records_va,
+                    count_va = ?c.count_va, "Metal: recorded operation");
                 continue;
             }
             MetalOp::Draw(d) => {
@@ -132,12 +133,21 @@ fn fit(costs: impl Iterator<Item = u64>) -> usize {
     }).count()
 }
 
-pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>) {
+pub(super) fn trace_indirect(pipeline: &str) -> bool {
+    static FILTER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| std::env::var("VICTORY_METAL_TRACE_INDIRECT").unwrap_or_default()
+        .split(',').map(str::trim).filter(|p| !p.is_empty()).map(str::to_owned).collect())
+        .iter().any(|id| pipeline.contains(id))
+}
+
+pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>,
+    batch: u64, traces: &mut Vec<(usize, victory_metal::indirect::IndirectTrace)>) {
     if let Some(counter) = counter {
         use victory_metal::sys;
         // SAFETY: the buffer is owned; never read GPU output after an error or non-commit.
         if unsafe { sys::MTLCommandBuffer_status(cb.handle()) } != sys::WMTCommandBufferStatus::WMTCommandBufferStatusCompleted {
             tracing::warn!("Metal: no completed indirect clamp count for failed buffer");
+            traces.clear();
             return;
         }
         let records = unsafe { counter.completed_count() };
@@ -145,6 +155,13 @@ pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_
             static CLAMPED: AtomicU64 = AtomicU64::new(0);
             let total = CLAMPED.fetch_add(u64::from(records), Ordering::Relaxed) + u64::from(records);
             tracing::warn!(records, total, "Metal: indirect arguments clamped; not a correctness sample");
+        }
+        for (op_index, trace) in traces.drain(..) {
+            // SAFETY: the owning command buffer completed successfully above.
+            for (record, args) in unsafe { trace.completed_records() }.enumerate() {
+                tracing::debug!(batch, op_index, record, raw_count = args.raw_count, active = args.active,
+                    before = ?args.before, after = ?args.after, "Metal: indirect trace record");
+            }
         }
     }
 }

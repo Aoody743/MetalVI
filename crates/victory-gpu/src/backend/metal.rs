@@ -832,6 +832,7 @@ impl MetalBackend {
         let mut i = 0;
         let mut planned_end = 0;
         let mut clamp_counter = None;
+        let mut indirect_traces = Vec::new();
         let mut ok = true;
         let mut copy_scratch = None;
         let mut readback_scratch: Option<Buffer> = None;
@@ -894,8 +895,11 @@ impl MetalBackend {
                             clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
                         }
                         let Some(counter) = clamp_counter.as_ref() else { return work::reject("indirect counter unavailable") };
-                        match tr.encode_bounded(&self.device, &cb, &source, counter) {
-                            Ok(Some(batch)) => {
+                        match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&c.pso.name)) {
+                            Ok(Some(mut batch)) => {
+                                if let Some(trace) = batch.take_trace() {
+                                    indirect_traces.push((i, trace));
+                                }
                                 let mut steps = Vec::new();
                                 for rec_idx in 0..batch.record_count() {
                                     let Some(rec) = batch.record(rec_idx) else { continue };
@@ -1093,8 +1097,13 @@ impl MetalBackend {
                                     clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
                                 }
                                 let Some(counter) = clamp_counter.as_ref() else { return work::reject("indirect counter unavailable") };
-                                match tr.encode_bounded(&self.device, &cb, &source, counter) {
-                                    Ok(b) => batch = b,
+                                match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&d.pso.name)) {
+                                    Ok(mut b) => {
+                                        if let Some(trace) = b.as_mut().and_then(|batch| batch.take_trace()) {
+                                            indirect_traces.push((j, trace));
+                                        }
+                                        batch = b;
+                                    }
                                     Err(e) => {
                                         tracing::error!(error = %e, "Metal: indirect draw translation failed");
                                         return work::reject("indirect draw translation");
@@ -1286,7 +1295,7 @@ impl MetalBackend {
                 cb.encode_signal_event(split_event, value);
                 tracing::debug!(batch, command = cb.handle(), first = cb_start, end = i, reason, "Metal: command buffer operations");
                 let result = submit_checked(&cb, &ops[cb_start..i], true, "bounded pass");
-                work::report(&cb, clamp_counter.take());
+                work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces);
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "Metal: a bounded command buffer failed");
                     fuse::stop();
@@ -1315,7 +1324,7 @@ impl MetalBackend {
         let committed_at = started.elapsed();
         tracing::debug!(batch, command = cb.handle(), first = cb_start, end = ops.len(), reason = "batch end", "Metal: command buffer operations");
         let waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
-        work::report(&cb, clamp_counter.take());
+        work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces);
         let waited_at = started.elapsed();
         let res = match waited {
             Ok(()) => {

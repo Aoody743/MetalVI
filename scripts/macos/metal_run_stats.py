@@ -42,7 +42,14 @@ def summarize(lines, from_frame=0):
             if op["batch"] != batch:
                 recorded.clear()
                 batch = op["batch"]
+            if "indirect" in op["kind"]:
+                op["indirect_arguments"] = []
             recorded[op["op_index"]] = op
+        elif "Metal: indirect trace record " in line:
+            args = fields(line.partition("Metal: indirect trace record ")[2])
+            op = recorded.get(args.pop("op_index")) if args.pop("batch") == batch else None
+            if op is not None:
+                op["indirect_arguments"].append(args)
         elif "Metal: command buffer operations " in line:
             cb = fields(line.partition("Metal: command buffer operations ")[2])
             pending[cb["command"]] = [
@@ -88,7 +95,8 @@ def summarize(lines, from_frame=0):
         "auxiliary_buffers": auxiliary, "unmatched": dict(unmatched),
         "uncompleted_ranges": len(pending), "fuse_log_lines": fuses, "hang_log_lines": hangs,
         "last_present_report": frame, "last_cache_report": cache,
-        "top_20": [row[2] for row in sorted(top, reverse=True)],
+        "top_20": [{k: v for k, v in row[2].items() if k != "indirect_arguments" or v}
+                   for row in sorted(top, reverse=True)],
     }
 
 

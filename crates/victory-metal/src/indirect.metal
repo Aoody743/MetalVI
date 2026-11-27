@@ -2,11 +2,16 @@
 using namespace metal;
 
 struct Options {
-    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs;
+    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace;
 };
 
 struct Record {
     uint words[5];
+};
+
+struct TraceRecord {
+    uint raw_count, active;
+    Record before, after;
 };
 
 kernel void translate_indirect(device const uint *src [[buffer(0)]],
@@ -15,15 +20,18 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
                                constant Options &opts [[buffer(3)]],
                                device Record *draw_params [[buffer(4)]],
                                device atomic_uint *clamped [[buffer(5)]],
+                               device uint *trace [[buffer(6)]],
                                uint id [[thread_position_in_grid]]) {
     if (id >= opts.max_count) return;
     Record result = {};
-    uint live = opts.has_count ? min(opts.max_count, *count) : opts.max_count;
+    Record original = {};
+    uint raw_count = opts.has_count ? *count : opts.max_count;
+    uint live = min(opts.max_count, raw_count);
     if (id < live) {
         device const uint *args = src + ulong(id) * opts.stride;
         uint words = opts.kind == 0 || opts.kind == 11 ? 4 : (opts.kind == 1 ? 5 : 3);
         for (uint i = 0; i < words; ++i) result.words[i] = args[i];
-        Record original = result;
+        original = result;
         if (opts.kind == 1) {
             uint first = result.words[2];
             if (first >= opts.index_capacity) {
@@ -99,4 +107,7 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
         result = {};
     dst[id] = result;
     if (opts.kind <= 1) draw_params[id] = result;
+    if (opts.trace) {
+        reinterpret_cast<device TraceRecord *>(trace)[id] = {raw_count, uint(id < live), original, result};
+    }
 }

@@ -6,6 +6,7 @@ use crate::{Buffer, CommandBuffer, Compute, ComputePipeline, Device, Error, Resu
 
 const SOURCE: &str = include_str!("indirect.metal");
 const RECORD_BYTES: u64 = 20;
+const TRACE_BYTES: usize = 48;
 // Both Metal and the MSC draw uniform accept 4-byte offsets on Apple silicon.
 const DRAW_PARAMS_BYTES: u64 = 20;
 const THREADS: u64 = 64;
@@ -25,6 +26,36 @@ impl ClampCounter {
     /// All commands using this counter must have completed before reading.
     pub unsafe fn completed_count(&self) -> u32 {
         unsafe { self.1.cast::<u32>().read_volatile() }
+    }
+}
+
+pub struct IndirectTrace {
+    buffer: Buffer,
+    ptr: *mut u8,
+    count: u32,
+}
+
+pub struct IndirectTraceRecord {
+    pub raw_count: u32,
+    pub active: bool,
+    pub before: [u32; 5],
+    pub after: [u32; 5],
+}
+
+impl IndirectTrace {
+    /// # Safety
+    /// The command buffer that wrote this trace must have completed successfully.
+    pub unsafe fn completed_records(&self) -> impl Iterator<Item = IndirectTraceRecord> + '_ {
+        let bytes = unsafe { std::slice::from_raw_parts(self.ptr, self.count as usize * TRACE_BYTES) };
+        bytes.chunks_exact(TRACE_BYTES).map(|bytes| {
+            let word = |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+            IndirectTraceRecord {
+                raw_count: word(0),
+                active: word(1) != 0,
+                before: std::array::from_fn(|i| word(i + 2)),
+                after: std::array::from_fn(|i| word(i + 7)),
+            }
+        })
     }
 }
 
@@ -74,17 +105,21 @@ impl IndirectTranslator {
         command: &CommandBuffer,
         source: &IndirectSource<'_>,
     ) -> Result<Option<IndirectBatch>> {
-        self.encode_impl(device, command, source, None)
+        self.encode_impl(device, command, source, None, false)
     }
 
     pub fn encode_bounded(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter) -> Result<Option<IndirectBatch>> {
+        self.encode_bounded_with_trace(device, command, source, counter, false)
+    }
+
+    pub fn encode_bounded_with_trace(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter, trace: bool) -> Result<Option<IndirectBatch>> {
         if source.max_count > RECORD_LIMIT {
             return Err(Error("indirect record budget exceeded".into()));
         }
-        self.encode_impl(device, command, source, Some(counter))
+        self.encode_impl(device, command, source, Some(counter), trace)
     }
 
-    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>) -> Result<Option<IndirectBatch>> {
+    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>, trace: bool) -> Result<Option<IndirectBatch>> {
         if source.max_count == 0 {
             return Ok(None);
         }
@@ -128,8 +163,9 @@ impl IndirectTranslator {
             rect.map_or(0, |r| r.1),
             if counter.is_some() { GROUPS_PER_RECORD } else { 0 },
             INPUTS_PER_RECORD,
+            u32::from(trace),
         ];
-        let mut options = [0; 36];
+        let mut options = [0; 40];
         for (dst, value) in options.chunks_exact_mut(4).zip(values) {
             dst.copy_from_slice(&value.to_le_bytes());
         }
@@ -137,6 +173,10 @@ impl IndirectTranslator {
         let draw_params = (kind <= 1 || rect.is_some())
             .then(|| device.private_buffer(u64::from(source.max_count) * if rect.is_some() { 48 } else { DRAW_PARAMS_BYTES }))
             .transpose()?;
+        let trace = if trace {
+            let (buffer, ptr) = device.shared_buffer_mapped(&vec![0; source.max_count as usize * TRACE_BYTES])?;
+            Some(IndirectTrace { buffer, ptr, count: source.max_count })
+        } else { None };
         command.compute(&[
             Compute::Pipeline {
                 pipeline: &self.0,
@@ -168,6 +208,7 @@ impl IndirectTranslator {
                 index: 4,
             },
             Compute::Buffer { buffer: counter.map_or(&output, |c| &c.0), offset: 0, index: 5 },
+            Compute::Buffer { buffer: trace.as_ref().map_or(&output, |t| &t.buffer), offset: 0, index: 6 },
             Compute::Dispatch {
                 groups: [u64::from(source.max_count).div_ceil(THREADS), 1, 1],
             },
@@ -177,6 +218,7 @@ impl IndirectTranslator {
             draw_params,
             kind: source.kind,
             count: source.max_count,
+            trace,
         }))
     }
 }
@@ -197,9 +239,13 @@ pub struct IndirectBatch {
     draw_params: Option<Buffer>,
     kind: IndirectKind,
     count: u32,
+    trace: Option<IndirectTrace>,
 }
 
 impl IndirectBatch {
+    pub fn take_trace(&mut self) -> Option<IndirectTrace> {
+        self.trace.take()
+    }
     /// The GPU writes exactly this many records, including inactive records.
     pub fn record_count(&self) -> u32 {
         self.count
