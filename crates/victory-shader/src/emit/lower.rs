@@ -412,13 +412,6 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             LaneExit::Indirect => return None,
         }
     }
-    let loop_regions = std::env::var_os("VICTORY_WAVE_LOOP_REGIONS").is_none_or(|v| v != "0");
-    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (b, s) in succ.iter().enumerate() {
-        for &t in s {
-            preds[t].push(b);
-        }
-    }
     // post-dominators (bitsets; a virtual exit after every End)
     let words = n.div_ceil(64);
     let full = vec![u64::MAX; words];
@@ -459,31 +452,8 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
-        // A lane branch on a cycle (a loop each lane leaves on its own): every block of the
-        // cycle runs as many times as the lane stays, which differs from lane to lane, so the
-        // halves of a console wave split in two host waves would meet there a different number
-        // of times (`a1bf269d5b19f025`'s counting loops with an LDS add, a half-wave sync
-        // before each: the two halves fell out of step, one host wave waited out the poll
-        // limit). Those blocks are in its region too, the branch's own block with them.
-        // (`VICTORY_WAVE_LOOP_REGIONS=0`: not, as before: 78 of the F85 programs change.)
-        let walk = |from: &[usize], next: &[Vec<usize>]| {
-            let mut got = vec![false; n];
-            let mut stack = from.to_vec();
-            while let Some(b) = stack.pop() {
-                if !got[b] {
-                    got[b] = true;
-                    stack.extend(next[b].iter().copied());
-                }
-            }
-            got
-        };
-        let fwd = walk(&succ[d], &succ);
-        if fwd[d] && loop_regions {
-            let back = walk(&[d], &preds);
-            for b in (0..n).filter(|&b| fwd[b] && back[b]) {
-                seen[b] = true;
-            }
-        }
+        // a loop each lane leaves on its own: its whole cycle ([`super::lane_loops`])
+        super::lane_loops::add_cycle(d, &succ, &mut seen);
         regions.push((d, seen));
     }
     Some(regions)
