@@ -488,6 +488,16 @@ FILL(fill_u, uint)
     #[test]
     #[ignore = "requires a private Wine prefix with victorymetal and a real Metal device"]
     fn gpu_texture_writeback_matches_cpu_tile() {
+        round_trip(false);
+    }
+
+    #[test]
+    #[ignore = "requires Metal"]
+    fn checked_upload_and_writeback_same_buffer() {
+        round_trip(true);
+    }
+
+    fn round_trip(upload: bool) {
         use victory_metal::sys::{
             self, WMTResourceOptions, WMTTextureType as Type, WMTTextureUsage,
         };
@@ -509,6 +519,7 @@ FILL(fill_u, uint)
             .unwrap();
         let subresources = [(0, 0), (0, 3), (1, 1)];
         for (side, format) in CASES {
+            if upload && (side, format) != (64, 16) { continue; }
             let d = desc(side, format);
             let (pixel, bytes) = shape(&d).unwrap();
             for swizzle in [Swizzle::SW_4KB_S, Swizzle::LINEAR] {
@@ -582,6 +593,7 @@ FILL(fill_u, uint)
                 let dst = unsafe { device.wrap(pages.0, size as u64) }.unwrap();
                 {
                     let cb = queue.command_buffer().unwrap();
+                    let mut staging = Vec::new();
                     for (i, (c, view)) in plan.copies.iter().zip(&views).enumerate() {
                         let tag = i as u32 + 1;
                         let fill = if format == 36 { &fill_u } else { &fill_f };
@@ -613,13 +625,31 @@ FILL(fill_u, uint)
                                 linear.len(),
                             )
                             .unwrap();
-                        encode_fill(&cb, fill, view, tag, w, h);
+                        if upload {
+                            let pitch = row.next_multiple_of(256);
+                            let mut padded = vec![0u8; pitch * h as usize];
+                            for (src, dst) in linear.chunks_exact(row).zip(padded.chunks_exact_mut(pitch)) {
+                                dst[..row].copy_from_slice(src);
+                            }
+                            staging.push(device.shared_buffer(&padded).unwrap());
+                            let mut blit = cb.blit_encoder().unwrap();
+                            blit.copy_from_buffer_to_texture(staging.last().unwrap(), 0, pitch as u32,
+                                padded.len() as u32, [w.into(), h.into(), 1], view, 0, 0, [0;3]);
+                            blit.finish();
+                        } else {
+                            encode_fill(&cb, fill, view, tag, w, h);
+                        }
                     }
                     tiler
                         .encode(&device, &cb, &texture, &dst, OFFSET as u64, &plan, bytes)
                         .unwrap();
-                    cb.commit();
-                    cb.wait().unwrap();
+                    if upload {
+                        assert!(cb.encoded_work().blit_texels >= 64*64);
+                        super::super::metal::submit_checked(&cb, &[], true, "upload and writeback").unwrap();
+                    } else {
+                        cb.commit();
+                        cb.wait().unwrap();
+                    }
                 }
                 // SAFETY: GPU completion precedes this read; the pages are mapped.
                 let actual = unsafe { core::slice::from_raw_parts(pages.0.cast::<u8>(), size) };
