@@ -3,15 +3,19 @@ use super::MetalOp;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// Count limits, not measured GPU time limits. A vertex/index is a conservative
-// upper bound for a primitive in the ordinary non-amplifying draw paths.
+// Diagnostic thresholds, not admission limits or measured GPU time.
 const GROUPS: u64 = 4096;
 const INPUTS: u64 = 65536;
 pub(super) const WINDOW_NS: u64 = 50_000_000;
-pub(super) fn within_limits(work: victory_metal::EncodedWork) -> bool {
-    work.groups <= GROUPS && work.draw_inputs <= INPUTS &&
-        work.attachment_samples <= 32 * 1024 * 1024 && work.blit_bytes <= 16 * 1024 * 1024 &&
-        work.blit_texels <= 8 * 1024 * 1024 && work.resolve_pixels <= 8 * 1024 * 1024
+pub(super) fn report_large(label: &str, work: victory_metal::EncodedWork) {
+    if work.groups > GROUPS || work.draw_inputs > INPUTS ||
+        work.attachment_samples > 32 * 1024 * 1024 || work.blit_bytes > 16 * 1024 * 1024 ||
+        work.blit_texels > 8 * 1024 * 1024 || work.resolve_pixels > 8 * 1024 * 1024
+    {
+        static LARGE: AtomicU64 = AtomicU64::new(0);
+        let total = LARGE.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(label, ?work, total, "Metal: large encoded workload");
+    }
 }
 pub(super) static REJECTIONS: AtomicU64 = AtomicU64::new(0);
 pub(super) static SPLITS: AtomicU64 = AtomicU64::new(0);
@@ -26,13 +30,6 @@ pub(super) fn reject(reason: &'static str) -> bool {
     let rejected = REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
     tracing::error!(reason, rejected, "Metal: encoding stopped before commit");
     false
-}
-
-#[derive(Default)]
-pub(super) struct Budget {
-    groups: u64,
-    inputs: u64,
-    estimated_ns: u64,
 }
 
 fn profile(op: &MetalOp) -> Option<(&AtomicU64, u64)> {
@@ -62,7 +59,7 @@ fn estimate(op: &MetalOp) -> Option<u64> {
 
 pub(super) fn reservation(ops: &[Arc<MetalOp>]) -> u64 {
     if ops.is_empty() { return WINDOW_NS; }
-    ops.iter().try_fold(0u64, |n, op| Some(n.saturating_add(estimate(op)?))).unwrap_or(WINDOW_NS)
+    ops.iter().fold(0u64, |n, op| n.saturating_add(estimate(op).unwrap_or(WINDOW_NS)))
 }
 
 pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
@@ -79,66 +76,18 @@ pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
     if let Some(n) = units && ns != 0 { cost.store(ns.div_ceil(n), Ordering::Relaxed); }
 }
 
-impl Budget {
-    /// Return the fitting prefix. Never consume the first operation of the next
-    /// buffer; the caller re-evaluates it after the preceding buffer completes.
-    pub(super) fn prefix(ops: &[Arc<MetalOp>]) -> usize {
-        let mut b = Self::default();
-        ops.iter().take_while(|op| {
-            let fits = match &***op {
-                MetalOp::Dispatch(c) => b.charge(c.groups, 0),
-                MetalOp::DispatchIndirect(c) => b.reserve_indirect(c.max, true, false),
-                MetalOp::Draw(d) => b.draw(&d.kind) && match &d.kind {
-                    DrawKind::Indirect { max, index, .. } => b.reserve_indirect(*max,
-                        d.pso.mesh || d.pso.geometry.is_some(), !d.pso.mesh || d.pso.geometry.is_some() || index.is_some()),
-                    _ => true,
-                },
-                _ => true,
-            };
-            fits && b.charge_time(op)
-        }).count()
-    }
-    pub(super) fn charge_time(&mut self, op: &MetalOp) -> bool {
-        self.estimated_ns = self.estimated_ns.saturating_add(estimate(op).unwrap_or(WINDOW_NS));
-        self.estimated_ns <= WINDOW_NS
-    }
-    pub(super) fn reserve_indirect(&mut self, count: u32, groups: bool, inputs: bool) -> bool {
-        use victory_metal::indirect::{GROUPS_PER_RECORD, INPUTS_PER_RECORD, RECORD_LIMIT};
-        let helper = u64::from(count.div_ceil(64));
-        count <= RECORD_LIMIT && self.charge(
-            [helper + u64::from(count) * u64::from(GROUPS_PER_RECORD) * u64::from(groups), 1, 1],
-            u64::from(count) * u64::from(INPUTS_PER_RECORD) * u64::from(inputs),
-        )
-    }
-    pub(super) fn charge(&mut self, dims: [u64; 3], inputs: u64) -> bool {
-        let Some(groups) = dims.into_iter().try_fold(1u64, u64::checked_mul) else { return false };
-        let limit = GROUPS;
-        #[cfg(test)]
-        let limit = if FAULT.get() == Some("one-group") { 1 } else { limit };
-        if dims.into_iter().any(|d| d > limit) || groups > limit - self.groups || inputs > INPUTS - self.inputs {
-            return false;
-        }
-        self.groups += groups;
-        self.inputs += inputs;
-        true
-    }
+/// An over-window operation runs alone. Replan after each completion so
+/// observed costs can inform the next boundary.
+pub(super) fn prefix(ops: &[Arc<MetalOp>], max_ops: usize) -> usize {
+    fit(ops.iter().take(max_ops).map(|op| estimate(op).unwrap_or(WINDOW_NS)))
+}
 
-    pub(super) fn draw(&mut self, kind: &DrawKind) -> bool {
-        match kind {
-            DrawKind::Vertices { count, instances, .. } | DrawKind::Indexed { count, instances, .. } =>
-                self.charge([0; 3], u64::from(*count) * u64::from(*instances)),
-            DrawKind::Generated { indices, instances, .. } =>
-                (indices.len() as u64).checked_mul((*instances).into()).is_some_and(|n| self.charge([0; 3], n)),
-            DrawKind::Mesh { groups } => self.charge(*groups, 0),
-            DrawKind::Geometry { draw, .. } => {
-                let count = u32::from_le_bytes(draw.args[..4].try_into().unwrap());
-                let instances = u32::from_le_bytes(draw.args[4..8].try_into().unwrap());
-                self.charge(draw.groups, u64::from(count) * u64::from(instances))
-            }
-            // GPU-generated arguments require their own reservation and clamp.
-            DrawKind::Indirect { .. } => true,
-        }
-    }
+fn fit(costs: impl Iterator<Item = u64>) -> usize {
+    let mut used = 0u64;
+    costs.enumerate().take_while(|&(i, cost)| {
+        used = used.saturating_add(cost);
+        i == 0 || used <= WINDOW_NS
+    }).count()
 }
 
 pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>) {
@@ -159,13 +108,9 @@ pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_
 }
 
 #[test]
-fn cumulative_direct_limits() {
-    let mut budget = Budget::default();
-    assert!(budget.charge([16, 16, 16], 0));
-    assert!(!budget.charge([1; 3], 0));
-    assert!(!budget.charge([u64::MAX; 3], 1));
-    let draw = |count, instances| DrawKind::Vertices { count, instances, first: 0, first_instance: 0 };
-    assert!(budget.draw(&draw(1024, 64)));
-    assert!(!budget.draw(&draw(1, 1)));
-    assert!(!Budget::default().draw(&draw(u32::MAX, u32::MAX)));
+fn budget_prefix_never_rejects_oversized_first_operation() {
+    assert_eq!(fit(std::iter::empty()), 0);
+    assert_eq!(fit([u64::MAX, 1].into_iter()), 1);
+    assert_eq!(fit([WINDOW_NS / 2, WINDOW_NS / 2, 1].into_iter()), 2);
+    assert_eq!(fit([1, WINDOW_NS + 1].into_iter()), 1);
 }

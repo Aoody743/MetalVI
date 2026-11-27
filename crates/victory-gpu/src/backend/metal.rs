@@ -235,11 +235,8 @@ fn complete_checked(
     label: &'static str,
 ) -> victory_metal::Result<()> {
     let encoded = cb.encoded_work();
-    if !work::within_limits(encoded) {
-        tracing::error!(%label, ?encoded, "Metal: command buffer exceeds physical encoder budget");
-        work::reject("physical encoder budget");
-        return Err(victory_metal::Error("physical encoder budget exceeded".into()));
-    }
+    work::report_large(label, encoded);
+    let estimated_ns = work::reservation(ops);
     if !fuse::commit_if_open(cb) {
         return Err(victory_metal::Error("Metal safety stop already tripped".into()));
     }
@@ -252,19 +249,18 @@ fn complete_checked(
     drop(watch);
     if let Err(e) = result {
         fuse::stop();
-        tracing::error!(%label, error = %e, "Metal safety stop: submission failed");
+        tracing::error!(%label, error = %e, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
         return Err(e);
     }
-    let unsafe_time = if ops.is_empty() {
-        (has_work || encoded != Default::default()) && fuse::check_aux(cb)
-    } else {
-        fuse::check(std::iter::once((cb, 0..ops.len())), ops)
-    };
-    if unsafe_time {
-        tracing::error!(%label, "Metal safety stop: submission failed");
+    let gpu_ns = cb.gpu_time_ns();
+    tracing::debug!(%label, ops = ops.len(), estimated_ns, gpu_ns, ?encoded, "Metal: command buffer completed");
+    let limit_ns = fuse::limit_ns();
+    if (has_work || !ops.is_empty() || encoded != Default::default()) && fuse::unsafe_timing(gpu_ns, limit_ns) {
+        fuse::stop();
+        tracing::error!(%label, gpu_ns, limit_ns, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
         return Err(victory_metal::Error("Metal safety stop: unsafe GPU duration".into()));
     }
-    work::observe(ops, cb.gpu_time_ns());
+    work::observe(ops, gpu_ns);
     Ok(())
 }
 
@@ -780,8 +776,8 @@ impl MetalBackend {
         // submitting the next buffer so a failure or fuse trip cannot leave
         // more of this batch queued. One command buffer of seconds of compute kept the window
         // server from the GPU until macOS's watchdog panicked the machine
-        // (2026-11-27). `VICTORY_METAL_PASS_DISPATCHES` (default 4; 0: one
-        // command buffer per batch, as before).
+        // (2026-11-27). `VICTORY_METAL_PASS_DISPATCHES` defaults to 4;
+        // 1 isolates every operation, 0 leaves only the estimate-based cuts.
         static PASS_DISPATCHES: OnceLock<u32> = OnceLock::new();
         let pass_cap = *PASS_DISPATCHES.get_or_init(|| {
             std::env::var("VICTORY_METAL_PASS_DISPATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
@@ -798,9 +794,6 @@ impl MetalBackend {
         }
         let bounded = pass_cap > 0 && split_event.is_some();
         let pass_dispatches = if bounded { pass_cap } else { u32::MAX };
-        // Keep the earlier completed command buffers and their operation ranges
-        // until the batch finishes.
-        let mut earlier: Vec<(victory_metal::CommandBuffer, std::ops::Range<usize>)> = Vec::new();
         let mut cb_start = 0usize;
         // `VICTORY_METAL_SPLIT=1`: every pass in a command buffer of its own,
         // waited for, so a GPU fault names the pass that made it.
@@ -833,7 +826,6 @@ impl MetalBackend {
             })
         };
         let mut i = 0;
-        let mut budget = work::Budget::default();
         let mut planned_end = 0;
         let mut clamp_counter = None;
         let mut ok = true;
@@ -841,11 +833,8 @@ impl MetalBackend {
         let mut readback_scratch: Option<Buffer> = None;
         while i < ops.len() && ok {
             if i == cb_start {
-                planned_end = i + work::Budget::prefix(&ops[i..]);
-                if planned_end == i {
-                    tracing::error!(at = i, op = ?describe_fault_ops(&ops[i..=i]), "Metal: single operation does not fit an empty buffer");
-                    return work::reject("unbounded or oversized single operation");
-                }
+                let max_ops = if pass_cap == 1 { 1 } else { usize::MAX };
+                planned_end = i + work::prefix(&ops[i..], max_ops);
                 if planned_end < ops.len() && split_event.is_none() {
                     return work::reject("budget split needs an ordering event");
                 }
@@ -861,15 +850,6 @@ impl MetalBackend {
                         if i == planned_end || in_pass >= pass_dispatches {
                             break;
                         }
-                        if fuse::blown(&c.pso) {
-                            i += 1;
-                            continue;
-                        }
-                        if !budget.charge(c.groups, 0) {
-                            tracing::error!(pipeline = %c.pso.name, groups = ?c.groups, "Metal: direct dispatch rejected");
-                            return work::reject("direct dispatch budget");
-                        }
-                        if !budget.charge_time(&ops[i]) { return work::reject("estimated compute time"); }
                         in_pass += 1;
                         if !steps.is_empty() {
                             steps.push(Compute::Barrier);
@@ -890,11 +870,7 @@ impl MetalBackend {
                     ok = encoded("compute pass", cb.compute(&steps), || String::new());
                     depth_sync.colour_may_change();
                 }
-                MetalOp::DispatchIndirect(c) if fuse::blown(&c.pso) => {
-                    i += 1;
-                }
                 MetalOp::DispatchIndirect(c) => {
-                    if !budget.charge_time(&ops[i]) { return work::reject("estimated indirect compute time"); }
                     if c.max > 256 {
                         static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         if LARGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -910,9 +886,6 @@ impl MetalBackend {
                             max_count: c.max,
                             count: c.count.as_ref().map(|(b, o)| (b, *o)),
                         };
-                        if !budget.reserve_indirect(c.max, true, false) {
-                            return work::reject("indirect dispatch budget");
-                        }
                         if clamp_counter.is_none() {
                             clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
                         }
@@ -1085,10 +1058,6 @@ impl MetalBackend {
                             if j == planned_end || !d.targets.same(&t) {
                                 break;
                             }
-                            if !budget.draw(&d.kind) {
-                                return work::reject("direct draw budget");
-                            }
-                            if !budget.charge_time(&ops[j]) { return work::reject("estimated draw time"); }
                             let mut batch = None;
                             if let DrawKind::Indirect { records, records_offset, stride, max, count, index, .. } = &d.kind {
                                 let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok())
@@ -1116,9 +1085,6 @@ impl MetalBackend {
                                     max_count: *max,
                                     count: count.as_ref().map(|(b, o)| (b, *o)),
                                 };
-                                if !budget.reserve_indirect(*max, d.pso.mesh || d.pso.geometry.is_some(), !d.pso.mesh || d.pso.geometry.is_some() || index.is_some()) {
-                                    return work::reject("indirect draw budget");
-                                }
                                 if clamp_counter.is_none() {
                                     clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
                                 }
@@ -1292,30 +1258,21 @@ impl MetalBackend {
                     }
                 }
             }
-            let budget_cut = i == planned_end && i < ops.len();
-            if split && ok && !budget_cut {
-                let result = submit_checked(&cb, &ops[group_start..i], true, "split pass");
-                work::report(&cb, clamp_counter.take());
-                if let Err(e) = result {
-                    depth_sync.colour_may_change();
-                    let what = describe_fault_ops(&ops[group_start..i]);
-                    // SAFETY: a live device.
-                    let allocated = unsafe { sys::MTLDevice_currentAllocatedSize(self.device.handle()) } >> 20;
-                    // SAFETY: a live device.
-                    let recommended = unsafe { sys::MTLDevice_recommendedMaxWorkingSetSize(self.device.handle()) } >> 20;
-                    tracing::warn!(ops = i - group_start, first = ?what, allocated_mb = allocated, recommended_mb = recommended, error = %e, "Metal: a pass failed on the GPU (split)");
-                    fuse::stop();
-                    return false;
-                }
-                let Ok(next) = self.queue.command_buffer() else { return false };
-                cb = next;
-                budget = work::Budget::default();
-                cb_start = i;
-            } else if let Some(split_event) = split_event
-                && ok
-                && i < ops.len()
-                && (budget_cut || (bounded && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))))
-            {
+            let cut = if pass_cap == 1 {
+                Some("single operation")
+            } else if i == planned_end {
+                Some("estimated time")
+            } else if split {
+                Some("diagnostic pass")
+            } else if bounded && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_)) {
+                Some("compute pass")
+            } else {
+                None
+            };
+            if ok && i < ops.len() && let Some(reason) = cut {
+                let Some(split_event) = split_event else {
+                    return work::reject("split event unavailable");
+                };
                 // The next command buffer waits for this one to finish: the
                 // queue starts them in order but does not order their memory
                 // (views reach title memory by GPU address, untracked), so
@@ -1332,12 +1289,9 @@ impl MetalBackend {
                 }
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
-                if budget_cut {
-                    let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    tracing::info!(total, ops = i - cb_start, "Metal: budget split");
-                }
-                earlier.push((std::mem::replace(&mut cb, next), cb_start..i));
-                budget = work::Budget::default();
+                let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                tracing::info!(total, reason, ops = i - cb_start, "Metal: command buffer split");
+                cb = next;
                 cb_start = i;
             }
         }
@@ -1354,27 +1308,8 @@ impl MetalBackend {
         let encoded_at = started.elapsed();
         self.commit_residency();
         let committed_at = started.elapsed();
-        let mut waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
+        let waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
         work::report(&cb, clamp_counter.take());
-        // The queue ran the earlier ones before it: done; a fault in one is
-        // this batch's fault.
-        for (e, _) in &earlier {
-            if let Err(err) = e.wait()
-                && waited.is_ok()
-            {
-                waited = Err(err);
-            }
-        }
-        if waited.is_err() {
-            fuse::stop();
-        }
-        // The fuse: a command buffer that kept the GPU too long has its
-        // compute pipelines left out from now on (`fuse`).
-        if waited.is_ok()
-            && fuse::check(earlier.iter().map(|(c, r)| (c, r.clone())).chain(std::iter::once((&cb, cb_start..ops.len()))), ops)
-        {
-            return false;
-        }
         let waited_at = started.elapsed();
         let res = match waited {
             Ok(()) => {
@@ -2281,7 +2216,7 @@ mod inflight {
         }
     }
 
-    fn describe(ops: &[Arc<MetalOp>]) -> String {
+    pub(super) fn describe(ops: &[Arc<MetalOp>]) -> String {
         let mut names: Vec<(String, u32)> = Vec::new();
         for op in ops {
             let name = match &**op {
@@ -2368,12 +2303,9 @@ mod inflight {
 /// after completion and cannot interrupt an already running command buffer.
 static STOPPED_ENDPOINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 mod fuse {
-    use super::{MetalCompute, MetalOp};
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Mutex, OnceLock};
 
-    static BLOWN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
     static TRIPPED: AtomicBool = AtomicBool::new(false);
     static COMMIT: Mutex<()> = Mutex::new(());
 
@@ -2393,7 +2325,7 @@ mod fuse {
         TRIPPED.store(true, Ordering::Release);
     }
 
-    fn limit_ns() -> u64 {
+    pub(super) fn limit_ns() -> u64 {
         #[cfg(test)]
         if TEST_ONE_NS.load(Ordering::Relaxed) { return 1; }
         static MS: OnceLock<u64> = OnceLock::new();
@@ -2402,56 +2334,8 @@ mod fuse {
     #[cfg(test)]
     pub(super) static TEST_ONE_NS: AtomicBool = AtomicBool::new(false);
 
-    fn unsafe_timing(ns: u64, limit: u64) -> bool {
+    pub(super) fn unsafe_timing(ns: u64, limit: u64) -> bool {
         limit != 0 && (ns == 0 || ns > limit)
-    }
-
-    pub(super) fn check_aux(cb: &victory_metal::CommandBuffer) -> bool {
-        let limit = limit_ns();
-        let ns = cb.gpu_time_ns();
-        if !unsafe_timing(ns, limit) {
-            return false;
-        }
-        stop();
-        tracing::warn!(gpu_ms = ns / 1_000_000, limit_ms = limit / 1_000_000, "Metal: missing or excessive GPU time; stopping subsequent submissions");
-        true
-    }
-
-    pub(super) fn blown(p: &Arc<MetalCompute>) -> bool {
-        BLOWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(Arc::as_ptr(p) as usize)))
-    }
-
-    pub(super) fn check<'a>(cbs: impl Iterator<Item = (&'a victory_metal::CommandBuffer, std::ops::Range<usize>)>, ops: &[Arc<MetalOp>]) -> bool {
-        let limit = limit_ns();
-        if limit == 0 {
-            return false;
-        }
-        let mut exceeded = false;
-        for (cb, range) in cbs {
-            if range.is_empty() {
-                continue;
-            }
-            let ns = cb.gpu_time_ns();
-            if !unsafe_timing(ns, limit) {
-                continue;
-            }
-            exceeded = true;
-            stop();
-            tracing::warn!(gpu_ms = ns / 1_000_000, limit_ms = limit / 1_000_000, "Metal: missing or excessive GPU time; stopping subsequent submissions");
-            let mut set = BLOWN.lock().unwrap_or_else(|e| e.into_inner());
-            let set = set.get_or_insert_with(HashSet::new);
-            for op in ops.get(range).unwrap_or(&[]) {
-                let p = match &**op {
-                    MetalOp::Dispatch(c) => &c.pso,
-                    MetalOp::DispatchIndirect(c) => &c.pso,
-                    _ => continue,
-                };
-                if set.insert(Arc::as_ptr(p) as usize) {
-                    tracing::warn!(pipeline = %p.name, gpu_ms = ns / 1_000_000, "Metal: a command buffer kept the GPU too long: this compute pipeline no longer runs (VICTORY_METAL_FUSE_MS)");
-                }
-            }
-        }
-        exceeded
     }
 
     #[cfg(test)]

@@ -461,8 +461,38 @@ fn exhausted_ring_stops_submission() { run_order_probe(Some("ring")); }
 fn missing_event_stops_submission() { run_order_probe(Some("event")); }
 
 #[test]
-#[ignore = "trips process-wide fuse; run alone"]
-fn direct_budget_stops_submission() { run_order_probe(Some("one-group")); }
+fn large_direct_dispatch_is_not_rejected() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    const GROUPS: u64 = 4097;
+    const BYTES: usize = 32 * 1024;
+    let _pool = victory_metal::Pool::new();
+    let backend = MetalBackend::new().unwrap();
+    let ptr = unsafe { VirtualAlloc(std::ptr::null(), BYTES, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    assert!(!ptr.is_null());
+    let dst = unsafe { backend.device.wrap(ptr, BYTES as u64) }.unwrap();
+    let pipeline = backend.device.compute_pipeline_msl(
+        "#include <metal_stdlib>\nusing namespace metal;\n\
+         kernel void mark(device uint *dst [[buffer(0)]], uint3 id [[threadgroup_position_in_grid]]) { dst[id.x] = id.x + 1; }",
+        "mark",
+    ).unwrap();
+    let cb = backend.queue.command_buffer().unwrap();
+    cb.compute(&[
+        victory_metal::Compute::Pipeline { pipeline: &pipeline, threads_per_group: [1; 3] },
+        victory_metal::Compute::Buffer { buffer: &dst, offset: 0, index: 0 },
+        victory_metal::Compute::Dispatch { groups: [GROUPS, 1, 1] },
+    ]).unwrap();
+    assert_eq!(cb.encoded_work().groups, GROUPS);
+    submit_checked(&cb, &[], true, "large direct test").unwrap();
+    // SAFETY: the mapped buffer is live and its sole GPU writer has completed.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), GROUPS as usize * 4) };
+    assert!(bytes.chunks_exact(4).enumerate().all(|(i, value)| {
+        u32::from_ne_bytes(value.try_into().unwrap()) == i as u32 + 1
+    }));
+    assert!(!backend.submissions_stopped());
+    drop(cb);
+    drop(dst);
+    unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+}
 
 #[test]
 #[ignore = "requires Metal; process-local fuse"]
@@ -478,8 +508,7 @@ fn fused_capture_and_present() {
 }
 
 #[test]
-#[ignore = "trips process-wide fuse; run alone"]
-fn predicted_time_stops_submission() { run_order_probe(Some("estimated-time")); }
+fn over_window_estimate_runs_alone() { run_order_probe(Some("estimated-time")); }
 
 #[test]
 fn budget_boundary_preserves_order() { run_order_probe(Some("split-time")); }
@@ -517,7 +546,7 @@ fn run_order_probe(fault: Option<&'static str>) {
             heap: None,
             sampler_heap: None,
             top: top.bytes,
-            groups: [if fault == Some("one-group") { 2 } else { 1 }, 1, 1],
+            groups: [1; 3],
             tables: Vec::new(),
         })));
         expected = expected.wrapping_mul(3).wrapping_add(k);
@@ -529,7 +558,7 @@ fn run_order_probe(fault: Option<&'static str>) {
     }
     if fault == Some("split-time") {
         mp.cost_ns.store(30_000_000, std::sync::atomic::Ordering::Relaxed);
-    } else if fault.is_some() {
+    } else if matches!(fault, Some("ring" | "event")) {
         assert!(!backend.run(&ops));
         assert_eq!(work::REJECTIONS.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(unsafe { mem.cast::<u32>().read() }, 0);
@@ -541,7 +570,7 @@ fn run_order_probe(fault: Option<&'static str>) {
         return;
     }
     assert!(backend.run(&ops));
-    if fault == Some("split-time") {
+    if matches!(fault, Some("split-time" | "estimated-time")) {
         assert_eq!(work::SPLITS.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(!backend.submissions_stopped());
     }

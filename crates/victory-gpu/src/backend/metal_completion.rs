@@ -39,7 +39,8 @@ impl Admission {
     }
 
     fn acquire(&self, ns: u64, mut on_wait: impl FnMut()) -> Result<Permit<'_>> {
-        if ns > self.time { return Err(stopped("estimated GPU time exceeds queue budget")); }
+        // An over-window buffer reserves the whole window and runs alone.
+        let ns = ns.min(self.time);
         let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if fuse::tripped() { return Err(Error("Metal safety stop already tripped".into())); }
@@ -95,7 +96,7 @@ mod tests {
 
     #[test]
     fn admission_blocks_on_count_and_time() {
-        for (capacity, first, next) in [(1, 1, 1), (2, 40, 11)] {
+        for (capacity, first, next) in [(1, 1, 1), (2, 40, 11), (2, 51, 1), (2, 1, 51)] {
             let gate = Admission::new(capacity, 50);
             let held = gate.acquire(first, || unreachable!()).unwrap();
             std::thread::scope(|s| {
