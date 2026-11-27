@@ -2442,3 +2442,54 @@ mod barycentric_tests {
         });
     }
 }
+
+/// `VICTORY_DUMP_IN=<container> VICTORY_DUMP_OUT=<file> cargo test -p victory-shader
+/// --lib dump_translated -- --ignored`: the DXIL a container translates to on a host
+/// of 32-lane waves (for `llvm-dis` after stripping the DXIL part header).
+#[cfg(test)]
+#[test]
+#[ignore = "a tool: needs VICTORY_DUMP_IN / VICTORY_DUMP_OUT"]
+fn dump_translated() {
+    let input = std::env::var("VICTORY_DUMP_IN").expect("VICTORY_DUMP_IN");
+    let out = std::env::var("VICTORY_DUMP_OUT").expect("VICTORY_DUMP_OUT");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    bitcode::LLVM_DIS_LAYOUT.set(true);
+    let shader = translate(&std::fs::read(input).unwrap());
+    lower::TEST_HOST_WAVE.set(was);
+    std::fs::write(out, shader.expect("translate").dxil).unwrap();
+}
+
+/// `VICTORY_DUMP_WORDS=<file of hex dwords> VICTORY_DUMP_OUT=<file> cargo test -p
+/// victory-shader --lib dump_native -- --ignored`: [`dump_translated`] for a wave64
+/// compute program of 64 threads given as its body (4 root constants in s0..s3, a raw
+/// UAV's descriptor loaded into s[8:11]), the layout of victory-gpu's Metal repros.
+#[cfg(test)]
+#[test]
+#[ignore = "a tool: needs VICTORY_DUMP_WORDS / VICTORY_DUMP_OUT"]
+fn dump_native() {
+    use crate::native::{ComputeIo, ResourceType, RootParam, RootType, StageIo, UsedResource};
+    let text = std::fs::read_to_string(std::env::var("VICTORY_DUMP_WORDS").expect("VICTORY_DUMP_WORDS")).unwrap();
+    let mut words = vec![0xBE85_0380, 0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, 125 << 25, 0xBF8C_C07F];
+    words.extend(text.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()).map(|w| {
+        u32::from_str_radix(w.trim_start_matches("0x").replace('_', "").as_str(), 16).unwrap()
+    }));
+    words.push(0xBF81_0000);
+    let root = |root, sgprs, user_data, slot| RootParam { root, table_offset_dwords: 0, sgprs, base_register: 0, user_data, slot };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 96,
+        layout: vec![root(RootType::Constants, 4, 0, 0), root(RootType::Table, 1, 4, 1)],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav, root: RootType::Table, table_offset_dwords: 0, lower_bound: 0,
+            stride: 0, dwords: 4, user_data: 4, slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [64, 1, 1] }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    bitcode::LLVM_DIS_LAYOUT.set(true);
+    let shader = translate_native(&native);
+    lower::TEST_HOST_WAVE.set(was);
+    std::fs::write(std::env::var("VICTORY_DUMP_OUT").unwrap(), shader.expect("translate").dxil).unwrap();
+}

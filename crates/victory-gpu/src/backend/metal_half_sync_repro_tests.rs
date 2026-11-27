@@ -228,3 +228,155 @@ fn a_loop_cut_by_the_budget_reports_its_header_and_counter() {
     // s20 as the header joined it on the iteration cut
     assert_eq!(get(DIAG_LOOPS + 2), 4095, "s20 at the header when cut");
 }
+
+/// 2561af9577c47289's light-bit loop (0x3978..0x6124): take the first set bit
+/// of the mask, clear it, leave once it was the last (`s67 == s80`). s21
+/// counts iterations: the mask's population count on the console. (s12 for the
+/// game's s10, which here holds the UAV descriptor.)
+const BIT_LOOP: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xBE8C_0300, // s_mov_b32 s12, s0
+    0xBE95_0380, // s_mov_b32 s21, 0
+    0x7EA2_020C, // LOOP: v_mov_b32 v81, s12
+    0x7E86_0551, // v_readfirstlane_b32 s67, v81
+    0xBED3_1343, // s_ff1_i32_b32 s83, s67
+    0x870C_9F53, // s_and_b32 s12, s83, 31
+    0x8F50_0C81, // s_lshl_b32 s80, 1, s12
+    0x8015_8115, // s_add_u32 s21, s21, 1
+    0x890C_4350, // s_xor_b32 s12, s80, s67
+    0xBF06_5043, // s_cmp_eq_u32 s67, s80
+    0xBF84_FFF7, // s_cbranch_scc0 LOOP
+    0x7E02_0215, // v_mov_b32 v1, s21
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+];
+
+#[test]
+fn the_light_bit_loop_runs_once_a_set_bit() {
+    let _pool = victory_metal::Pool::new();
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program_of(BIT_LOOP, false)).expect("translate");
+    let backend = MetalBackend::new().unwrap();
+    let mut bad = Vec::new();
+    for mask in [1u32, 0xF, 0x4000_0000, 0x8000_0000, 0x8000_0001, 0xC000_0000, u32::MAX] {
+        let r = run(&backend, &shader, 64, 1, mask);
+        eprintln!("REPRO bit loop mask {mask:#010x}: {} iterations (want {}), GPU {:.3} ms", r.out[0], mask.count_ones(), r.ms);
+        if r.out[0] != mask.count_ones() {
+            bad.push((mask, r.out[0]));
+        }
+    }
+    assert!(bad.is_empty(), "iterations differ: {bad:x?}");
+}
+
+/// [`BIT_LOOP`] as 2561af9577c47289 runs it: a wave64 program as two host waves
+/// that exchange (a lane read across halves elsewhere makes it so), so the
+/// header's first-lane read goes through the halves' exchange, and inside the
+/// loop a per-lane skip (`v_cmpx` + `s_cbranch_execz` to the latch) for the
+/// lanes without the light's bit. Lane t holds bit t % 32.
+const BIT_LOOP_64: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xD760_0014, 0x0001_4100, // v_readlane_b32 s20, v0, 32
+    0xD51A_0050, 0x0001_0300, // v_lshlrev_b32 v80, v0, 1
+    0xBE8C_0300, // s_mov_b32 s12, s0
+    0xBE95_0380, // s_mov_b32 s21, 0
+    0x7EA6_0280, // v_mov_b32 v83, 0
+    0x7EA2_020C, // LOOP: v_mov_b32 v81, s12
+    0xBEAE_047E, // s_mov_b64 s[46:47], exec
+    0x7E86_0551, // v_readfirstlane_b32 s67, v81
+    0xBED3_1343, // s_ff1_i32_b32 s83, s67
+    0x870C_9F53, // s_and_b32 s12, s83, 31
+    0x8F50_0C81, // s_lshl_b32 s80, 1, s12
+    0x36A2_A050, // v_and_b32 v81, s80, v80
+    0x7DAA_A280, // v_cmpx_ne_u32 0, v81
+    0xBF88_0001, // s_cbranch_execz LATCH
+    0x4AA6_A681, // v_add_nc_u32 v83, 1, v83
+    0xBEFE_042E, // LATCH: s_mov_b64 exec, s[46:47]
+    0x8015_8115, // s_add_u32 s21, s21, 1
+    0x890C_4350, // s_xor_b32 s12, s80, s67
+    0xBF06_5043, // s_cmp_eq_u32 s67, s80
+    0xBF84_FFF1, // s_cbranch_scc0 LOOP
+    0x7E02_0215, // v_mov_b32 v1, s21
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+];
+
+#[test]
+fn the_light_bit_loop_runs_once_a_set_bit_in_two_halves() {
+    let _pool = victory_metal::Pool::new();
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program_of(BIT_LOOP_64, true)).expect("translate");
+    assert!(shader.root_uavs.contains(&victory_shader::emit::SLOT_DIAG));
+    let backend = MetalBackend::new().unwrap();
+    let mut bad = Vec::new();
+    for mask in [1u32, 0xF, 0x4000_0000, 0x8000_0000, 0x8000_0001, 0x8000_0100, 0xC000_0000, u32::MAX] {
+        let r = run(&backend, &shader, 64, 1, mask);
+        let last = diag::LAST.lock().unwrap().clone();
+        eprintln!("REPRO bit loop (two halves) mask {mask:#010x}: lanes 0/32 counted {}/{} (want {}), timeouts {}, diag {last:x?}, GPU {:.3} ms",
+            r.out[0], r.out[32], mask.count_ones(), r.timeouts, r.ms);
+        if r.out[0] != mask.count_ones() || r.out[32] != mask.count_ones() {
+            bad.push((mask, r.out[0], r.out[32]));
+        }
+    }
+    assert!(bad.is_empty(), "iterations differ: {bad:x?}");
+}
+
+/// The cause of 2561af9577c47289's ~0.5 s dispatches: lanes past a count leave
+/// (`execz` to `s_endpgm`), then a loop whose exit asks the lanes
+/// (`s_cbranch_vccz` on a compare: some lane in EXEC equal) with a lane read
+/// across halves inside. With no lane left the console ends at once; a host
+/// wave that walked the body with EXEC clear (the early-out left out) never
+/// met the exit and ran the loop to its budget.
+const EARLY_OUT_LOOP: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0x7E06_0285, // v_mov_b32 v3, 5
+    0x7DA8_0000, // v_cmpx_gt_u32 s0, v0
+    0xBF88_000A, // s_cbranch_execz END
+    0xBE94_0380, // s_mov_b32 s20, 0
+    0x8014_8114, // LOOP: s_add_u32 s20, s20, 1
+    0xD760_0015, 0x0001_4103, // v_readlane_b32 s21, v3, 32
+    0xD4C2_006A, 0x0000_2A14, // v_cmp_eq_u32 vcc, s20, s21
+    0xBF86_FFFA, // s_cbranch_vccz LOOP
+    0x7E02_0214, // v_mov_b32 v1, s20
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+];
+
+fn early_out_loop_case(live: &[u32]) -> Vec<(u32, u32, u64)> {
+    use victory_shader::emit::DIAG_LOOP_BUDGET;
+    let _pool = victory_metal::Pool::new();
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program_of(EARLY_OUT_LOOP, true)).expect("translate");
+    let backend = MetalBackend::new().unwrap();
+    let mut bad = Vec::new();
+    for &live in live {
+        let r = run(&backend, &shader, 64, 2, live);
+        let last = diag::LAST.lock().unwrap().clone();
+        let cut = last.iter().find(|c| c.0 == DIAG_LOOP_BUDGET).map_or(0, |c| c.1);
+        let ok = r.out.iter().enumerate().all(|(t, &v)| v == if (t as u32) < live { 5 } else { 0 });
+        eprintln!("REPRO early-out over a loop, live {live:2}: {} stores right, {cut} threads cut by the budget, timeouts {}, GPU {:.3} ms",
+            if ok { "all" } else { "NOT all" }, r.timeouts, r.ms);
+        if !ok || cut != 0 || r.timeouts != 0 {
+            bad.push((live, cut, r.timeouts));
+        }
+    }
+    bad
+}
+
+/// A console wave with no lane left must not run the loop at all (before
+/// `ir::loop_beyond` all 128 threads ran it to the budget, 9.4 ms here).
+#[test]
+fn an_early_out_over_a_loop_is_taken_by_the_whole_wave() {
+    let bad = early_out_loop_case(&[0, 64]);
+    assert!(bad.is_empty(), "(live, threads cut, timeouts): {bad:?}");
+}
+
+/// KNOWN WRONG: a wave with some lanes left. The lanes past the count walk the
+/// loop with EXEC clear and decide its `vccz` exit by their own bit, which a
+/// compare writes as 0 outside EXEC: they go round until the budget. The
+/// console decides by the lanes in EXEC (their compare of two scalars).
+/// Needs mask-decided loop exits taken by the whole wave wherever lanes may
+/// walk with EXEC clear (2561af9577c47289's exits already are: its loops hold
+/// exchanges, so their exits are wave-wide).
+#[test]
+#[ignore = "known wrong: EXEC-clear lanes decide a per-lane vccz loop exit by their own bit"]
+fn an_early_out_over_a_loop_with_some_lanes_left() {
+    let bad = early_out_loop_case(&[10, 32, 40]);
+    assert!(bad.is_empty(), "(live, threads cut, timeouts): {bad:?}");
+}
