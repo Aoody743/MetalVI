@@ -280,6 +280,16 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    static LAST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The wave size the last program emitted on this thread declared (`None`: none), for
+/// translation surveys: after a successful [`translate`], the size of the shader it returned.
+pub fn last_wave() -> Option<u32> {
+    LAST_WAVE.get()
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -685,6 +695,7 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    LAST_WAVE.set(wave_size);
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
