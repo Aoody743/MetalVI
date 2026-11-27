@@ -1,0 +1,302 @@
+//! The same compute ops through the old path (`MetalBackend::run`) and as
+//! execution-timeline segments: same memory afterwards. One-thread kernels;
+//! milliseconds of GPU work at most.
+
+use super::*;
+use crate::backend::metal::{MetalBackend, MetalCompute, MetalDispatchIndirect, diag};
+use std::time::Duration;
+use victory_metal::exec::{Config, Hooks, Timeline};
+
+/// The ABI shape of MSC's compute shaders: the top-level argument buffer at
+/// bind point 2, a one-view table in it naming the memory by address.
+const MSL: &str = "#include <metal_stdlib>
+using namespace metal;
+struct Entry { device uint *va; ulong tex; ulong meta; };
+struct Top { device const Entry *table; uint dst; uint src; uint add; uint pad; };
+kernel void k(constant Top &t [[buffer(2)]]) { device uint *b = t.table->va; b[t.dst] = b[t.src] + t.add; }
+";
+
+const WORDS: usize = 64;
+
+struct Setup {
+    backend: MetalBackend,
+    pso: Arc<MetalCompute>,
+    mem: victory_metal::Buffer,
+    cpu: *mut u32,
+    records: victory_metal::Buffer,
+}
+
+impl Setup {
+    fn new() -> Self {
+        let backend = MetalBackend::new().unwrap();
+        let pso = backend.device.compute_pipeline_msl(MSL, "k").unwrap();
+        let pso = Arc::new(MetalCompute {
+            // Warm (as after a first run): 100 µs per dispatch, so the
+            // estimate window does not cut every dispatch into its own buffer.
+            cost_ns: std::sync::atomic::AtomicU64::new(10_000),
+            name: "exec compute test".into(),
+            pso,
+            threadgroup: [1, 1, 1],
+            top_level: victory_metal::ir::TopLevel::new(Vec::new(), 24),
+        });
+        let (mem, cpu) = backend.device.shared_buffer_untracked_mapped(&[0u8; WORDS * 4]).unwrap();
+        let records = backend.device.shared_buffer(&[2u32, 1, 1].map(u32::to_le_bytes).concat()).unwrap();
+        backend.chunks().residency().add(&[mem.handle(), records.handle()]);
+        backend.chunks().residency().commit();
+        Self { backend, pso, mem, cpu: cpu.cast(), records }
+    }
+
+    fn reset(&self) {
+        for i in 0..WORDS {
+            // SAFETY: inside the buffer; no GPU work in flight.
+            unsafe { self.cpu.add(i).write_volatile(if i == 0 { 7 } else { 0 }) };
+        }
+    }
+
+    fn words(&self) -> Vec<u32> {
+        // SAFETY: read after the GPU work completed.
+        (0..WORDS).map(|i| unsafe { self.cpu.add(i).read_volatile() }).collect()
+    }
+
+    fn top(&self, dst: u32, src: u32, add: u32) -> (Vec<u8>, Vec<(u32, DescriptorEntry)>) {
+        let mut top = vec![0u8; 8];
+        for v in [dst, src, add, 0] {
+            top.extend_from_slice(&v.to_le_bytes());
+        }
+        (top, vec![(0, DescriptorEntry::buffer(self.mem.gpu_address, (WORDS * 4) as u64))])
+    }
+
+    fn direct(&self, dst: u32, src: u32, add: u32, after_barrier: bool) -> Arc<MetalOp> {
+        let (top, tables) = self.top(dst, src, add);
+        Arc::new(MetalOp::Dispatch(MetalCmd {
+            pso: self.pso.clone(),
+            heap: None,
+            sampler_heap: None,
+            top,
+            groups: [1, 1, 1],
+            tables,
+            loop_counts: None,
+            after_barrier,
+        }))
+    }
+
+    fn indirect(&self, dst: u32, src: u32, add: u32) -> Arc<MetalOp> {
+        let (top, tables) = self.top(dst, src, add);
+        Arc::new(MetalOp::DispatchIndirect(MetalDispatchIndirect {
+            pso: self.pso.clone(),
+            heap: None,
+            sampler_heap: None,
+            top,
+            tables,
+            records: self.records.clone(),
+            records_offset: 0,
+            stride: 12,
+            max: 1,
+            count: None,
+            records_va: 0,
+            count_va: None,
+        }))
+    }
+
+    /// b1 = b0+1 | b2 = b1+1 (after a barrier) | b10 = b0+5, b11 = b0+6
+    /// (no barrier: may overlap) | indirect b3 = b2+1 | b4 = b3+1 | b12 = b4+1.
+    fn ops(&self) -> Vec<Arc<MetalOp>> {
+        vec![
+            self.direct(1, 0, 1, true),
+            self.direct(2, 1, 1, true),
+            self.direct(10, 0, 5, false),
+            self.direct(11, 0, 6, false),
+            self.indirect(3, 2, 1),
+            self.direct(4, 3, 1, true),
+            self.direct(12, 4, 1, true),
+        ]
+    }
+}
+
+#[test]
+#[ignore = "requires Metal"]
+fn timeline_compute_matches_old_path() {
+    let _pool = victory_metal::Pool::new();
+    let s = Setup::new();
+    let ops = s.ops();
+    assert!(compute_only(&ops));
+
+    s.reset();
+    assert!(s.backend.run(&ops), "old path failed");
+    let old = s.words();
+    let mut want = vec![0u32; WORDS];
+    want[0] = 7;
+    want[1] = 8;
+    want[2] = 9;
+    want[10] = 12;
+    want[11] = 13;
+    want[3] = 10;
+    want[4] = 11;
+    want[12] = 12;
+    assert_eq!(old, want, "old path");
+
+    s.reset();
+    let t = Timeline::new(s.backend.device.clone(), Config { max_segments_per_cb: 1, ..Config::default() }, Hooks::default()).unwrap();
+    for q in 0..2 {
+        t.queue(q).add_residency_set(s.backend.chunks().residency());
+    }
+    let rings: Vec<_> = t.ring_buffers().iter().map(|b| b.handle()).collect();
+    s.backend.chunks().residency().add(&rings);
+    s.backend.chunks().residency().commit();
+    diag::LAST_GPU_NS.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    let before = ENCODED.each_ref().map(|c| c.load(Ordering::Relaxed));
+    let segs = segments(&ops);
+    assert_eq!(segs.len(), 3, "4 dispatches | indirect | 2 dispatches");
+    t.submit(0, segs).unwrap();
+    t.drain(Duration::from_secs(5)).unwrap();
+    assert!(t.stopped().is_none());
+    let new = s.words();
+    assert_eq!(new, old, "timeline path");
+    let after = ENCODED.each_ref().map(|c| c.load(Ordering::Relaxed));
+    assert_eq!([after[0] - before[0], after[1] - before[1], after[2] - before[2]], [6, 1, 3]);
+    assert_eq!(
+        diag::LAST_GPU_NS.load(std::sync::atomic::Ordering::Relaxed),
+        u64::MAX,
+        "the old completion path (submit_checked) was not used"
+    );
+    let st = t.stats();
+    println!(
+        "timeline compute: committed={:?} barriers={} elided={} ring_high_water={:?}",
+        st.committed, st.barriers, st.barriers_elided, st.ring_high_water
+    );
+    assert_eq!(st.committed[0], 3);
+    // The title barrier before b2 = b1+1 and before b12 = b4+1; b10 and b11
+    // run without one (the old path had a barrier between every dispatch).
+    assert_eq!((st.barriers, st.barriers_elided), (2, 2));
+    assert!(st.ring_high_water[0] > 0, "tables went through the timeline ring");
+}
+
+/// Queues on two timelines with the title's compute ops: the compute queue's
+/// ops and the graphics queue's ops are encoded and committed without
+/// waiting for each other, and their results are right.
+#[test]
+#[ignore = "requires Metal"]
+fn timeline_compute_on_two_queues() {
+    let _pool = victory_metal::Pool::new();
+    let s = Setup::new();
+    s.reset();
+    let t = Timeline::new(s.backend.device.clone(), Config { max_segments_per_cb: 1, ..Config::default() }, Hooks::default()).unwrap();
+    for q in 0..2 {
+        t.queue(q).add_residency_set(s.backend.chunks().residency());
+    }
+    let rings: Vec<_> = t.ring_buffers().iter().map(|b| b.handle()).collect();
+    s.backend.chunks().residency().add(&rings);
+    s.backend.chunks().residency().commit();
+    let gfx: Vec<_> = (0..8).map(|i| s.direct(20 + i, 0, i, true)).collect();
+    let compute: Vec<_> = (0..8).map(|i| s.direct(40 + i, 0, 100 + i, true)).collect();
+    t.submit(0, segments(&gfx)).unwrap();
+    t.submit(1, segments(&compute)).unwrap();
+    t.drain(Duration::from_secs(5)).unwrap();
+    let w = s.words();
+    for i in 0..8u32 {
+        assert_eq!(w[(20 + i) as usize], 7 + i);
+        assert_eq!(w[(40 + i) as usize], 107 + i);
+    }
+    let st = t.stats();
+    assert_eq!(st.committed, [2, 2]);
+    assert!(t.stopped().is_none());
+}
+
+fn spin_pso(s: &Setup, iterations: u32) -> Arc<MetalCompute> {
+    let src = format!(
+        "#include <metal_stdlib>
+using namespace metal;
+struct Entry {{ device uint *va; ulong tex; ulong meta; }};
+struct Top {{ device const Entry *table; uint dst; uint src; uint add; uint pad; }};
+kernel void k(constant Top &t [[buffer(2)]], uint g [[thread_position_in_grid]]) {{
+  device uint *b = t.table->va; uint v = t.src + g;
+  for (uint i = 0; i < {iterations}u; ++i) {{ v = v * 1664525u + t.add; }}
+  if (g == 0) {{ b[t.dst] = v; }}
+}}"
+    );
+    Arc::new(MetalCompute {
+        cost_ns: std::sync::atomic::AtomicU64::new(10_000),
+        name: format!("spin {iterations}"),
+        pso: s.backend.device.compute_pipeline_msl(&src, "k").unwrap(),
+        threadgroup: [32, 1, 1],
+        top_level: victory_metal::ir::TopLevel::new(Vec::new(), 24),
+    })
+}
+
+fn spin_op(s: &Setup, pso: &Arc<MetalCompute>, dst: u32) -> Arc<MetalOp> {
+    let (top, tables) = s.top(dst, dst, 1013904223);
+    Arc::new(MetalOp::Dispatch(MetalCmd {
+        pso: pso.clone(),
+        heap: None,
+        sampler_heap: None,
+        top,
+        groups: [1, 1, 1],
+        tables,
+        loop_counts: None,
+        after_barrier: false,
+    }))
+}
+
+/// Sixteen independent dispatches per queue, two queues: the old path runs
+/// them one at a time (a barrier between each, a wait per command buffer, one
+/// queue); the timeline runs those without a title barrier concurrently and
+/// the two queues side by side.
+#[test]
+#[ignore = "requires Metal"]
+fn timeline_compute_overlaps() {
+    let _pool = victory_metal::Pool::new();
+    let s = Setup::new();
+    s.reset();
+    // Calibrate: one dispatch must stay well under a millisecond or two.
+    let pso = spin_pso(&s, 2500);
+    for _ in 0..2 {
+        assert!(s.backend.run(&[spin_op(&s, &pso, 5)]));
+    }
+    let one = diag::LAST_GPU_NS.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(one < 3_000_000, "one spin dispatch took {one} ns");
+    let ops = |base: u32| -> Vec<Arc<MetalOp>> { (0..16).map(|i| spin_op(&s, &pso, base + i)).collect() };
+    let (a, b) = (ops(20), ops(40));
+    s.reset();
+    let start = std::time::Instant::now();
+    assert!(s.backend.run(&a));
+    assert!(s.backend.run(&b));
+    let old = start.elapsed();
+    let old_words = s.words();
+
+    s.reset();
+    let t = Timeline::new(s.backend.device.clone(), Config { max_segments_per_cb: 1, ..Config::default() }, Hooks::default()).unwrap();
+    for q in 0..2 {
+        t.queue(q).add_residency_set(s.backend.chunks().residency());
+    }
+    let rings: Vec<_> = t.ring_buffers().iter().map(|r| r.handle()).collect();
+    s.backend.chunks().residency().add(&rings);
+    s.backend.chunks().residency().commit();
+    // Warm the timeline's queues.
+    t.submit(0, segments(&[spin_op(&s, &pso, 5)])).unwrap();
+    t.submit(1, segments(&[spin_op(&s, &pso, 6)])).unwrap();
+    t.drain(Duration::from_secs(5)).unwrap();
+    s.reset();
+    let gpu_before = t.stats().gpu_ns.clone();
+    let start = std::time::Instant::now();
+    t.submit(0, segments(&a)).unwrap();
+    t.submit(1, segments(&b)).unwrap();
+    let submitted = start.elapsed();
+    t.drain(Duration::from_secs(5)).unwrap();
+    let new = start.elapsed();
+    assert_eq!(s.words(), old_words, "same results");
+    let st = t.stats();
+    let intervals: Vec<_> = st.intervals.iter().rev().take(8).cloned().collect();
+    let overlap = |q: usize| intervals.iter().filter(|i| i.queue == q).map(|i| (i.gpu_start, i.gpu_end)).fold((u64::MAX, 0), |(s0, e0), (s1, e1)| (s0.min(s1), e0.max(e1)));
+    let (g, c) = (overlap(0), overlap(1));
+    let both = g.1.min(c.1) as i64 - g.0.max(c.0) as i64;
+    println!(
+        "OVERLAP title compute: 2 queues x 16 dispatches ({one} ns each alone): old path wall {old:?}; timeline wall {new:?} (submits {submitted:?}), gpu {:?} ns, queues overlapped {both} ns, barriers {} elided {}",
+        [st.gpu_ns[0] - gpu_before[0], st.gpu_ns[1] - gpu_before[1]], st.barriers, st.barriers_elided
+    );
+    assert!(both > 0, "the two queues did not overlap");
+    // GPU-side (wall clock depends on what else the machine runs): each
+    // queue's sixteen dispatches took well under the sixteen run serially.
+    for q in 0..2 {
+        assert!((st.gpu_ns[q] - gpu_before[q]) * 2 < 16 * one, "queue {q}: dispatches did not overlap");
+    }
+}

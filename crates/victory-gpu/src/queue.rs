@@ -60,8 +60,8 @@ enum Held {
 #[cfg(windows)]
 #[derive(Default)]
 pub(crate) struct MetalOps {
-    commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
-    textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+    pub(crate) commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
+    pub(crate) textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 #[cfg(not(windows))]
 pub(crate) type MetalOps = Vec<()>;

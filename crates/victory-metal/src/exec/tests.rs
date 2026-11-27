@@ -91,6 +91,7 @@ impl Gpu {
             buffers: vec![(self.buf.clone(), 0, 0)],
             bytes: Some((args(dst, src, add), 1)),
             ring: None,
+            patches: vec![],
             reads: vec![self.range(src)],
             writes: vec![self.range(dst)],
         })
@@ -104,6 +105,7 @@ impl Gpu {
             buffers: vec![(self.buf.clone(), 0, 0)],
             bytes: None,
             ring: Some((args(dst, src, add), 2)),
+            patches: vec![],
             reads: vec![self.range(src)],
             writes: vec![self.range(dst)],
         })
@@ -171,6 +173,7 @@ impl Gpu {
             buffers: vec![(self.buf.clone(), 0, 0)],
             bytes: Some((args(dst, seed, MUL), 1)),
             ring: None,
+            patches: vec![],
             reads: vec![],
             writes: vec![Range::of(&self.buf, u64::from(dst) * 4, SPIN_THREADS * 4)],
         })

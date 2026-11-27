@@ -191,6 +191,11 @@ pub(crate) struct State {
     /// run when the list is submitted.
     #[cfg(windows)]
     pub(crate) metal: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
+    /// A Metal dispatch was recorded since the list began or since its last
+    /// barrier (or command that orders like one): the next dispatch may
+    /// overlap it ([`crate::backend::metal::MetalCmd::after_barrier`]).
+    #[cfg(windows)]
+    pub(crate) metal_since_barrier: bool,
     /// The bound targets as Metal attachments, made at the first Metal draw
     /// after they were set (`None`: not made yet).
     #[cfg(windows)]
@@ -444,6 +449,15 @@ fn dropped(pipeline: usize) {
 
 /// Dispatches run on the host so far.
 static DISPATCHED: AtomicU64 = AtomicU64::new(0);
+/// D3D12-era preparation the Metal record path still does (stage 4 is to
+/// bring these to 0): heap syncs (per stage), slot refreshes, and root-view
+/// bounds from the shadow copies.
+static METAL_PREP: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// [`METAL_PREP`]: (heap syncs, slot refreshes, shadow bounds) so far.
+pub(crate) fn metal_prep() -> [u64; 3] {
+    METAL_PREP.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
 
 pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
@@ -2055,6 +2069,7 @@ impl State {
             groups: groups.map(u64::from),
             tables: bound.tables,
             loop_counts,
+            after_barrier: !std::mem::replace(&mut self.metal_since_barrier, true),
         })));
         true
     }
@@ -2656,6 +2671,7 @@ impl State {
 
         // Sync dirty descriptor slots on the bound view and sampler heaps first so
         // bindless reads and `SLOT_STRIDES` see up-to-date entries and strides.
+        METAL_PREP[0].fetch_add(1, Ordering::Relaxed);
         let view_bound = (self.heaps[0] != 0)
             .then(|| {
                 let heap = crate::descriptor::heap(self.heaps[0] as This);
@@ -2715,6 +2731,7 @@ impl State {
                 let extent = if va == 0 {
                     0
                 } else {
+                    METAL_PREP[2].fetch_add(1, Ordering::Relaxed);
                     match crate::shadow::buffer_extent(va) {
                         Some((_, end)) => end - va,
                         None => victory_metal::chunks::committed_extent(va, 4 << 20),
@@ -2751,6 +2768,7 @@ impl State {
             let Some(heap) = self.heap_of(handle) else { continue };
             let Some(index) = heap.index(handle) else { continue };
             let key = std::ptr::from_ref(heap) as usize;
+            METAL_PREP[1].fetch_add(1, Ordering::Relaxed);
             if let Some((buffer, _, missing)) = m.refresh_slot(key, heap.count(), heap.samplers(), index, handle) {
                 Self::note_slot(index, handle, missing);
                 worst = worst.or(missing);
@@ -2771,6 +2789,7 @@ impl State {
             let Some(heap) = self.heap_of(handle) else { continue };
             let Some(i) = heap.index(handle) else { continue };
             let key = std::ptr::from_ref(heap) as usize;
+            METAL_PREP[1].fetch_add(1, Ordering::Relaxed);
             if let Some((buffer, _, missing)) = m.refresh_slot(key, heap.count(), heap.samplers(), i, handle) {
                 Self::note_slot(i, handle, missing);
                 worst = worst.or(missing);
@@ -2785,6 +2804,7 @@ impl State {
         for (h, out) in [(self.heaps[0], &mut heap_buffer), (self.heaps[1], &mut sampler_buffer)] {
             if h != 0 && out.is_none() {
                 let heap = crate::descriptor::heap(h as This);
+                METAL_PREP[1].fetch_add(1, Ordering::Relaxed);
                 *out = m.refresh_slot(h, heap.count(), heap.samplers(), 0, heap.handle(0).unwrap_or(0)).map(|(b, _, _)| b);
             }
         }

@@ -161,11 +161,14 @@ pub struct Hooks {
     /// A fence signal completed on its queue (after the bottom-of-pipe writes
     /// before it): wake what waits for the fence on the CPU.
     pub fence_reached: Box<dyn Fn(FenceId, u64) + Send + Sync>,
+    /// Run on the encoder thread before each command buffer is encoded
+    /// (pending uploads, residency commits). False stops submission.
+    pub prepare: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl Default for Hooks {
     fn default() -> Self {
-        Self { stopped: Box::new(|| false), stop: Box::new(|_| {}), fence_reached: Box::new(|_, _| {}) }
+        Self { stopped: Box::new(|| false), stop: Box::new(|_| {}), fence_reached: Box::new(|_, _| {}), prepare: Box::new(|| true) }
     }
 }
 
@@ -223,13 +226,16 @@ pub struct Segment {
     pub writes: Vec<Write>,
     /// Estimated GPU time (budgeting only; never a reason to refuse).
     pub estimate_ns: u64,
+    /// Told the measured GPU time of the segment's command buffer once it
+    /// completed (the whole buffer's: exact when it holds one segment).
+    pub observe: Option<Box<dyn FnOnce(u64) + Send>>,
     forced: bool,
     held_counted: bool,
 }
 
 impl Segment {
     pub fn new(label: &'static str, work: Work) -> Self {
-        Self { label, waits: Vec::new(), work, signals: Vec::new(), writes: Vec::new(), estimate_ns: 0, forced: false, held_counted: false }
+        Self { label, waits: Vec::new(), work, signals: Vec::new(), writes: Vec::new(), estimate_ns: 0, observe: None, forced: false, held_counted: false }
     }
     pub fn wait_fence(mut self, fence: FenceId, value: u64) -> Self {
         self.waits.push(Wait::Fence { fence, value });
@@ -378,6 +384,18 @@ enum Msg {
     Shutdown,
 }
 
+/// An encoded command buffer: it, whether it has GPU work, per segment its
+/// signals / CPU-signal flag / writes, the signals and tag writes it
+/// commits, and the segments' GPU-time observers.
+type Encoded = (
+    CommandBuffer,
+    bool,
+    Vec<(Vec<(FenceId, u64)>, bool, Vec<Write>)>,
+    Vec<(FenceId, u64)>,
+    Vec<(TagId, u64)>,
+    Vec<Box<dyn FnOnce(u64) + Send>>,
+);
+
 /// What the completion thread finishes for one command buffer.
 struct Flight {
     seq: u64,
@@ -388,6 +406,7 @@ struct Flight {
     /// Per segment: its signals, whether the CPU signals them (after the
     /// writes), and its bottom-of-pipe writes.
     done: Vec<(Vec<(FenceId, u64)>, bool, Vec<Write>)>,
+    observers: Vec<Box<dyn FnOnce(u64) + Send>>,
     has_writes: bool,
     ring: ring::Token,
 }
@@ -449,6 +468,7 @@ impl Inner {
     fn complete(&self, q: QueueId, flight: Flight) {
         let _pool = Pool::new();
         let qs = &self.queues[q];
+        let mut measured = 0;
         let ok = (|| -> std::result::Result<(), String> {
             if !qs.done.wait_until_signaled(flight.seq, self.cfg.hang_ms) {
                 return Err(format!(
@@ -458,6 +478,7 @@ impl Inner {
             }
             flight.cb.wait().map_err(|e| format!("queue {q} command buffer {} ({}) failed: {e}", flight.seq, flight.label))?;
             let gpu = flight.cb.gpu_time_ns();
+            measured = gpu;
             let (start, end) = flight.cb.gpu_interval_ns();
             {
                 let mut st = lock(&self.stats);
@@ -479,6 +500,9 @@ impl Inner {
             self.fault(reason);
         }
         if !self.is_stopped() {
+            for observe in flight.observers {
+                observe(measured);
+            }
             for (signals, cpu, writes) in flight.done {
                 for w in writes {
                     (w.action)();
@@ -781,7 +805,13 @@ impl Encoder {
         for tx in self.quiesce.drain(..) {
             let _ = tx.send(if stopped { Err(err()) } else { Ok(()) });
         }
-        let held = self.pending.iter().any(|q| !q.is_empty()) && self.inner.queues.iter().all(|q| lock(&q.in_flight).0 == 0);
+        // Held: work is left, nothing is in flight, and every queue's next
+        // segment stands at a wait (not merely behind a budget that a
+        // completion freed after the pump looked: its progress message
+        // pumps again).
+        let held = self.pending.iter().any(|q| !q.is_empty())
+            && self.inner.queues.iter().all(|q| lock(&q.in_flight).0 == 0)
+            && self.pending.iter().all(|q| q.front().is_none_or(|s| matches!(self.ready(s), Ready::Held)));
         if stopped || self.idle() || held {
             for tx in self.drains.drain(..) {
                 let _ = tx.send(if stopped {
@@ -953,9 +983,15 @@ impl Encoder {
                 }
             }
         };
+        if !(inner.hooks.prepare)() {
+            lock(&qs.ring).fifo.give_back(token);
+            inner.fault(format!("queue {q}: preparing a command buffer failed"));
+            inner.pending_done(n);
+            return false;
+        }
         let mut slice = if ring_bytes == 0 { RingSlice::empty(lock(&qs.ring).buffer.clone()) } else { lock(&qs.ring).slice(&token) };
         let _pool = Pool::new();
-        let encoded = (|| -> Result<(CommandBuffer, bool, Vec<(Vec<(FenceId, u64)>, bool, Vec<Write>)>, Vec<(FenceId, u64)>, Vec<(TagId, u64)>)> {
+        let encoded = (|| -> Result<Encoded> {
             let cb = qs.queue.command_buffer()?;
             let seq = self.seq[q] + 1;
             if seq > 1 {
@@ -973,7 +1009,9 @@ impl Encoder {
             let mut signalled = Vec::new();
             let mut tagged = Vec::new();
             let mut encoders = 0usize;
-            for s in segs {
+            let mut observers = Vec::new();
+            for mut s in segs {
+                observers.extend(s.observe.take());
                 if s.forced && !s.waits.is_empty() {
                     lock(&inner.stats).forced += 1;
                 }
@@ -1013,9 +1051,9 @@ impl Encoder {
             }
             cb.encode_signal(&qs.chain, seq);
             cb.encode_signal(&qs.done, seq);
-            Ok((cb, has_work, done, signalled, tagged))
+            Ok((cb, has_work, done, signalled, tagged, observers))
         })();
-        let (cb, has_work, done, signalled, tagged) = match encoded {
+        let (cb, has_work, done, signalled, tagged, observers) = match encoded {
             Ok(e) => e,
             Err(e) => {
                 lock(&qs.ring).fifo.give_back(token);
@@ -1044,7 +1082,7 @@ impl Encoder {
         if has_writes {
             qs.writes_out.fetch_add(1, Ordering::AcqRel);
         }
-        let flight = Flight { seq, cb: cb.clone(), label, estimate_ns: estimate.min(cfg.in_flight_ns), has_work, done, has_writes, ring: token };
+        let flight = Flight { seq, cb: cb.clone(), label, estimate_ns: estimate.min(cfg.in_flight_ns), has_work, done, observers, has_writes, ring: token };
         if cfg.sync {
             cb.commit();
             self.enqueued(&signalled, &tagged);

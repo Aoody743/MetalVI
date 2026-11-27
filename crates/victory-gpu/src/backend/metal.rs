@@ -187,6 +187,11 @@ pub(crate) struct MetalCmd {
     /// entry), written into the submission's table ring when run.
     pub(crate) tables: Vec<(u32, DescriptorEntry)>,
     pub(crate) loop_counts: Option<[(u64, Buffer, u64); 2]>,
+    /// A title barrier (or the start of its list, or a command that orders
+    /// like one) comes between this dispatch and the one recorded before it.
+    /// The execution timeline encodes dispatches without one concurrently;
+    /// [`MetalBackend::run`] puts a barrier between all of them anyway.
+    pub(crate) after_barrier: bool,
 }
 
 pub(crate) fn want_loop_counts(name: &str) -> bool {
@@ -2273,6 +2278,10 @@ mod work;
 
 #[path = "metal_completion.rs"]
 mod completion;
+
+/// Stage 4 start: compute ops as execution-timeline segments.
+#[path = "metal_exec_compute.rs"]
+pub(crate) mod exec_compute;
 
 #[path = "metal_diag.rs"]
 pub(crate) mod diag;

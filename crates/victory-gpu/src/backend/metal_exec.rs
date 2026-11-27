@@ -19,16 +19,21 @@
 //!   nothing in flight may read memory being remapped, and the present reads
 //!   what the frame drew (the present itself is not on the timeline yet).
 //!
-//! What it does not change yet: `MetalBackend::run` encodes and waits on its
-//! own queue under its submission lock, so title work gets no GPU overlap
-//! between queues and no concurrent dispatch; that needs the stage 4
-//! preparation path to encode into timeline command buffers
-//! (`exec::Work::Encode`). This module has not been run in the game.
+//! * Stage 4 start: a part whose Metal ops are all compute dispatches (and
+//!   need no texture checks) is encoded straight into timeline command
+//!   buffers (`metal::exec_compute`): no `MetalBackend::run`, no submission
+//!   lock, no wait per command buffer, concurrent dispatch between title
+//!   barriers, overlap between the queues. `VICTORY_METAL_EXEC_COMPUTE=0`
+//!   sends those parts through `MetalBackend::run` too.
+//!
+//! Other parts (draws, clears, copies, texture checks) still run through
+//! `MetalBackend::run` on the encoder thread, one synchronous command buffer
+//! at a time. This module has not been run in the game.
 
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use victory_metal::exec::{Config, FenceId, Hooks, QueueId, Segment, Timeline, Work};
+use victory_metal::exec::{self, Config, FenceId, Hooks, QueueId, Segment, Timeline, Work};
 
 use crate::object::This;
 
@@ -61,12 +66,30 @@ fn timeline() -> Option<&'static Timeline> {
                     super::metal::stop_submissions("execution timeline");
                 }),
                 fence_reached: Box::new(|fence, value| crate::fence::set(fence as This, value)),
+                // What `run_batch` does before encoding: pending remaps and
+                // uploads, then residency.
+                prepare: Box::new(|| {
+                    let Some(m) = super::metal::backend() else { return false };
+                    super::metal_texture::drain_remap_partial();
+                    if !m.flush_uploads() {
+                        return false;
+                    }
+                    m.commit_residency();
+                    true
+                }),
             };
+            // One segment per command buffer: segments are already cut where
+            // the old path cuts command buffers.
+            cfg.max_segments_per_cb = 1;
             match Timeline::new(m.device.clone(), cfg, hooks) {
                 Ok(t) => {
                     for q in 0..2 {
                         t.queue(q).add_residency_set(m.chunks().residency());
                     }
+                    // Tables in the ring are read by GPU address.
+                    let rings: Vec<_> = t.ring_buffers().iter().map(|b| b.handle()).collect();
+                    m.add_resident(&rings);
+                    m.commit_residency();
                     Some(t)
                 }
                 Err(e) => {
@@ -76,6 +99,13 @@ fn timeline() -> Option<&'static Timeline> {
             }
         })
         .as_ref()
+}
+
+/// Whether compute-only parts go straight into timeline command buffers
+/// (`VICTORY_METAL_EXEC_COMPUTE=0`: through `MetalBackend::run` as well).
+fn timeline_compute() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_EXEC_COMPUTE").as_deref() != Ok("0"))
 }
 
 /// The timeline queue for a title queue type (D3D12_COMMAND_LIST_TYPE):
@@ -106,15 +136,25 @@ pub(crate) fn execute(kind: u32, lists: &[This]) {
         // The submission's Metal ops run with its last part, after every
         // wait (as `queue.rs` does with cuts).
         let mine = if k + 1 == n { ops.take() } else { None };
-        let mut seg = Segment::new("title part", Work::Host(Box::new(move || {
-            match mine {
-                Some(Owned(ops)) => crate::queue::run_metal_checked(&ops),
-                None => true,
+        // Compute only: straight into timeline command buffers. The part's
+        // waits go on its first segment, its writes on its last.
+        let mut segs: Vec<Segment> = match mine {
+            Some(Owned(ops)) if timeline_compute() && ops.textures.is_empty() && super::metal::exec_compute::compute_only(&ops.commands) => {
+                super::metal::exec_compute::segments(&ops.commands)
             }
-        })));
-        for w in waits {
-            let (address, value, ge) = w.as_tag();
-            seg = seg.wait_tag(address, value, ge, std::sync::Arc::new(move || w.met()));
+            Some(mine) => vec![Segment::new("title part", Work::Host(Box::new(move || {
+                let mine = mine;
+                crate::queue::run_metal_checked(&mine.0)
+            })))],
+            None => vec![Segment::new("title part", Work::None)],
+        };
+        let mut seg = segs.pop().expect("at least one segment");
+        {
+            let first = segs.first_mut().unwrap_or(&mut seg);
+            for w in waits {
+                let (address, value, ge) = w.as_tag();
+                first.waits.push(exec::Wait::Tag { tag: address, value, ge, met: std::sync::Arc::new(move || w.met()) });
+            }
         }
         for &i in &order {
             for (at, what, bytes) in taken[i].host().bottom_writes() {
@@ -133,6 +173,7 @@ pub(crate) fn execute(kind: u32, lists: &[This]) {
             let Owned((taken, order)) = lists;
             crate::list::recycle(taken, &order);
         });
+        segments.extend(segs);
         segments.push(seg);
     }
     if let Err(e) = t.submit(q, segments) {
@@ -197,6 +238,11 @@ pub(crate) fn drain(force: bool, why: &'static str) {
             gpu_tag_waits = s.gpu_tag_waits,
             gpu_fence_waits = s.gpu_fence_waits,
             budget_stalls = s.budget_stalls,
+            barriers = s.barriers,
+            barriers_elided = s.barriers_elided,
+            timeline_dispatches = super::metal::exec_compute::ENCODED[0].load(std::sync::atomic::Ordering::Relaxed),
+            timeline_indirect = super::metal::exec_compute::ENCODED[1].load(std::sync::atomic::Ordering::Relaxed),
+            d3d12_prep = ?crate::draw::metal_prep(),
             "Metal: execution timeline"
         );
     }

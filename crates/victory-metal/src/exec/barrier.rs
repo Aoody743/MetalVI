@@ -62,6 +62,11 @@ pub struct Dispatch {
     /// Data put in the command buffer's ring slice and bound as a buffer at
     /// the index (lives until the command buffer has completed).
     pub ring: Option<(Vec<u8>, u8)>,
+    /// Data put in the ring whose GPU address is written (8 bytes, little
+    /// endian) into `bytes` at the offset: one-view descriptor tables named
+    /// from the top-level argument buffer. Each datum's length is a multiple
+    /// of 8.
+    pub patches: Vec<(u32, Vec<u8>)>,
     pub reads: Vec<Range>,
     pub writes: Vec<Range>,
 }
@@ -131,10 +136,16 @@ pub fn plan(items: &[ComputeItem], policy: BarrierPolicy) -> (Vec<bool>, Plan) {
 
 /// Ring bytes a compute pass puts in its command buffer's slice.
 pub fn ring_need(items: &[ComputeItem]) -> usize {
-    RingSlice::need(items.iter().filter_map(|i| match i {
-        ComputeItem::Dispatch(Dispatch { ring: Some((b, _)), .. }) => Some(b.len()),
-        _ => None,
-    }))
+    RingSlice::need(items.iter().flat_map(|i| match i {
+        ComputeItem::Dispatch(d) => [d.ring.as_ref().map(|(b, _)| b.len()), patch_bytes(d)],
+        ComputeItem::Barrier => [None, None],
+    }).flatten())
+}
+
+/// The ring bytes of a dispatch's patches (one region), if any.
+fn patch_bytes(d: &Dispatch) -> Option<usize> {
+    let n: usize = d.patches.iter().map(|(_, data)| data.len()).sum();
+    (n > 0).then_some(n)
 }
 
 /// Thread groups a compute pass dispatches (the per-command-buffer work
@@ -164,11 +175,29 @@ pub fn encode(
         ComputeItem::Barrier => None,
     }).collect();
     // Ring offsets first: steps borrow the slice's buffer.
+    let full = || crate::Error("ring slice too small for its pass".into());
     let mut ring_offsets = Vec::with_capacity(dispatches.len());
+    let mut patched: Vec<Option<Vec<u8>>> = Vec::with_capacity(dispatches.len());
     for d in &dispatches {
         ring_offsets.push(match &d.ring {
-            Some((bytes, _)) => Some(ring.put(bytes).ok_or_else(|| crate::Error("ring slice too small for its pass".into()))?),
+            Some((bytes, _)) => Some(ring.put(bytes).ok_or_else(full)?),
             None => None,
+        });
+        patched.push(if d.patches.is_empty() {
+            None
+        } else {
+            let data: Vec<u8> = d.patches.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+            let base = ring.buffer.gpu_address + ring.put(&data).ok_or_else(full)?;
+            let mut bytes = d.bytes.as_ref().map(|(b, _)| b.clone()).unwrap_or_default();
+            let mut at = 0u64;
+            for (offset, p) in &d.patches {
+                let o = *offset as usize;
+                if o + 8 <= bytes.len() {
+                    bytes[o..o + 8].copy_from_slice(&(base + at).to_le_bytes());
+                }
+                at += p.len() as u64;
+            }
+            Some(bytes)
         });
     }
     let mut steps: Vec<Compute<'_>> = Vec::new();
@@ -184,6 +213,7 @@ pub fn encode(
             steps.push(Compute::Buffer { buffer: b, offset: *offset, index: *index });
         }
         if let Some((bytes, index)) = &d.bytes {
+            let bytes = patched[k].as_deref().unwrap_or(bytes);
             steps.push(Compute::Bytes { bytes, index: *index });
         }
         if let (Some(offset), Some((_, index))) = (ring_offsets[k], &d.ring) {
@@ -212,6 +242,7 @@ pub(super) mod tests {
             buffers: vec![],
             bytes: None,
             ring: None,
+            patches: vec![],
             reads: r(reads),
             writes: r(writes),
         })
