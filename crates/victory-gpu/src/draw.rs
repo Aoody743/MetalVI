@@ -2676,6 +2676,10 @@ impl State {
         // descriptors, the title's as one-view tables bounded by the title
         // buffer that holds them (zero copy: a stray write is corruption).
         let mut tables = Vec::new();
+        // Our own buffers first: making one adds it to the residency set,
+        // which takes the chunks lock held below.
+        let wave_scratch_gpu = if host.root_uavs.contains(&SLOT_WAVE_SCRATCH) { m.wave_scratch_gpu() } else { 0 };
+        let diag_gpu = if host.root_uavs.contains(&victory_shader::emit::SLOT_DIAG) { crate::backend::metal::diag::gpu(m) } else { 0 };
         {
             use crate::backend::metal::{RootSlot, root_layout};
             let mut chunks = m.chunks();
@@ -2687,11 +2691,11 @@ impl State {
                         continue;
                     }
                     RootSlot::Uav(s) if s == SLOT_WAVE_SCRATCH => {
-                        top.set_u64(i, m.wave_scratch_gpu());
+                        top.set_u64(i, wave_scratch_gpu);
                         continue;
                     }
                     RootSlot::Uav(s) if s == victory_shader::emit::SLOT_DIAG => {
-                        top.set_u64(i, crate::backend::metal::diag::gpu(m));
+                        top.set_u64(i, diag_gpu);
                         continue;
                     }
                     RootSlot::Srv(s) if s == victory_shader::emit::SLOT_MEMORY => {
