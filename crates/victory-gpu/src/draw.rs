@@ -2018,6 +2018,20 @@ impl State {
             }
         };
         count(bound.outcome);
+        let loop_counts = if crate::backend::metal::want_loop_counts(&p.name) {
+            let counts = match self.roots_ref(true).as_slice() {
+                [Root::Table(table), _, Root::Constants(values), ..] =>
+                    table.checked_add(0x500)
+                        .filter(|&handle| self.heap_of(handle).is_some())
+                        .zip(values.get(1))
+                        .and_then(|(handle, &base)| m.a1f6_loop_counts(handle, base)),
+                _ => None,
+            };
+            if counts.is_none() {
+                once!(pipeline = %p.name, "Metal: no mappable descriptor for dispatch loop count inputs");
+            }
+            counts
+        } else { None };
         self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Dispatch(crate::backend::metal::MetalCmd {
             pso: mp,
             heap: bound.heap,
@@ -2025,6 +2039,7 @@ impl State {
             top: bound.top,
             groups: groups.map(u64::from),
             tables: bound.tables,
+            loop_counts,
         })));
         true
     }

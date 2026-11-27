@@ -146,27 +146,40 @@ pub(super) fn trace_indirect_writer(pipeline: &str) -> bool {
         .as_ref().is_some_and(|s| pipeline.contains(s))
 }
 
-pub(super) fn snapshot_arguments(
+pub(super) fn a1f6_count_offsets(root: u32, view_bytes: u64) -> Option<[u64; 2]> {
+    let offsets = [4, 0x374].map(|n| u64::from(root.wrapping_add(n)));
+    offsets.iter().all(|&n| n % 4 == 0 && n + 4 <= view_bytes).then_some(offsets)
+}
+
+#[test]
+fn a1f6_loop_count_offsets_match_scalar_loads() {
+    assert_eq!(a1f6_count_offsets(0x400, 0x778), Some([0x404, 0x774]));
+    assert_eq!(a1f6_count_offsets(0x400, 0x777), None);
+    assert_eq!(a1f6_count_offsets(1, 0x800), None);
+    assert_eq!(a1f6_count_offsets(u32::MAX - 3, 0x374), Some([0, 0x370]));
+}
+
+pub(super) fn snapshot_words<const N: usize>(
     device: &victory_metal::Device,
     queue: &victory_metal::Queue,
     sources: &[(&victory_metal::Buffer, u64)],
-) -> victory_metal::Result<Vec<[u32; 3]>> {
-    const RECORD: usize = 12;
-    let size = sources.len() * RECORD;
+) -> victory_metal::Result<Vec<[u32; N]>> {
+    let record = N * 4;
+    let size = sources.len() * record;
     let (dst, mapped) = device.shared_buffer_mapped(&vec![0; size])?;
     let cb = queue.command_buffer()?;
     let mut blit = cb.blit_encoder()?;
     for (i, &(src, offset)) in sources.iter().enumerate() {
-        if offset % 4 != 0 || offset.checked_add(RECORD as u64).is_none_or(|end| end > src.len) {
+        if offset % 4 != 0 || offset.checked_add(record as u64).is_none_or(|end| end > src.len) {
             return Err(victory_metal::Error("invalid indirect snapshot window".into()));
         }
-        blit.copy_buffer(src, offset, &dst, (i * RECORD) as u64, RECORD as u64);
+        blit.copy_buffer(src, offset, &dst, (i * record) as u64, record as u64);
     }
     blit.finish();
     super::submit_checked(&cb, &[], true, "indirect writer snapshot")?;
     // SAFETY: the buffer is still owned here and submit_checked waited successfully.
     let bytes = unsafe { std::slice::from_raw_parts(mapped, size) };
-    Ok(bytes.chunks_exact(RECORD).map(|record| {
+    Ok(bytes.chunks_exact(record).map(|record| {
         std::array::from_fn(|i| u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap()))
     }).collect())
 }
@@ -179,7 +192,7 @@ fn snapshot_indirect_arguments_reads_gpu_writes() {
     let queue = device.new_queue(1).unwrap();
     let buffer = device.shared_buffer(&[0; 16]).unwrap();
     let sources = [(&buffer, 4)];
-    assert_eq!(snapshot_arguments(&device, &queue, &sources).unwrap(), [[0; 3]]);
+    assert_eq!(snapshot_words::<3>(&device, &queue, &sources).unwrap(), [[0; 3]]);
     let pipeline = device.compute_pipeline_msl(
         "#include <metal_stdlib>\nkernel void write_args(device uint *p [[buffer(0)]]) { p[1]=2; p[2]=1; p[3]=1; }",
         "write_args",
@@ -191,7 +204,8 @@ fn snapshot_indirect_arguments_reads_gpu_writes() {
         Compute::Dispatch { groups: [1, 1, 1] },
     ]).unwrap();
     super::submit_checked(&cb, &[], true, "synthetic argument producer").unwrap();
-    assert_eq!(snapshot_arguments(&device, &queue, &sources).unwrap(), [[2, 1, 1]]);
+    assert_eq!(snapshot_words::<3>(&device, &queue, &sources).unwrap(), [[2, 1, 1]]);
+    assert_eq!(snapshot_words::<1>(&device, &queue, &[(&buffer, 4), (&buffer, 12)]).unwrap(), [[2], [1]]);
 }
 
 pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>,

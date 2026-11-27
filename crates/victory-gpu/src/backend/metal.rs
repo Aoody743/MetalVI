@@ -186,6 +186,35 @@ pub(crate) struct MetalCmd {
     /// One-view tables: (offset in `top` of the table's address, its one
     /// entry), written into the submission's table ring when run.
     pub(crate) tables: Vec<(u32, DescriptorEntry)>,
+    pub(crate) loop_counts: Option<[(u64, Buffer, u64); 2]>,
+}
+
+pub(crate) fn want_loop_counts(name: &str) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    name.contains("a1f6cdf8874960a9")
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_METAL_TRACE_LOOP_COUNTS").is_some_and(|s| s == "1"))
+}
+
+impl MetalBackend {
+    pub(crate) fn a1f6_loop_counts(&self, handle: u64, base: u32) -> Option<[(u64, Buffer, u64); 2]> {
+        use super::metal_views::{placed_address, srv_window};
+        use crate::descriptor::{View, view};
+        let (address, window) = match view(handle)? {
+            View::Placed(false, resource, desc) if resource[0] == 1 =>
+                (placed_address(&desc), srv_window(&desc[..10])?),
+            View::Shader(resource, Some(desc)) =>
+                (crate::resource::buffer_bytes(resource as crate::object::This)?.0 as u64, srv_window(&desc)?),
+            _ => return None,
+        };
+        let mut chunks = self.chunks();
+        let [first, second] = work::a1f6_count_offsets(base, window.bytes)?;
+        let mut at = |offset| {
+            let va = address.checked_add(window.offset)?.checked_add(offset)?;
+            let (buffer, offset) = chunks.window_buffer(va, 4)?;
+            Some((va, buffer, offset))
+        };
+        Some([at(first)?, at(second)?])
+    }
 }
 
 /// One indirect compute dispatch as recorded into a title list.
@@ -849,6 +878,18 @@ impl MetalBackend {
             match &*ops[i] {
                 MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
                 MetalOp::Dispatch(producer) => {
+                    if pass_cap == 1 && let Some(counts) = &producer.loop_counts {
+                        let sources = counts.each_ref().map(|(_, buffer, offset)| (buffer, *offset));
+                        match work::snapshot_words::<1>(&self.device, &self.queue, &sources) {
+                            Ok(values) => tracing::debug!(batch, op_index = i, pipeline = %producer.pso.name,
+                                first_va = counts[0].0, second_va = counts[1].0, first = values[0][0],
+                                second = values[1][0], "Metal: dispatch loop count inputs"),
+                            Err(e) => {
+                                tracing::error!(%e, batch, op_index = i, "Metal: loop count snapshot failed");
+                                return work::reject("loop count snapshot");
+                            }
+                        }
+                    }
                     if pass_cap == 1 && work::trace_indirect_writer(&producer.pso.name) {
                         let consumers: Vec<_> = ops.iter().enumerate().skip(i + 1).take(32).filter_map(|(index, op)| {
                             match &**op {
@@ -858,7 +899,7 @@ impl MetalBackend {
                         }).take(8).collect();
                         if !consumers.is_empty() {
                             let sources: Vec<_> = consumers.iter().map(|(_, c)| (&c.records, c.records_offset)).collect();
-                            let before = match work::snapshot_arguments(&self.device, &self.queue, &sources) {
+                            let before = match work::snapshot_words::<3>(&self.device, &self.queue, &sources) {
                                 Ok(args) => args,
                                 Err(e) => {
                                     tracing::error!(%e, batch, producer = i, "Metal: indirect writer snapshot before failed");
@@ -1322,7 +1363,7 @@ impl MetalBackend {
                     return false;
                 }
                 if let Some((consumers, sources, before)) = indirect_writes {
-                    let after = match work::snapshot_arguments(&self.device, &self.queue, &sources) {
+                    let after = match work::snapshot_words::<3>(&self.device, &self.queue, &sources) {
                         Ok(args) => args,
                         Err(e) => {
                             tracing::error!(%e, batch, producer = group_start, "Metal: indirect writer snapshot after failed");
