@@ -14,6 +14,7 @@ pub(super) fn within_limits(work: victory_metal::EncodedWork) -> bool {
         work.blit_texels <= 8 * 1024 * 1024 && work.resolve_pixels <= 8 * 1024 * 1024
 }
 pub(super) static REJECTIONS: AtomicU64 = AtomicU64::new(0);
+pub(super) static SPLITS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
 thread_local! {
@@ -56,7 +57,7 @@ fn estimate(op: &MetalOp) -> Option<u64> {
     let (cost, units) = profile(op)?;
     let measured = cost.load(Ordering::Relaxed);
     // Bootstrap only. Neither an estimate nor an observed time is a WCET.
-    Some(units.saturating_mul(if measured == 0 { 1_000 } else { measured }).max(100_000))
+    Some(if measured == 0 { WINDOW_NS } else { units.saturating_mul(measured).max(100_000) })
 }
 
 pub(super) fn reservation(ops: &[Arc<MetalOp>]) -> u64 {
@@ -79,6 +80,24 @@ pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
 }
 
 impl Budget {
+    /// Return the fitting prefix. Never consume the first operation of the next
+    /// buffer; the caller re-evaluates it after the preceding buffer completes.
+    pub(super) fn prefix(ops: &[Arc<MetalOp>]) -> usize {
+        let mut b = Self::default();
+        ops.iter().take_while(|op| {
+            let fits = match &***op {
+                MetalOp::Dispatch(c) => b.charge(c.groups, 0),
+                MetalOp::DispatchIndirect(c) => b.reserve_indirect(c.max, true, false),
+                MetalOp::Draw(d) => b.draw(&d.kind) && match &d.kind {
+                    DrawKind::Indirect { max, index, .. } => b.reserve_indirect(*max,
+                        d.pso.mesh || d.pso.geometry.is_some(), !d.pso.mesh || d.pso.geometry.is_some() || index.is_some()),
+                    _ => true,
+                },
+                _ => true,
+            };
+            fits && b.charge_time(op)
+        }).count()
+    }
     pub(super) fn charge_time(&mut self, op: &MetalOp) -> bool {
         self.estimated_ns = self.estimated_ns.saturating_add(estimate(op).unwrap_or(WINDOW_NS));
         self.estimated_ns <= WINDOW_NS

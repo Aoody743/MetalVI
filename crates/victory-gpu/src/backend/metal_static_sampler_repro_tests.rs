@@ -468,6 +468,9 @@ fn direct_budget_stops_submission() { run_order_probe(Some("one-group")); }
 #[ignore = "trips process-wide fuse; run alone"]
 fn predicted_time_stops_submission() { run_order_probe(Some("estimated-time")); }
 
+#[test]
+fn budget_boundary_preserves_order() { run_order_probe(Some("split-time")); }
+
 fn run_order_probe(fault: Option<&'static str>) {
     let dxil = std::fs::read(dxil_dir().expect("F85 DXIL fixtures required").join("cs_order.dxil")).unwrap();
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
@@ -501,7 +504,7 @@ fn run_order_probe(fault: Option<&'static str>) {
             heap: None,
             sampler_heap: None,
             top: top.bytes,
-            groups: [1, 1, 1],
+            groups: [if fault == Some("one-group") { 2 } else { 1 }, 1, 1],
             tables: Vec::new(),
         })));
         expected = expected.wrapping_mul(3).wrapping_add(k);
@@ -509,10 +512,11 @@ fn run_order_probe(fault: Option<&'static str>) {
     unsafe { mem.cast::<u32>().write(0) };
     work::FAULT.set(fault);
     if fault == Some("estimated-time") {
-        // Two one-group operations, each predicted at 30ms, may not share a 50ms CB.
-        mp.cost_ns.store(30_000_000, std::sync::atomic::Ordering::Relaxed);
+        mp.cost_ns.store(work::WINDOW_NS + 1, std::sync::atomic::Ordering::Relaxed);
     }
-    if fault.is_some() {
+    if fault == Some("split-time") {
+        mp.cost_ns.store(30_000_000, std::sync::atomic::Ordering::Relaxed);
+    } else if fault.is_some() {
         assert!(!backend.run(&ops));
         assert_eq!(work::REJECTIONS.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(unsafe { mem.cast::<u32>().read() }, 0);
@@ -524,6 +528,10 @@ fn run_order_probe(fault: Option<&'static str>) {
         return;
     }
     assert!(backend.run(&ops));
+    if fault == Some("split-time") {
+        assert_eq!(work::SPLITS.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(!backend.submissions_stopped());
+    }
     let got = unsafe { mem.cast::<u32>().read() };
     assert_eq!(got, expected, "dispatches ran out of order or were lost");
     assert_ne!(mp.cost_ns.load(std::sync::atomic::Ordering::Relaxed), 0, "completion worker did not publish pipeline timing");

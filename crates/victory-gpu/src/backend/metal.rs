@@ -827,11 +827,22 @@ impl MetalBackend {
         };
         let mut i = 0;
         let mut budget = work::Budget::default();
+        let mut planned_end = 0;
         let mut clamp_counter = None;
         let mut ok = true;
         let mut copy_scratch = None;
         let mut readback_scratch: Option<Buffer> = None;
         while i < ops.len() && ok {
+            if i == cb_start {
+                planned_end = i + work::Budget::prefix(&ops[i..]);
+                if planned_end == i {
+                    tracing::error!(at = i, op = ?describe_fault_ops(&ops[i..=i]), "Metal: single operation does not fit an empty buffer");
+                    return work::reject("unbounded or oversized single operation");
+                }
+                if planned_end < ops.len() && split_event.is_none() {
+                    return work::reject("budget split needs an ordering event");
+                }
+            }
             let group_start = i;
             match &*ops[i] {
                 MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
@@ -840,7 +851,7 @@ impl MetalBackend {
                     let mut in_pass = 0u32;
                     while let Some(MetalOp::Dispatch(c)) = ops.get(i).map(|o| &**o) {
                         // A pass of at most `pass_dispatches` (see `bounded`).
-                        if in_pass >= pass_dispatches {
+                        if i == planned_end || in_pass >= pass_dispatches {
                             break;
                         }
                         if fuse::blown(&c.pso) {
@@ -1064,7 +1075,7 @@ impl MetalBackend {
                     {
                         let mut j = i;
                         while let Some(MetalOp::Draw(d)) = ops.get(j).map(|o| &**o) {
-                            if !d.targets.same(&t) {
+                            if j == planned_end || !d.targets.same(&t) {
                                 break;
                             }
                             if !budget.draw(&d.kind) {
@@ -1132,7 +1143,7 @@ impl MetalBackend {
                     let mut steps: Vec<Render> = Vec::new();
                     let mut depth_written = false;
                     while let Some(MetalOp::Draw(d)) = ops.get(i).map(|o| &**o) {
-                        if !d.targets.same(&t) {
+                        if i == planned_end || !d.targets.same(&t) {
                             break;
                         }
                         let g = &d.pso;
@@ -1274,7 +1285,8 @@ impl MetalBackend {
                     }
                 }
             }
-            if split && ok {
+            let budget_cut = i == planned_end && i < ops.len();
+            if split && ok && !budget_cut {
                 let result = submit_checked(&cb, &ops[group_start..i], true, "split pass");
                 work::report(&cb, clamp_counter.take());
                 if let Err(e) = result {
@@ -1293,10 +1305,9 @@ impl MetalBackend {
                 budget = work::Budget::default();
                 cb_start = i;
             } else if let Some(split_event) = split_event
-                && bounded
                 && ok
                 && i < ops.len()
-                && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))
+                && (budget_cut || (bounded && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))))
             {
                 // The next command buffer waits for this one to finish: the
                 // queue starts them in order but does not order their memory
@@ -1314,6 +1325,10 @@ impl MetalBackend {
                 }
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
+                if budget_cut {
+                    let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    tracing::info!(total, ops = i - cb_start, "Metal: budget split");
+                }
                 earlier.push((std::mem::replace(&mut cb, next), cb_start..i));
                 budget = work::Budget::default();
                 cb_start = i;
