@@ -140,6 +140,60 @@ pub(super) fn trace_indirect(pipeline: &str) -> bool {
         .iter().any(|id| pipeline.contains(id))
 }
 
+pub(super) fn trace_indirect_writer(pipeline: &str) -> bool {
+    static FILTER: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FILTER.get_or_init(|| std::env::var("VICTORY_METAL_TRACE_INDIRECT_WRITER").ok().filter(|s| !s.is_empty()))
+        .as_ref().is_some_and(|s| pipeline.contains(s))
+}
+
+pub(super) fn snapshot_arguments(
+    device: &victory_metal::Device,
+    queue: &victory_metal::Queue,
+    sources: &[(&victory_metal::Buffer, u64)],
+) -> victory_metal::Result<Vec<[u32; 3]>> {
+    const RECORD: usize = 12;
+    let size = sources.len() * RECORD;
+    let (dst, mapped) = device.shared_buffer_mapped(&vec![0; size])?;
+    let cb = queue.command_buffer()?;
+    let mut blit = cb.blit_encoder()?;
+    for (i, &(src, offset)) in sources.iter().enumerate() {
+        if offset % 4 != 0 || offset.checked_add(RECORD as u64).is_none_or(|end| end > src.len) {
+            return Err(victory_metal::Error("invalid indirect snapshot window".into()));
+        }
+        blit.copy_buffer(src, offset, &dst, (i * RECORD) as u64, RECORD as u64);
+    }
+    blit.finish();
+    super::submit_checked(&cb, &[], true, "indirect writer snapshot")?;
+    // SAFETY: the buffer is still owned here and submit_checked waited successfully.
+    let bytes = unsafe { std::slice::from_raw_parts(mapped, size) };
+    Ok(bytes.chunks_exact(RECORD).map(|record| {
+        std::array::from_fn(|i| u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap()))
+    }).collect())
+}
+
+#[test]
+fn snapshot_indirect_arguments_reads_gpu_writes() {
+    use victory_metal::{Compute, Device, Pool};
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let buffer = device.shared_buffer(&[0; 16]).unwrap();
+    let sources = [(&buffer, 4)];
+    assert_eq!(snapshot_arguments(&device, &queue, &sources).unwrap(), [[0; 3]]);
+    let pipeline = device.compute_pipeline_msl(
+        "#include <metal_stdlib>\nkernel void write_args(device uint *p [[buffer(0)]]) { p[1]=2; p[2]=1; p[3]=1; }",
+        "write_args",
+    ).unwrap();
+    let cb = queue.command_buffer().unwrap();
+    cb.compute(&[
+        Compute::Pipeline { pipeline: &pipeline, threads_per_group: [1, 1, 1] },
+        Compute::Buffer { buffer: &buffer, offset: 0, index: 0 },
+        Compute::Dispatch { groups: [1, 1, 1] },
+    ]).unwrap();
+    super::submit_checked(&cb, &[], true, "synthetic argument producer").unwrap();
+    assert_eq!(snapshot_arguments(&device, &queue, &sources).unwrap(), [[2, 1, 1]]);
+}
+
 pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>,
     batch: u64, traces: &mut Vec<(usize, victory_metal::indirect::IndirectTrace)>) {
     if let Some(counter) = counter {

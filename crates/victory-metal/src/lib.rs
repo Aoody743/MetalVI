@@ -225,7 +225,10 @@ impl Device {
         self.shared_buffer_mapped(bytes).map(|(buffer, _)| buffer)
     }
 
-    fn shared_buffer_mapped(&self, bytes: &[u8]) -> Result<(Buffer, *mut u8)> {
+    /// Creates a Metal-owned shared buffer and returns its CPU address.
+    /// The pointer is valid while the buffer lives. The caller must synchronize
+    /// GPU access before reading or writing through it.
+    pub fn shared_buffer_mapped(&self, bytes: &[u8]) -> Result<(Buffer, *mut u8)> {
         let len = bytes.len() as u64;
         let mut info = sys::WMTBufferInfo {
             length: len,

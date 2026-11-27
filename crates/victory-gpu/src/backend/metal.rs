@@ -845,9 +845,29 @@ impl MetalBackend {
                 }
             }
             let group_start = i;
+            let mut indirect_writes = None;
             match &*ops[i] {
                 MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
-                MetalOp::Dispatch(_) => {
+                MetalOp::Dispatch(producer) => {
+                    if pass_cap == 1 && work::trace_indirect_writer(&producer.pso.name) {
+                        let consumers: Vec<_> = ops.iter().enumerate().skip(i + 1).take(32).filter_map(|(index, op)| {
+                            match &**op {
+                                MetalOp::DispatchIndirect(c) if c.max != 0 && work::trace_indirect(&c.pso.name) => Some((index, c)),
+                                _ => None,
+                            }
+                        }).take(8).collect();
+                        if !consumers.is_empty() {
+                            let sources: Vec<_> = consumers.iter().map(|(_, c)| (&c.records, c.records_offset)).collect();
+                            let before = match work::snapshot_arguments(&self.device, &self.queue, &sources) {
+                                Ok(args) => args,
+                                Err(e) => {
+                                    tracing::error!(%e, batch, producer = i, "Metal: indirect writer snapshot before failed");
+                                    return work::reject("indirect writer snapshot");
+                                }
+                            };
+                            indirect_writes = Some((consumers, sources, before));
+                        }
+                    }
                     let mut steps = Vec::new();
                     let mut in_pass = 0u32;
                     while let Some(MetalOp::Dispatch(c)) = ops.get(i).map(|o| &**o) {
@@ -1300,6 +1320,19 @@ impl MetalBackend {
                     tracing::warn!(error = %e, "Metal: a bounded command buffer failed");
                     fuse::stop();
                     return false;
+                }
+                if let Some((consumers, sources, before)) = indirect_writes {
+                    let after = match work::snapshot_arguments(&self.device, &self.queue, &sources) {
+                        Ok(args) => args,
+                        Err(e) => {
+                            tracing::error!(%e, batch, producer = group_start, "Metal: indirect writer snapshot after failed");
+                            return work::reject("indirect writer snapshot");
+                        }
+                    };
+                    for (((consumer, c), before), after) in consumers.into_iter().zip(before).zip(after) {
+                        tracing::debug!(batch, producer = group_start, consumer, records_va = c.records_va,
+                            ?before, ?after, "Metal: indirect writer snapshot");
+                    }
                 }
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
