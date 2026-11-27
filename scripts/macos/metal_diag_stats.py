@@ -17,6 +17,10 @@ FIELD = re.compile(r'(\w+)=("([^"]*)"|\S+)')
 
 def fields(line):
     out = {}
+    # `ops` is last and holds spaces: everything after it
+    if " ops=" in line:
+        line, ops = line.split(" ops=", 1)
+        out["ops"] = ops.strip()
     for m in FIELD.finditer(line):
         out[m.group(1)] = m.group(3) if m.group(3) is not None else m.group(2)
     return out
