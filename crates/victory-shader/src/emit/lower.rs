@@ -341,6 +341,9 @@ struct Lower<'a> {
     /// `half_sync` sites emitted so far (each its own counter in
     /// [`super::shader::SLOT_DIAG`]).
     sync_sites: u32,
+    /// [`Self::sync_sites`] when each loop header was lowered: a loop whose back edge
+    /// finds more has half-wave meetings inside.
+    loop_sites: HashMap<usize, u32>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -482,6 +485,12 @@ pub(super) fn needs_every_lane(what: &str) -> bool {
 /// (its "... where not every lane runs" refusals), which it forgets.
 pub(super) fn take_needs() -> Vec<usize> {
     NEEDS.take()
+}
+
+/// Blocks whose own closing branch the last lowering on this thread wanted taken by the whole
+/// wave (a loop's back edge on a lane mask, with half-wave meetings inside), which it forgets.
+pub(super) fn take_widen() -> Vec<usize> {
+    WIDEN.take()
 }
 
 fn need(block: usize) {
@@ -1079,6 +1088,8 @@ pub fn host_has_image_atomic64() -> bool {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// See [`take_widen`].
+    static WIDEN: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
@@ -1769,6 +1780,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             sync_sites: 0,
+            loop_sites: HashMap::new(),
             budget: None,
             pops: false,
         }
@@ -2425,6 +2437,9 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            if self.counters.contains_key(&b) {
+                self.loop_sites.insert(b, self.sync_sites);
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -11470,6 +11485,34 @@ impl<'a> Lower<'a> {
                 taken,
                 not_taken,
             } => {
+                // A loop's back edge on a lane mask (`s_cbranch_scc1` on "some lane left",
+                // `vccz`, ...) is the wave's decision on the console. Two host waves that
+                // meet inside the loop must take it together, or each half leaves after its
+                // own lanes and the other waits at every meeting until the poll limit
+                // (a1bf269d5b19f025: timeouts at its loop headers 0xe0, 0x2a0, 0x350, 0x4d0).
+                if !self.x.st.wide.contains(&b)
+                    && self.x.st.wave_any.get(b).copied().flatten().is_some()
+                    && self.half_sync_slot.is_some()
+                    && !self.local
+                    && std::env::var_os("VICTORY_WAVE_LOOP_EXITS").is_none_or(|v| v != "0")
+                {
+                    // (straight to the header, or through a latch that only jumps there)
+                    let to_header = |l: &Self, t: usize| {
+                        let h = match l.x.st.exits[t] {
+                            LaneExit::Jump(h) if !l.counters.contains_key(&t) => h,
+                            _ => t,
+                        };
+                        (l.counters.contains_key(&h) && l.rpo[h] <= l.rpo[b]).then_some(h)
+                    };
+                    let header = to_header(self, taken).or_else(|| to_header(self, not_taken));
+                    if let Some(h) = header
+                        && self.sync_sites > self.loop_sites.get(&h).copied().unwrap_or(u32::MAX)
+                    {
+                        WIDEN.with_borrow_mut(|w| if !w.contains(&b) { w.push(b) });
+                        need(b);
+                        return Err(unsupported(offset, "a loop exit each half-wave takes alone where not every lane runs"));
+                    }
+                }
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     _ if self.x.st.wide.contains(&b) => {

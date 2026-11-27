@@ -82,7 +82,7 @@ fn program_of(body: &[u32], wave64: bool) -> NativeProgram {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [64, 1, 1] }),
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | u32::from(body == LDS_LOOP) << 15, threads: [64, 1, 1] }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     }
 }
@@ -367,16 +367,61 @@ fn an_early_out_over_a_loop_is_taken_by_the_whole_wave() {
     assert!(bad.is_empty(), "(live, threads cut, timeouts): {bad:?}");
 }
 
-/// KNOWN WRONG: a wave with some lanes left. The lanes past the count walk the
-/// loop with EXEC clear and decide its `vccz` exit by their own bit, which a
-/// compare writes as 0 outside EXEC: they go round until the budget. The
-/// console decides by the lanes in EXEC (their compare of two scalars).
-/// Needs mask-decided loop exits taken by the whole wave wherever lanes may
-/// walk with EXEC clear (2561af9577c47289's exits already are: its loops hold
-/// exchanges, so their exits are wave-wide).
+/// A wave with some lanes left: the lanes past the count walk the loop with
+/// EXEC clear, and decided its `vccz` exit by their own bit (0 outside EXEC)
+/// until the loop exits with half-wave meetings inside were taken by the whole
+/// wave: they went round until the budget (108 threads cut).
 #[test]
-#[ignore = "known wrong: EXEC-clear lanes decide a per-lane vccz loop exit by their own bit"]
 fn an_early_out_over_a_loop_with_some_lanes_left() {
     let bad = early_out_loop_case(&[10, 32, 40]);
     assert!(bad.is_empty(), "(live, threads cut, timeouts): {bad:?}");
+}
+
+/// a1bf269d5b19f025's loop at 0xe0: each lane walks its own range (lane t
+/// t + 1 times), an LDS atomic add in the loop, the lanes done leave EXEC
+/// (`v_cmpx`, `s_andn2`) and the wave goes round while any lane is left
+/// (`s_cbranch_scc1`). Every lane then reads the sum, 2080, from LDS.
+const LDS_LOOP: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xBE98_047E, // s_mov_b64 s[24:25], exec
+    0x7E10_0280, // v_mov_b32 v8, 0
+    0x7E14_0280, // v_mov_b32 v10, 0
+    0xD834_0000, 0x0000_0A08, // ds_write_b32 v8, v10
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0xBE84_047E, // s_mov_b64 s[4:5], exec
+    0x7E0C_0280, // v_mov_b32 v6, 0
+    0xD760_0015, 0x0001_4100, // v_readlane_b32 s21, v0, 32 (32: a lane read across halves,
+    0x8095_A015, // s_sub_u32 s21, s21, 32              as a1bf's mbcnt sums are)
+    0x4A26_0015, // v_add_nc_u32 v19, s21, v0
+    0x4A26_2681, // v_add_nc_u32 v19, 1, v19
+    0x7E12_0281, // v_mov_b32 v9, 1
+    0xBF82_0001, // s_branch HDR
+    0x87FE_0406, // LATCH: s_and_b64 exec, s[6:7], s[4:5]
+    0x4A0C_0C81, // HDR: v_add_nc_u32 v6, 1, v6
+    0xBE86_047E, // s_mov_b64 s[6:7], exec
+    0xD800_0000, 0x0000_0908, // ds_add_u32 v8, v9
+    0x7DA4_2706, // v_cmpx_eq_u32 v6, v19
+    0x8A84_7E04, // s_andn2_b64 s[4:5], s[4:5], exec
+    0xBF85_FFF8, // s_cbranch_scc1 LATCH
+    0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xBF8A_0000, // s_barrier
+    0xD8D8_0000, 0x0100_0008, // ds_read_b32 v1, v8
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+];
+
+#[test]
+fn a_per_lane_loop_with_lds_inside_runs_in_both_halves_together() {
+    let _pool = victory_metal::Pool::new();
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program_of(LDS_LOOP, true)).expect("translate");
+    let backend = MetalBackend::new().unwrap();
+    let r = run(&backend, &shader, 64, 2, 0);
+    let last = diag::LAST.lock().unwrap().clone();
+    eprintln!("REPRO per-lane LDS loop: lanes 0/31/32/63 read {}/{}/{}/{} (want 2080), timeouts {} {last:?}, GPU {:.3} ms",
+        r.out[0], r.out[31], r.out[32], r.out[63], r.timeouts, r.ms);
+    assert_eq!(r.timeouts, 0, "half-wave syncs timed out: {:?}", r.sites);
+    assert!(r.out.iter().all(|&v| v == 2080), "{:?}", r.out);
 }
