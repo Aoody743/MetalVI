@@ -1,6 +1,6 @@
 # MetalVI native Metal backend v2: execution architecture
 
-> **Status: design document, not implemented yet.** Written 2026-11-27. Section 1 describes the current code (some of the newest parts are still local). That code still uses the old execution model: synchronous submission on a single queue. v2 is built in stages (see the roadmap in the README). All performance numbers here are predictions, not measurements.
+> **Status: design document, not implemented yet.** Written 2026-11-27. Section 1 describes the current code. That code still uses the old execution model: synchronous submission on a single queue. v2 is built in stages (see the roadmap in the README). All performance numbers here are predictions, not measurements.
 
 **English** · [简体中文](metal-architecture-v2.zh-CN.md)
 

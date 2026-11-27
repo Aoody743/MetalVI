@@ -121,7 +121,7 @@ Full design: [docs/metal-architecture-v2.md](docs/metal-architecture-v2.md).
 
 ## Status at a glance
 
-Measured on an M1 Max (64 GB, macOS 15.7.9), as of 2026-11-27. Items marked *in progress* are partly published; the latest safety and memory-directory work is still local and uncommitted.
+Measured on an M1 Max (64 GB, macOS 15.7.9), as of 2026-11-27. Items marked *in progress* are published but incomplete.
 
 | Area | State |
 | --- | --- |
