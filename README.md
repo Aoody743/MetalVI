@@ -121,7 +121,7 @@ Full design: [docs/metal-architecture-v2.md](docs/metal-architecture-v2.md).
 
 ## Status at a glance
 
-Measured on an M1 Max (64 GB, macOS 15.7.9), as of 2026-11-27. Items marked *dev branch* are not published in this repository yet.
+Measured on an M1 Max (64 GB, macOS 15.7.9), as of 2026-11-27. Items marked *in progress* are partly published; the latest safety and memory-directory work is still local and uncommitted.
 
 | Area | State |
 | --- | --- |
@@ -131,9 +131,9 @@ Measured on an M1 Max (64 GB, macOS 15.7.9), as of 2026-11-27. Items marked *dev
 | Compute shaders on native Metal | ✅ 99.3% of dispatches fully bound |
 | GPU texture detiling, zero copy from game memory | ✅ byte-exact against the CPU reference, on by default |
 | CPU-side 3D frame time (rendering off) | 35–75 ms (about 46–52 ms with msync) |
-| Drawing and presenting on Metal | 🚧 *dev branch*: runs, but depends on the old D3D12 preparation path. The G-buffer is correct; after lighting and post-processing the picture is mostly black |
+| Drawing and presenting on Metal | 🚧 *in progress*: runs, but depends on the old D3D12 preparation path. The G-buffer is correct; after lighting and post-processing the picture is mostly black |
 | Real 3D average frame rate, stalls included | ⚠️ 1.2–2.5 fps (it hits the game's own 30 fps cap between stalls, but stalls last seconds) |
-| GPU safety (a bound on GPU time per submission) | 🚧 *dev branch*: split submissions and an after-the-fact fuse, **no hard bound yet** |
+| GPU safety (a bound on GPU time per submission) | 🚧 *in progress*: split submissions and an after-the-fact fuse, **no hard bound yet** |
 | Shader translation | 🚧 7 failures out of 25,953 programs; 27 mesh pipelines exceed Metal's 32 KiB output limit |
 | Execution architecture v2 (async multi-queue, TBDR, parallel encoding) | 📐 designed, not implemented |
 | Playable | ❌ not yet |
@@ -164,7 +164,7 @@ timeline
     Shaders : Metal Shader Converter in process : 99.2 % of 32,503 shaders convert
     Compute on Metal : Descriptor heaps, textures, samplers, typed buffers : 99.3 % of dispatches fully bound
     Stability : Rosetta masked-store race found and fixed : Wine metadata deadlock fixed : 10-minute runs, no crash
-    Drawing : Metal draws, present and indirect draws on the dev branch : Root cause of the whole-Mac GPU freezes found
+    Drawing : Metal draws, present and indirect draws in progress : Root cause of the whole-Mac GPU freezes found
     Redesign : Execution architecture v2 : async multi-queue, TBDR pass planner, parallel encoding, safety v2
 ```
 
@@ -243,7 +243,7 @@ Done:
 - [x] P0: `victorymetal` unixlib, zero-copy chunks, residency, safe Rust wrappers
 - [x] P1: compute on Metal in-game: MSC in-process, heaps, textures, samplers, typed buffers, GPU detile, disk cache
 - [x] Stability: Rosetta masked-store race, Wine metadata deadlock, hang watchdog
-- [x] P2/P3 prototype (*dev branch*): Metal draws, present, indirect draws, depth and MSAA resolve. It depends on the old D3D12 preparation path, which v2 replaces
+- [x] P2/P3 prototype: Metal draws, present, indirect draws, depth and MSAA resolve. It depends on the old D3D12 preparation path, which v2 replaces
 
 Execution architecture v2 ([design](docs/metal-architecture-v2.md)):
 - [ ] Stage 1: GPU safety gate v2 (encode-time work bounds, clamped indirect arguments, in-flight budget, asynchronous checks)
