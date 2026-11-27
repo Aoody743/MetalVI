@@ -55,6 +55,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/intersect_tests.rs"),
         include_str!("emit/lane_loops.rs"),
         include_str!("emit/lower.rs"),
+        include_str!("emit/lower_diag.rs"),
         include_str!("emit/lower_image.rs"),
         include_str!("emit/lower_tests.rs"),
         include_str!("emit/mod.rs"),

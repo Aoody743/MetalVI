@@ -596,8 +596,10 @@ fn widen(
         let io = io::raise(p, native)?;
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
+        lower::take_widen();
         let r = emit_program(c, native, p, &st, &io, &res);
         let needs = lower::take_needs();
+        let own = lower::take_widen();
         // (or translated for 64-lane waves still: shared memory read and written where not
         // every lane runs, whose blocks the lowering names too)
         let stuck = matches!(&r, Err(ShaderError::Unsupported { what, .. })
@@ -611,11 +613,17 @@ fn widen(
             }
             return r;
         }
-        let more: Vec<usize> = lower::branches_around(&st, &needs)
+        let mut more: Vec<usize> = lower::branches_around(&st, &needs)
             .unwrap_or_default()
             .into_iter()
             .filter(|b| !wide.contains(b))
             .collect();
+        // (loop exits the lowering wants taken by the whole wave, by their own block)
+        for b in own {
+            if !wide.contains(&b) && !more.contains(&b) {
+                more.push(b);
+            }
+        }
         if more.is_empty() {
             if why {
                 eprintln!("WAVE64-WIDE stopped with {} branches wave-wide: a branch around it cannot be", wide.len());
