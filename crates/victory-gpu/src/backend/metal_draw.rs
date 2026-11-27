@@ -714,6 +714,7 @@ impl MetalBackend {
     /// to `<dir>/<name>.ppm`.
     pub(crate) fn capture(&self, resource: This, name: &str) {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if self.stopped_endpoint("capture") { return; }
         let Some(dir) = std::env::var_os("VICTORY_METAL_CAPTURE_DIR") else { return };
         let Some(t) = self.texture_for(resource) else { return };
         // Bytes per pixel of the formats written (others are skipped):

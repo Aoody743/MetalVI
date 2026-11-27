@@ -509,6 +509,13 @@ impl MetalBackend {
         ok
     }
 
+    pub(super) fn stopped_endpoint(&self, path: &'static str) -> bool {
+        if !self.submissions_stopped() { return false; }
+        let total = STOPPED_ENDPOINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::warn!(path, total, "Metal: endpoint refused after fuse");
+        true
+    }
+
     pub(crate) fn submissions_stopped(&self) -> bool {
         fuse::tripped()
     }
@@ -2359,6 +2366,7 @@ mod inflight {
 /// Stop further `run` submissions after a command buffer exceeds
 /// `VICTORY_METAL_FUSE_MS` (default 1500; 0: off). This is measured only
 /// after completion and cannot interrupt an already running command buffer.
+static STOPPED_ENDPOINTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 mod fuse {
     use super::{MetalCompute, MetalOp};
     use std::collections::HashSet;

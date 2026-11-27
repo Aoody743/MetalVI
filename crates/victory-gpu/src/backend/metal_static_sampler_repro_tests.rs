@@ -465,6 +465,19 @@ fn missing_event_stops_submission() { run_order_probe(Some("event")); }
 fn direct_budget_stops_submission() { run_order_probe(Some("one-group")); }
 
 #[test]
+#[ignore = "requires Metal; process-local fuse"]
+fn fused_capture_and_present() {
+    use std::sync::atomic::Ordering;
+    let _pool = victory_metal::Pool::new();
+    let backend = MetalBackend::new().unwrap();
+    super::fuse::stop();
+    let before = super::STOPPED_ENDPOINTS.load(Ordering::Relaxed);
+    backend.capture(std::ptr::null(), "fused");
+    assert!(!backend.present_metal(std::ptr::null()));
+    assert_eq!(super::STOPPED_ENDPOINTS.load(Ordering::Relaxed) - before, 2);
+}
+
+#[test]
 #[ignore = "trips process-wide fuse; run alone"]
 fn predicted_time_stops_submission() { run_order_probe(Some("estimated-time")); }
 

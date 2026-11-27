@@ -57,7 +57,7 @@ impl MetalBackend {
     /// False if it could not (the caller may present the D3D12 way).
     pub(crate) fn present_metal(&self, resource: This) -> bool {
         static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
-        if self.submissions_stopped() {
+        if self.stopped_endpoint("present") {
             return false;
         }
         let Some(source) = self.texture_for(resource) else { return fell_back("no Metal texture for the presented resource") };
