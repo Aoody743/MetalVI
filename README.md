@@ -26,7 +26,9 @@ Most attempts to run console games on a Mac stack translation layers: the game's
 
 Apple Silicon *has* unified memory, just like the console. **MetalVI drops the second translation layer.** Its renderer talks to **Metal directly** and hands the game's own memory to the GPU **without copying** (`newBufferWithBytesNoCopy` + `MTLResidencySet`). Shaders go through **Apple's Metal Shader Converter**, linked in-process. The ceiling is set by the GPU, not by memcpy.
 
-**Where it stands (November 2026):** the game boots, runs its menus, loads into the 3D world and starts the opening mission. On the new backend, **99.3% of compute work runs natively on Metal**. Drawing the picture through Metal is the next milestone. **It is not playable yet.** We'd rather say that plainly than overpromise.
+**Where it stands (2026-11-27):** the game boots, runs its menus, loads into the 3D world and starts the opening mission. Compute work runs almost entirely on native Metal. Drawing and presenting run on the development branch, but most of the 3D picture is still black. Counting stalls, the real 3D average is **1.2–2.5 fps**, about the same as the D3DMetal-based ports. The reason is that today's Metal backend is a **hybrid**: it sits on the old D3D12 preparation path, runs CPU and GPU in lockstep on a single GPU queue, and so has not yet collected the zero-copy win. We have therefore redesigned the **execution architecture (v2, below)**. It is designed but not implemented yet. **It is not playable.** We'd rather say that plainly than overpromise.
+
+> ⚠️ **Safety warning:** during development, experimental Metal paths produced single GPU command buffers that ran for 6–10 seconds. Apple GPUs do not preempt such work for WindowServer, so the whole machine froze, and once the kernel panicked. Until the v2 GPU safety gate is done, **do not run the full game on a Mac that holds work you care about.**
 
 ## Architecture
 
@@ -74,20 +76,66 @@ flowchart TB
     U --> MT
 ```
 
+### Execution architecture v2 (designed, not implemented yet)
+
+Today's Metal backend replaces the graphics API, but it still executes the way a D3D12 port does:
+- every submission waits for the GPU;
+- the console's queues are collapsed into one;
+- GPU dispatches run one at a time;
+- nothing is tuned for Apple's tile-based GPU (TBDR).
+
+The goal of v2 is **an architecture that puts no cap of its own on how much of the hardware we can use**.
+
+```mermaid
+flowchart LR
+    subgraph T["Title threads"]
+        R["List recording<br/>→ list IR"]
+    end
+    subgraph B["Backend"]
+        Q["Queue timelines<br/>fences / memory labels → MTLSharedEvent"]
+        P["Pass planner (TBDR)<br/>+ barrier translation"]
+        E["Encoder pool<br/>one command buffer per list part"]
+        D["Completion threads<br/>bottom-of-pipe writes · retirement · duration checks"]
+    end
+    subgraph G["Apple GPU"]
+        GQ["Graphics queue"]
+        CQ["Compute queue"]
+    end
+    R --> Q --> P --> E
+    E --> GQ & CQ
+    GQ -. "event ordering" .- CQ
+    GQ & CQ --> D --> Q
+```
+
+| Piece | What it does | What it fixes |
+| --- | --- | --- |
+| Async queue timelines | One Metal queue per title queue; fences and memory labels become `MTLSharedEvent`s; completion threads do bottom-of-pipe writes and retire resources | CPU/GPU lockstep; cross-queue sync emulated on the CPU |
+| Parallel encoding | A thread pool encodes, ordered with `enqueue`; no global lock | Single-threaded encoding that also pays for Rosetta |
+| TBDR pass planner | Clears folded into load actions; DontCare and memoryless where provably safe; no pass breaks for barriers that don't touch the attachments | Render targets stored and reloaded again and again, wasting bandwidth |
+| Barrier translation | Concurrent compute encoders; only the title's own barriers are translated | Every GPU dispatch serialised |
+| Texture ownership | Linear textures zero-copy; GPU-written textures stay on the GPU; CPU-written ones refreshed from known writers and dirty pages, never by hashing | Textures still on the copy-and-hash model |
+| Shader tiers | Verified pipelines drop bounds checks and loop budgets; binary archives; NGG shaders take a vertex-shader path where possible | Instrumentation cost, cold-compile stalls, the 32 KiB mesh-output limit |
+| Safety v2 | Work bounds at encode time, clamped indirect arguments, in-flight GPU-time budget, asynchronous checks | Safety bought by waiting on every buffer was itself a performance ceiling |
+
+Full design: [docs/metal-architecture-v2.md](docs/metal-architecture-v2.md).
+
 ## Status at a glance
 
-Measured on an M1 Max (64 GB, macOS 15.7.9), Series S profile.
+Measured on an M1 Max (64 GB, macOS 15.7.9), as of 2026-11-27. Items marked *dev branch* are not published in this repository yet.
 
 | Area | State |
 | --- | --- |
 | Boot, menus, loading screens | ✅ 20–30 fps (D3DMetal path) |
 | Into the 3D world, opening mission | ✅ reached |
-| Stability | ✅ 10-minute runs with no crash, after the fixes below. It was roughly 1 in 2 runs crashing before |
-| Compute shaders on native Metal | ✅ 99.3% of dispatches fully bound (textures, samplers, descriptor heaps, typed buffers) |
+| Title stability (CPU side) | ✅ 10-minute runs with no crash, after the fixes below. It was roughly 1 in 2 runs crashing before |
+| Compute shaders on native Metal | ✅ 99.3% of dispatches fully bound |
 | GPU texture detiling, zero copy from game memory | ✅ byte-exact against the CPU reference, on by default |
-| CPU-side 3D frame time (rendering off) | 35–75 ms |
-| Drawing on Metal (render pipelines, present to window) | 🚧 in progress (P2) |
-| Indirect and mesh draws on Metal | ⏳ next (P3) |
+| CPU-side 3D frame time (rendering off) | 35–75 ms (about 46–52 ms with msync) |
+| Drawing and presenting on Metal | 🚧 *dev branch*: runs, but depends on the old D3D12 preparation path. The G-buffer is correct; after lighting and post-processing the picture is mostly black |
+| Real 3D average frame rate, stalls included | ⚠️ 1.2–2.5 fps (it hits the game's own 30 fps cap between stalls, but stalls last seconds) |
+| GPU safety (a bound on GPU time per submission) | 🚧 *dev branch*: split submissions and an after-the-fact fuse, **no hard bound yet** |
+| Shader translation | 🚧 7 failures out of 25,953 programs; 27 mesh pipelines exceed Metal's 32 KiB output limit |
+| Execution architecture v2 (async multi-queue, TBDR, parallel encoding) | 📐 designed, not implemented |
 | Playable | ❌ not yet |
 
 ## What's new in this architecture
@@ -116,7 +164,8 @@ timeline
     Shaders : Metal Shader Converter in process : 99.2 % of 32,503 shaders convert
     Compute on Metal : Descriptor heaps, textures, samplers, typed buffers : 99.3 % of dispatches fully bound
     Stability : Rosetta masked-store race found and fixed : Wine metadata deadlock fixed : 10-minute runs, no crash
-    Next : Render pipelines and present (P2) : Indirect and mesh draws (P3)
+    Drawing : Metal draws, present and indirect draws on the dev branch : Root cause of the whole-Mac GPU freezes found
+    Redesign : Execution architecture v2 : async multi-queue, TBDR pass planner, parallel encoding, safety v2
 ```
 
 | | |
@@ -143,14 +192,67 @@ timeline
 - **Rosetta 2 won't last forever.** Apple supports it fully through macOS 27. Talking to Metal ourselves means the renderer does not depend on D3DMetal, which has no ARM64 build, and leaves a clean path to native ARM64 Wine plus FEX later.
 - **Series S is the target profile.** Its GPU budget is within reach of M-series GPUs once translation overhead is gone.
 
+## Performance predictions and device compatibility
+
+> **Everything in this section is a prediction, not a measurement.** The only measured machine is an M1 Max, and the real 3D average today is 1.2–2.5 fps. The numbers below assume v2 is finished, the picture is correct, and the Series S profile is used. We will update them, downwards too, once they are measured.
+
+### Where the overhead comes from (compared with the console running natively)
+
+| Source | Today | Predicted after v2 | Basis |
+| --- | --- | --- | --- |
+| Rosetta 2 running the title's x86-64 code | ~70–80% of native on scalar code, ~50% on AVX2-heavy code | Unchanged (only leaving Rosetta helps) | Public data and our CPU measurements |
+| Wine sync and syscalls | ~15% kernel time with msync; workers wait 59–88% of the time | Further wait-path work, limited headroom | Thread-wait sampling |
+| Console instructions and masked stores | Traps 21k/s → 1.1k/s | Near zero | Measured |
+| Memory copies and hashing | Buffers zero-copy; 2.4 GB of old shadow copies and per-frame hashing remain | 0 for buffers; textures detiled on the GPU for dirty regions only, a few ms per frame | Old route measured 3–6 s per frame |
+| CPU/GPU lockstep, single queue | Frame ≈ CPU + GPU | Overlapped: frame ≈ max(CPU, GPU) | Architecture |
+| Backend encoding | Single thread, on the submit path | 3–6 ms CPU per frame, off the critical path | Estimate from ~2,300 draws plus mesh dispatches per frame |
+| Shader translation (RDNA2 → DXIL → Metal) | Estimated 1.5–3× ALU, plus safety instrumentation | Estimated 1.3–2× for verified pipelines | **Not measured**; one of the biggest unknowns |
+| Ray tracing (RDNA2 BVH instructions in software) | Just starting to run; correctness unknown | Unknown, possibly heavy | Not measured |
+| Render-target bandwidth (TBDR) | Untuned, frequent pass breaks | On par with or better than immediate-mode rendering | Architecture |
+
+### Ceiling prediction (M1 Max, Series S profile)
+
+- Frame rate ≈ min(CPU rate, GPU rate), capped by the game's own 30 fps.
+- **CPU:** a cutscene ran at 33 ms (30 fps) between stalls; a separate CPU-only measurement gave 46–52 ms (~20 fps). So the CPU ceiling is about **20–30 fps**, depending on the scene.
+- **GPU:** 10.4 TFLOPS divided by 1.5–3× translation overhead leaves 3.5–7 effective TFLOPS, roughly a Series S (4 TFLOPS). So the GPU side is about **26–30 fps**.
+- **Prediction:** **20–30 fps** in most scenes once finished, and **15–20 fps** in heavy scenes such as driving through the city. A locked 30 fps across the whole game is unlikely. Confidence is low to medium; it hinges on the measured costs of shader translation and ray tracing.
+
+### Device compatibility prediction (after v2, Series S profile)
+
+| Mac (base configuration) | CPU | GPU (approx. FP32) | Memory | Prediction | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| M1 / M2 (8–10-core GPU) | 4P+4E | 2.6–3.6 TF | 8–24 GB | < 15 fps | ❌ not recommended |
+| **Base M1 Pro MacBook Pro** (8-core CPU / 14-core GPU / 16 GB) | 6P+2E | ~4.6 TF, 200 GB/s | 16 GB, tight | 15–20 fps with lower resolution or MetalFX; possible stutter from memory pressure | ⚠️ runs, not smooth |
+| M3 (10-core GPU) | 4P+4E | ~3.6 TF, 100 GB/s | 8 GB unsupported; 16/24 GB | 12–20 fps with MetalFX | ⚠️ marginal |
+| M4 (10-core GPU) | 4P+6E | ~4.3 TF, 120 GB/s | 16 GB and up | 15–25 fps with MetalFX | ⚠️ lower edge of playable |
+| M1 Max (24/32-core GPU) | 8P+2E | 7.8–10.4 TF, 400 GB/s | 32 GB and up | 20–30 fps | ✅ current dev machine |
+| M3 Pro (14/18-core GPU) | 5–6P+6E | ~5–6.4 TF, 150 GB/s | 18 GB, tight | 20–28 fps | ✅ mostly playable |
+| M4 Pro (16/20-core GPU) | 8–10P+4E | ~6.6–8.3 TF, 273 GB/s | 24 GB and up | 25–30 fps | ✅ recommended |
+| M3 Max / M4 Max | 10–12P | ~14–18 TF, 300–546 GB/s | 36 GB and up | Hits the 30 fps cap in most scenes | ✅ best |
+
+Notes:
+- **Memory:** on the Series S profile the title itself uses about 7.6 GB. Add Metal texture copies, Wine, Rosetta and caches, and we expect 13–17 GB per process (about 30 GB today, because the old shadow path is still in place). So 8 GB Macs are unsupported, 16 GB Macs will swap, and **24 GB or more is the comfortable range**.
+- **CPU:** the title runs about 7 heavy threads. Machines with fewer than 6 performance cores tend to be CPU-bound, even with faster cores (M3, M4). M3 and M4 single-core performance is about 30–50% above M1, which is why the M4 does much better at the same core count.
+- **GPU:** dynamic caching on M3/M4 may ease register pressure in translated shaders, which would help, but this is not measured. Their hardware ray tracing cannot be used directly, because the game's BVHs are in AMD's format; rebuilding Metal acceleration structures is a long-term option.
+- **MetalFX upscaling** is the main lever for lower-end Macs: render at a lower resolution, then upscale the output.
+- **System and disk:** macOS 15 or later (`MTLResidencySet` requires it) and Rosetta 2. The game dump is about 209 GB, plus caches, so 256 GB machines can't hold it.
+
 ## Roadmap
 
+Done:
 - [x] P0: `victorymetal` unixlib, zero-copy chunks, residency, safe Rust wrappers
 - [x] P1: compute on Metal in-game: MSC in-process, heaps, textures, samplers, typed buffers, GPU detile, disk cache
 - [x] Stability: Rosetta masked-store race, Wine metadata deadlock, hang watchdog
-- [ ] **P2: drawing on Metal**: VS/PS/mesh pipelines through MSC, render targets, render passes, present to the window *(in progress)*
-- [ ] P3: indirect draws, mesh/amplification pipelines, the remaining shader classes (`attributeAtVertex` pixel shaders, the last 64-bit atomic)
-- [ ] P4: performance: pipeline pre-warming, batched submissions, MetalFX upscaling
+- [x] P2/P3 prototype (*dev branch*): Metal draws, present, indirect draws, depth and MSAA resolve. It depends on the old D3D12 preparation path, which v2 replaces
+
+Execution architecture v2 ([design](docs/metal-architecture-v2.md)):
+- [ ] Stage 1: GPU safety gate v2 (encode-time work bounds, clamped indirect arguments, in-flight budget, asynchronous checks)
+- [ ] Stage 2: observability (per-pass GPU timing), binary archives, replayable frame packages
+- [ ] Stage 3: execution model: async multi-queue, fences and labels as events, completion threads, barrier translation
+- [ ] Stages 4–5: native resources, bindings and draw preparation, TBDR pass planner, retiring the old copy, watch and hash machinery
+- [ ] Stage 6: route decision from a measured frame-budget split
+- [ ] Stage 7: rendering completeness: remaining shaders, 32 KiB mesh output, ExecuteIndirect, ray tracing, the black picture
+- [ ] Stage 8: performance: shader tiers, parallel encoding, MetalFX
 - [ ] Later: native ARM64 Wine + FEX, so it no longer depends on Rosetta
 
 ## Building and running on macOS
@@ -222,10 +324,10 @@ Always pipe through `2>&1 | tee`: under Wine, redirecting with `>` drops the con
 ## FAQ
 
 **Can I play GTA VI on my Mac with this today?**
-Not yet. It boots, loads the world and starts the story, but drawing through the new Metal backend is still being built, and the old D3DMetal path is far too slow to play (about 0.1–2 fps in 3D).
+Not yet. It boots, loads the world and starts the story, but most of the 3D picture is still black, and the real average counting stalls is 1.2–2.5 fps. D3DMetal-based ports reach about 0.1–4 fps in 3D.
 
 **Which Macs will it target?**
-Any Apple Silicon Mac (M1 or newer). More GPU cores and more memory will matter. Development and measurements are done on an M1 Max.
+Technically any Apple Silicon Mac on macOS 15 or later. By our predictions, getting close to playable takes roughly an M1 Pro or better (or an M4) with 24 GB or more; see [device compatibility](#device-compatibility-prediction-after-v2-series-s-profile). Development and measurements are done on an M1 Max.
 
 **Is this an emulator?**
 No CPU emulator of our own. The game's x86-64 code runs through Rosetta 2, and Wine provides Windows. MetalVI implements the console's system libraries (high-level emulation), recompiles the console GPU's RDNA2 shaders, and renders through Metal.
