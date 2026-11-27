@@ -17,6 +17,7 @@ pub mod chunks;
 pub mod clear_resolve;
 pub mod msc;
 pub mod events;
+pub mod exec;
 pub mod indirect;
 pub mod ir;
 pub mod sampler;
