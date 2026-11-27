@@ -279,6 +279,7 @@ fn complete_checked(
     drop(watch);
     if let Err(e) = result {
         fuse::stop();
+        diag::report(label, command as usize, || inflight::describe(ops));
         tracing::error!(%label, command, error = %e, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
         return Err(e);
     }
@@ -287,9 +288,13 @@ fn complete_checked(
     let limit_ns = fuse::limit_ns();
     if (has_work || !ops.is_empty() || encoded != Default::default()) && fuse::unsafe_timing(gpu_ns, limit_ns) {
         fuse::stop();
+        diag::report(label, command as usize, || inflight::describe(ops));
         tracing::error!(%label, command, gpu_ns, limit_ns, ops = %inflight::describe(ops), ?encoded, "Metal safety stop: submission failed");
         return Err(victory_metal::Error("Metal safety stop: unsafe GPU duration".into()));
     }
+    diag::report(label, command as usize, || inflight::describe(ops));
+    #[cfg(test)]
+    diag::LAST_GPU_NS.store(gpu_ns, std::sync::atomic::Ordering::Relaxed);
     work::observe(ops, gpu_ns);
     Ok(())
 }
@@ -348,6 +353,8 @@ pub(crate) struct MetalBackend {
     pub(crate) target_views: Mutex<HashMap<(usize, u32), victory_metal::texture::Texture>>,
     /// Per-threadgroup scratch buffer for spilled wave64-on-wave32 helpers (`u249, space1`).
     wave_scratch: OnceLock<Option<Buffer>>,
+    /// Shader diagnostic counters (`u248, space1`, [`diag`]).
+    pub(crate) diag: OnceLock<Option<Buffer>>,
     /// Whether allocations have been added to `chunks.residency()` since the last `commit()`.
     residency_dirty: std::sync::atomic::AtomicBool,
     /// Batched CPU-detiled texture uploads waiting for a single command buffer.
@@ -477,6 +484,7 @@ impl MetalBackend {
             depth_stencils: Mutex::new(HashMap::new()),
             target_views: Mutex::new(HashMap::new()),
             wave_scratch: OnceLock::new(),
+            diag: OnceLock::new(),
             residency_dirty: std::sync::atomic::AtomicBool::new(false),
             pending_uploads: Mutex::new(Default::default()),
             uploads_pending: std::sync::atomic::AtomicUsize::new(0),
@@ -1992,7 +2000,7 @@ pub(crate) enum RootSlot {
 }
 
 pub(crate) fn root_layout(t: &HostShader) -> Vec<RootSlot> {
-    use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WAVE_SCRATCH};
+    use victory_shader::emit::{SLOT_DIAG, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WAVE_SCRATCH};
     let mut out = Vec::new();
     let dwords = t.user_data_dwords();
     if dwords > 0 {
@@ -2000,7 +2008,7 @@ pub(crate) fn root_layout(t: &HostShader) -> Vec<RootSlot> {
     }
     out.extend(t.root_cbvs.iter().map(|&s| RootSlot::Cbv(s)));
     out.extend(t.root_srvs.iter().map(|&s| if s == SLOT_STRIDES || s == SLOT_MEMORY { RootSlot::Srv(s) } else { RootSlot::TableSrv(s) }));
-    out.extend(t.root_uavs.iter().map(|&s| if s == SLOT_FAULTS || s == SLOT_WAVE_SCRATCH { RootSlot::Uav(s) } else { RootSlot::TableUav(s) }));
+    out.extend(t.root_uavs.iter().map(|&s| if s == SLOT_FAULTS || s == SLOT_WAVE_SCRATCH || s == SLOT_DIAG { RootSlot::Uav(s) } else { RootSlot::TableUav(s) }));
     out
 }
 
@@ -2255,6 +2263,13 @@ mod work;
 
 #[path = "metal_completion.rs"]
 mod completion;
+
+#[path = "metal_diag.rs"]
+pub(crate) mod diag;
+
+#[cfg(test)]
+#[path = "metal_half_sync_repro_tests.rs"]
+mod half_sync_repro_tests;
 
 /// Names what a command buffer that does not complete was running: a
 /// GPU-side hang (a shader that never ends) blocks `cb.wait()` with no

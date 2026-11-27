@@ -338,6 +338,9 @@ struct Lower<'a> {
     budget: Option<V>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// `half_sync` sites emitted so far (each its own counter in
+    /// [`super::shader::SLOT_DIAG`]).
+    sync_sites: u32,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1765,6 +1768,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            sync_sites: 0,
             budget: None,
             pops: false,
         }
@@ -4308,7 +4312,23 @@ impl<'a> Lower<'a> {
         let under_lim = self.s.m.cmp(spin_hdr, pred::IULT, it_phi, max_it);
         let cond1 = self.s.m.bin(spin_hdr, Bin::And, ne_target, not_passed);
         let cond = self.s.m.bin(spin_hdr, Bin::And, cond1, under_lim);
-        self.s.m.terminate(spin_hdr, Term::CondBr(cond, spin_poll, spin_done));
+        // Leaving at the poll limit means the other half never came: counted per site in
+        // `SLOT_DIAG` (by the wave's first lane), which the host reports as an error.
+        let (timed_chk, timed_bump) = (self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(spin_hdr, Term::CondBr(cond, spin_poll, timed_chk));
+        let timed = self.s.m.cmp(timed_chk, pred::IUGE, it_phi, max_it);
+        let first_t = self.s.op(timed_chk, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+        let bump = self.s.m.bin(timed_chk, Bin::And, timed, first_t);
+        self.s.m.terminate(timed_chk, Term::CondBr(bump, timed_bump, spin_done));
+        let site = self.sync_sites;
+        self.sync_sites += 1;
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            let offset = self.x.p.blocks.get(self.cur_ir).map_or(0, |b| b.offset);
+            eprintln!("WAVE64-SYNC-SITE {site}: IR block {} at {offset:#x}", self.cur_ir);
+        }
+        let site_dword = (super::shader::DIAG_SITES + site).min(super::shader::DIAG_DWORDS - 1);
+        self.diag_bump(timed_bump, &[super::shader::DIAG_HALF_SYNC_TIMEOUTS, site_dword]);
+        self.s.m.terminate(timed_bump, Term::Br(spin_done));
 
         let is_first_p = self.s.op(spin_poll, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
         self.s.m.terminate(spin_poll, Term::CondBr(is_first_p, poll_do, poll_join));
@@ -4335,6 +4355,17 @@ impl<'a> Lower<'a> {
             self.cur = spin_done;
         }
         spin_done
+    }
+
+    /// Adds 1 to each of `dwords` of the diagnostic counters (`shader.rs` `SLOT_DIAG`) in `block`.
+    fn diag_bump(&mut self, block: usize, dwords: &[u32]) {
+        let uav = self.s.root_uav_handle(super::shader::SLOT_DIAG);
+        let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let iu = self.s.m.undef(self.s.t.i32);
+        for &d in dwords {
+            let byte = self.s.m.i32(d * 4);
+            self.s.op(block, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[uav, add, byte, iu, iu, one]);
+        }
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -11587,6 +11618,19 @@ impl<'a> Lower<'a> {
             let t = self.s.m.bool(true);
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+        }
+        if self.s.threads.is_some() && self.s.mesh.is_none() && !self.s.pixel {
+            // A compute wave a loop budget stops: counted (`SLOT_DIAG`) by its first lane.
+            let (bump, ret) = (self.s.m.new_block(), self.s.m.new_block());
+            let i1t = self.s.t.i1;
+            let first = self.s.op(a, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
+            self.s.flags |= flags::WAVE_OPS;
+            self.s.m.terminate(a, Term::CondBr(first, bump, ret));
+            self.diag_bump(bump, &[super::shader::DIAG_LOOP_BUDGET]);
+            self.s.m.terminate(bump, Term::Br(ret));
+            self.s.m.terminate(ret, Term::Ret);
+            self.abort = Some(a);
+            return a;
         }
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);

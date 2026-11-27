@@ -1122,6 +1122,21 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::SLOT_DIAG {
+                    // Ours: shader diagnostic counters (read only on the Metal path).
+                    let gpu = d3d12_diag();
+                    if gpu != 0 {
+                        // SAFETY: an open list; the buffer lives as long as the process.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootUnorderedAccessView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootUnorderedAccessView(param, gpu);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -2675,6 +2690,10 @@ impl State {
                         top.set_u64(i, m.wave_scratch_gpu());
                         continue;
                     }
+                    RootSlot::Uav(s) if s == victory_shader::emit::SLOT_DIAG => {
+                        top.set_u64(i, crate::backend::metal::diag::gpu(m));
+                        continue;
+                    }
                     RootSlot::Srv(s) if s == victory_shader::emit::SLOT_MEMORY => {
                         top.set_u64(i, memory.as_ref().map_or(0, |r| r.directory));
                         continue;
@@ -3893,4 +3912,22 @@ thread_local! {
     /// Heap slots read by the stages of the draw being recorded (the
     /// final-draw dossier).
     static SLOTS: std::cell::RefCell<Vec<(u32, u64, Option<crate::backend::metal_heap::Missing>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The D3D12 path's buffer for `victory_shader::emit::SLOT_DIAG` (made once,
+/// kept for the process): its GPU address, 0 without one.
+#[cfg(windows)]
+fn d3d12_diag() -> u64 {
+    static GPU: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *GPU.get_or_init(|| {
+        let Some(host) = crate::host::host() else { return 0 };
+        let bytes = u64::from(victory_shader::emit::DIAG_DWORDS) * 4;
+        let Some((buffer, data)) = host.shared_buffer(bytes) else { return 0 };
+        // SAFETY: a fresh mapping of that many bytes.
+        unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        std::mem::forget(buffer);
+        gpu
+    })
 }

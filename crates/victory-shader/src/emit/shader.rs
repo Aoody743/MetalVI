@@ -70,6 +70,24 @@ pub const SLOT_ATTR_SCRATCH: u8 = 250;
 /// `exchange`) when the shader's own LDS cannot fit them within 32 KiB.
 /// Each threadgroup owns [`WAVE_SCRATCH_GROUP_DWORDS`] dwords.
 pub const SLOT_WAVE_SCRATCH: u8 = 249;
+/// Root UAV `u<SLOT_DIAG>` in [`ROOT_CBV_SPACE`]: [`DIAG_DWORDS`] counters
+/// the host reads after each command buffer and logs (then zeroes). Written
+/// only when something goes wrong, so it costs nothing on the normal path:
+///
+/// - dword [`DIAG_HALF_SYNC_TIMEOUTS`]: a host wave that gave up waiting for
+///   the other half of its console wave (`half_sync` reached its poll limit);
+/// - dword [`DIAG_LOOP_BUDGET`]: a thread a loop budget made leave;
+/// - dword [`DIAG_SITES`] + n: the timeouts at the program's `half_sync` site n
+///   (the last dword takes the sites past it).
+pub const SLOT_DIAG: u8 = 248;
+/// Dwords of the [`SLOT_DIAG`] buffer.
+pub const DIAG_DWORDS: u32 = 1024;
+/// See [`SLOT_DIAG`].
+pub const DIAG_HALF_SYNC_TIMEOUTS: u32 = 0;
+/// See [`SLOT_DIAG`].
+pub const DIAG_LOOP_BUDGET: u32 = 1;
+/// See [`SLOT_DIAG`].
+pub const DIAG_SITES: u32 = 16;
 /// Dwords reserved per threadgroup in [`SLOT_WAVE_SCRATCH`]: 1 for `wave_base`
 /// (`halves`), up to 16 for `half_sync` counters (1024 threads / 64), and
 /// up to 32 for `exchange` slots (rounded up to 64 dwords = 256 bytes).

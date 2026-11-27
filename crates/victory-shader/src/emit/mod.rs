@@ -121,8 +121,9 @@ pub use lower::{
 };
 pub use rect::rect_list_gs;
 pub use shader::{
-    ATTR_TABLE_ROWS, ATTR_TABLE_VERTEX_STRIDE, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE,
-    SAMPLER_SPACE, SLOT_ATTR_SCRATCH, SLOT_ATTR_TABLE, SLOT_FAULTS, SLOT_MEMORY, SLOT_PRIM_IBO,
+    ATTR_TABLE_ROWS, ATTR_TABLE_VERTEX_STRIDE, DIAG_DWORDS, DIAG_HALF_SYNC_TIMEOUTS, DIAG_LOOP_BUDGET,
+    DIAG_SITES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE,
+    SAMPLER_SPACE, SLOT_ATTR_SCRATCH, SLOT_ATTR_TABLE, SLOT_DIAG, SLOT_FAULTS, SLOT_MEMORY, SLOT_PRIM_IBO,
     SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_WAVE_SCRATCH, USER_DATA_SPACE, USER_DISPATCH_THREADS_X,
     USER_GROUP_BASE, USER_GROUP_COUNT_X, USER_GROUP_COUNT_Y, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
     USER_VIEW_BIAS, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, WAVE_SCRATCH_GROUP_DWORDS,
@@ -306,6 +307,19 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let io = io::raise(&p, &native)?;
     let st = st?;
     emit(&c, &native, &p, &st, &io, &res)
+}
+
+/// Translates a compute program given as GFX10 code and layout (no
+/// container: no signatures), as [`translate`] does: for tests and repros
+/// that build programs by hand.
+pub fn translate_native(native: &NativeProgram) -> Result<HostShader, ShaderError> {
+    let c = Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
+    let p = crate::spill::build(native)?;
+    let st = structure::structure(&p);
+    let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
+    let io = io::raise(&p, native)?;
+    let st = st?;
+    emit(&c, native, &p, &st, &io, &res)
 }
 
 /// Emits a program whose earlier stages already ran.
