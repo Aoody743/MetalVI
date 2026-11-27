@@ -108,6 +108,32 @@ fn calibration_groups_256() { calibration(16, 256); }
 
 #[test]
 #[ignore = "requires Metal"]
+fn bounded_mesh_fragment_amplification() {
+    let _pool = Pool::new();
+    let dev = Device::first().unwrap();
+    let queue = dev.new_queue(1).unwrap();
+    let lib = dev.library_msl(include_str!("test.metal")).unwrap();
+    let mut desc = RenderPipelineDesc::default();
+    desc.colors[0] = ColorDesc { pixel_format: RGBA.0, write_mask: 15, ..Default::default() };
+    desc.sample_count = 1;
+    let pso = dev.mesh_render_pipeline_desc((&lib, "double_mesh"), Some((&lib, "count_fragments")), &desc).unwrap();
+    let image = target(&dev);
+    let hits = Shared::new(&dev, &[0u32; (W*H) as usize]);
+    let cb = queue.command_buffer().unwrap();
+    cb.render_pass(&[color(&image)], W, H, &[
+        Render::Pipeline { pipeline: &pso },
+        Render::FragmentBuffer { buffer: &hits.0, offset: 0, index: 0 },
+        Render::DrawMesh { groups: [1;3], object_threads: [1;3], mesh_threads: [1;3] },
+    ]).unwrap();
+    assert_eq!(cb.encoded_work().groups, 1);
+    cb.commit();
+    cb.wait().unwrap();
+    assert!(hits.words().iter().all(|&n| n == 2));
+    println!("mesh groups=1 triangles=2 fragment_hits={} cb_ns={}", 2*W*H, cb.gpu_time_ns());
+}
+
+#[test]
+#[ignore = "requires Metal"]
 fn bounded_title_mesh_records() {
     let _pool = Pool::new();
     let device = Device::first().unwrap();
