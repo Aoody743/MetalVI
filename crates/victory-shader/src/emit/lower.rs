@@ -458,8 +458,6 @@ fn lane_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
-        // a loop each lane leaves on its own: its whole cycle ([`super::lane_loops`])
-        super::lane_loops::add_cycle(d, &succ, &mut seen);
         regions.push((d, seen));
     }
     Some(regions)
