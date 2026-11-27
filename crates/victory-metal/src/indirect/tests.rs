@@ -60,6 +60,52 @@ fn target(device: &Device) -> Texture {
         .unwrap()
 }
 
+// Fixed trip count, one lane per group. The dependent index never leaves the
+// 16-word allocation. This measures a whole CB, not instruction latency.
+fn calibration(iterations: u32, groups: u32) {
+    assert!([1, 4, 16].contains(&iterations) && [1, 16, 256].contains(&groups));
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let table = Shared::new(&device, &std::array::from_fn::<_, 16, _>(|i| (i as u32 + 3) & 15));
+    let dst = Shared::new(&device, &vec![u32::MAX; groups as usize]);
+    let src = format!("#include <metal_stdlib>\nusing namespace metal;\n\
+        kernel void chase(device const volatile uint *t [[buffer(0)]], device uint *o [[buffer(1)]], \
+        uint g [[thread_position_in_grid]]) {{ uint v=g&15; for(uint i=0;i<{iterations};++i) \
+        v=t[v&15]; o[g]=v; }}");
+    let lib = device.library_msl(&src).unwrap();
+    let pso = device.compute_pipeline_from_library(&lib, "chase").unwrap();
+    let cb = queue.command_buffer().unwrap();
+    cb.compute(&[
+        Compute::Pipeline { pipeline: &pso, threads_per_group: [1; 3] },
+        Compute::Buffer { buffer: &table.0, offset: 0, index: 0 },
+        Compute::Buffer { buffer: &dst.0, offset: 0, index: 1 },
+        Compute::Dispatch { groups: [groups.into(), 1, 1] },
+    ]).unwrap();
+    cb.commit();
+    cb.wait().unwrap();
+    let ns = cb.gpu_time_ns();
+    println!("calibration device={} groups={groups} iterations={iterations} cb_ns={ns}", device.name());
+    assert!(ns > 0 && ns < 50_000_000);
+    assert_eq!(dst.words(), (0..groups).map(|g| (g + 3 * iterations) & 15).collect::<Vec<_>>());
+}
+
+#[test]
+#[ignore = "requires Metal"]
+fn calibration_one() { calibration(1, 1); }
+#[test]
+#[ignore = "requires Metal"]
+fn calibration_four() { calibration(4, 1); }
+#[test]
+#[ignore = "requires Metal"]
+fn calibration_sixteen() { calibration(16, 1); }
+#[test]
+#[ignore = "requires Metal"]
+fn calibration_groups_16() { calibration(16, 16); }
+#[test]
+#[ignore = "requires Metal"]
+fn calibration_groups_256() { calibration(16, 256); }
+
 #[test]
 #[ignore = "requires Metal"]
 fn bounded_title_mesh_records() {
