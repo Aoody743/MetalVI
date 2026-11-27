@@ -196,8 +196,13 @@ impl GeometryConfig {
         info[..2].copy_from_slice(&index_type.to_le_bytes());
         info[2] = 3; // IRRuntimePrimitiveTypeTriangle
         info[3] = 3; // threadsPerPatch
+        // gsInstanceCount is the GS `[instance(N)]` count (always 1 here,
+        // checked in convert_geometry); draw instancing is already carried by
+        // groups[1] = instances and args[1] = instances. Passing `instances`
+        // here causes MSC's object shader to spawn `instances^2` mesh groups
+        // and hit Metal Code=8 OOM.
         for (out, value) in info[4..16].chunks_exact_mut(2).zip([
-            self.max_input_primitives, stride, self.max_input_primitives, instances, stride / 3, 3,
+            self.max_input_primitives, stride, self.max_input_primitives, 1, stride / 3, 3,
         ]) {
             out.copy_from_slice(&(value as u16).to_le_bytes());
         }
@@ -582,7 +587,7 @@ mod tests {
         assert_eq!(u16_at(&direct.info, 4), 32); // maxInputPrimitivesPerMeshThreadgroup
         assert_eq!(u16_at(&direct.info, 6), 255); // objectThreadgroupVertexStride
         assert_eq!(u16_at(&direct.info, 8), 32); // meshThreadgroupPrimitiveStride
-        assert_eq!(u16_at(&direct.info, 10), 3); // gsInstanceCount
+        assert_eq!(u16_at(&direct.info, 10), 1); // gsInstanceCount
         assert_eq!(u16_at(&direct.info, 12), 85); // patchesPerObjectThreadgroup
         assert_eq!(u16_at(&direct.info, 14), 3); // inputControlPointsPerPatch
         assert_eq!(u64_at(&direct.info, 16), 0);

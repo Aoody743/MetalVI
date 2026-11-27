@@ -5408,6 +5408,17 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    pub(crate) fn metal_texture_inputs(&self, inputs: &mut Vec<std::sync::Arc<crate::texture::Staging>>) {
+        for step in &self.deferred().copies {
+            if let Step::Texture(s) = step
+                && crate::backend::metal_texture::tracks_memory(s.memory().0)
+                && !inputs.iter().any(|seen| std::sync::Arc::ptr_eq(seen, s))
+            {
+                inputs.push(s.clone());
+            }
+        }
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).

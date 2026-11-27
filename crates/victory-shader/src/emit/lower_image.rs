@@ -28,7 +28,6 @@ impl<'a> Lower<'a> {
         let dmask = if *dmask == 0 { &1 } else { dmask };
         let site = (b, i);
         let guard = self.guard(b, i)?;
-        let c = self.cur;
         let (kind, coords) = match dim {
             0 => (1, 1),
             1 => (2, 2),
@@ -205,7 +204,7 @@ impl<'a> Lower<'a> {
             };
             let value = if op == "sub" {
                 let zero = self.s.m.int_const(ty, 0);
-                self.s.m.bin(c, Bin::Sub, zero, original)
+                self.s.m.bin(self.cur, Bin::Sub, zero, original)
             } else {
                 original
             };
@@ -335,6 +334,7 @@ impl<'a> Lower<'a> {
             } else {
                 addr_val(self, 0)?
             };
+            let c = self.cur;
             let i32t = self.s.t.i32;
             let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
             let d = self
@@ -367,6 +367,9 @@ impl<'a> Lower<'a> {
         let iu = self.s.m.undef(self.s.t.i32);
         // A gather at a named level, done as four texel reads (below).
         let mut gathered: Option<[V; 4]> = None;
+        // (Sampler number test, handle) of the other immediate samplers a
+        // join may pick (`choices` below).
+        let mut choices: Vec<(V, V)> = Vec::new();
         let r = if sample {
             let ss = self
                 .descriptors
@@ -379,7 +382,33 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            // Immediate samplers chosen by control flow (a branch picks a
+            // point or a linear one, say): DXIL takes no select of handles,
+            // so the read is made with each, and the join's sampler number
+            // picks the result (below).
+            let sh = match ss {
+                Source::Phi { block, args } if Self::immediate_leaves(args) => {
+                    let mut numbers = Vec::new();
+                    let n = self.sampler_number_phi(*block, args, &mut numbers, 8)?;
+                    numbers.sort_unstable();
+                    numbers.dedup();
+                    if cmp {
+                        for &k in &numbers {
+                            self.s.cmp_samplers |= 1 << k;
+                        }
+                    }
+                    let c = self.cur;
+                    let (&first, rest) = numbers.split_first().ok_or("a sampler join without samplers")?;
+                    for &k in rest {
+                        let hk = self.s.sampler_handle(c, k);
+                        let kk = self.s.m.i32(k);
+                        let is = self.s.m.cmp(c, pred::EQ, n, kk);
+                        choices.push((is, hk));
+                    }
+                    self.s.sampler_handle(c, first)
+                }
+                _ => self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?,
+            };
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -424,6 +453,7 @@ impl<'a> Lower<'a> {
             }
             if *unorm {
                 // Texel coordinates: divided by the size of level 0.
+                let c = self.cur;
                 let i32t = self.s.t.i32;
                 let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                 let z = self.s.m.i32(0);
@@ -436,12 +466,16 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
+            if op == 81 && !choices.is_empty() {
+                return Err("a level of detail with a sampler chosen by control flow");
+            }
             if op == 81 {
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {
                     return Err("an image result");
                 };
                 let f32t = self.s.t.f32;
+                let c = self.cur;
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
                     let lod = self.s.op(
@@ -469,6 +503,7 @@ impl<'a> Lower<'a> {
             }
             if offset_word && offsets > 0 {
                 let w = addr_val(self, 0)?;
+                let c = self.cur;
                 for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
                     // Bits at..at+5 sign-extended: shift up, then down.
                     let left = self.s.m.i32(at);
@@ -499,7 +534,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(self.s.m.f32(0));
                     self.s.op(
-                        c,
+                        self.cur,
                         "sampleLevel.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
@@ -532,12 +567,13 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(clamp);
                     self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                        .op(self.cur, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
                 }
                 61 => {
                     // With a16 the bias is an f16 in the low half of its
                     // word (the word is whole, the value is not).
                     let bias = addr_u32(self, usize::from(offset_word))?;
+                    let c = self.cur;
                     let bias = if *a16 {
                         let low = self.s.m.i32(0xFFFF);
                         let bias = self.s.m.bin(c, Bin::And, bias, low);
@@ -583,12 +619,14 @@ impl<'a> Lower<'a> {
                         for k in 0..2 {
                             let x = addr_packed(self, first + axis * deriv_regs, k)?;
                             let x = to_float(self, x);
+                            let c = self.cur;
                             let sq = self.s.m.bin(c, Bin::Mul, x, x);
                             sum = self.s.m.bin(c, Bin::Add, sum, sq);
                         }
                         *slot = self.unary(24, sum); // square root
                     }
                     let longer = self.binary(35, len[0], len[1]); // maximum
+                    let c = self.cur;
                     let i32t = self.s.t.i32;
                     let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                     let z = self.s.m.i32(0);
@@ -609,7 +647,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
-                        c,
+                        self.cur,
                         "sampleLevel.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
@@ -629,7 +667,7 @@ impl<'a> Lower<'a> {
                     args.extend(g);
                     args.push(clamp);
                     self.s.op(
-                        c,
+                        self.cur,
                         "sampleGrad.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
@@ -649,7 +687,7 @@ impl<'a> Lower<'a> {
                         "sampleCmpLevelZero.f32"
                     };
                     self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                        .op(self.cur, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -661,7 +699,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.push(lod);
                     self.s.op(
-                        c,
+                        self.cur,
                         "sampleLevel.f32",
                         Attr::ReadOnly,
                         self.s.t.res_ret,
@@ -680,29 +718,13 @@ impl<'a> Lower<'a> {
                         && coords == 2
                         && spatial == 2
                     {
-                        // The host's gather has no level: it read level 0
-                        // where the title names one (the depth pyramid its
-                        // occlusion tests read: most of the world was
-                        // culled against the wrong depths). The four texels
-                        // are read at the level instead, in the gather's
-                        // order: (u0,v1) (u1,v1) (u1,v0) (u0,v0).
-                        // With an offset too (`image_gather4_l_o`): the
-                        // offset is in texels of that level.
-                        // The title's meshlet culling takes a 4x4 block of
-                        // the pyramid as one gather and three offset ones
-                        // ((2,0), (0,2), (2,2)); the three read level 0,
-                        // two texels beside the first one's place, so a
-                        // meshlet three or four texels wide was tested
-                        // against a quarter of what it covers.
-                        // shortcut: the level is rounded to a whole one and
-                        // coordinates past the edge are clamped, whatever
-                        // the sampler says.
                         let lod = addr_packed(self, coord_base, coords)?;
                         let lod = to_float(self, lod);
                         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
                         let zero = self.s.m.f32(0);
                         let lod = self.binary(35, lod, zero); // maximum
                         let lod = self.unary(26, lod); // round to nearest
+                        let c = self.cur;
                         let mip = self.s.m.cast(c, Cast::FpToUi, lod, i32t);
                         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
                         let d = self
@@ -750,7 +772,7 @@ impl<'a> Lower<'a> {
                         args.extend(&os[..2]);
                         args.push(self.s.m.i32(dmask.trailing_zeros()));
                         self.s.op(
-                            c,
+                            self.cur,
                             "textureGather.f32",
                             Attr::ReadOnly,
                             self.s.t.res_ret,
@@ -778,7 +800,7 @@ impl<'a> Lower<'a> {
             args.extend(&cs);
             args.extend([iu, iu, iu]);
             self.s.op(
-                c,
+                self.cur,
                 "textureLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
@@ -786,9 +808,20 @@ impl<'a> Lower<'a> {
                 &args,
             )
         };
+        let c = self.cur;
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
+        // The same read with each other sampler the join may pick: argument
+        // 2 of the call is the sampler (after the opcode and the image).
+        if !choices.is_empty() && gathered.is_some() {
+            return Err("a gather with a sampler chosen by control flow");
+        }
+        let mut alts = Vec::new();
+        for &(is, hk) in &choices {
+            let again = self.s.m.call_with_arg(c, r, 2, hk).ok_or("a sampled read that is not one call")?;
+            alts.push((is, again));
+        }
         let channels: Vec<u32> = if op == 73 {
             vec![0, 1, 2, 3]
         } else {
@@ -798,7 +831,14 @@ impl<'a> Lower<'a> {
         for ch in channels {
             let x = match gathered {
                 Some(g) => g[ch as usize],
-                None => self.s.m.extract(c, r, ch),
+                None => {
+                    let mut x = self.s.m.extract(c, r, ch);
+                    for &(is, again) in &alts {
+                        let y = self.s.m.extract(c, again, ch);
+                        x = self.s.m.select(c, is, y, x);
+                    }
+                    x
+                }
             };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to

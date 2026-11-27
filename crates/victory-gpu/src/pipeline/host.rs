@@ -439,7 +439,25 @@ impl HostPipeline {
                 shaders,
             );
         }
-        let mesh = find("mesh");
+        // A mesh shader over Metal's output limit, with outputs the pixel
+        // shader does not read: those left out (an equal pipeline), as a
+        // shader of its own (26 of the title's pipelines, 34-38 KiB).
+        let pruned = find("mesh").and_then(|ms| {
+            let limit = mesh_output_limit()?;
+            let bytes = ms.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil))?;
+            if bytes <= limit {
+                return None;
+            }
+            let ps = find("pixel")?.translated()?;
+            let keep = victory_shader::emit::input_semantics(&ps.host.dxil)?;
+            let outs = ms.translated().and_then(|t| victory_shader::emit::output_semantics(&t.host.dxil));
+            tracing::info!(?shaders, ?keep, ?outs, "mesh outputs and what the pixel shader reads");
+            let v = ms.pruned_mesh(keep)?;
+            let after = v.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil));
+            tracing::info!(?shaders, bytes, ?after, limit, "mesh outputs the pixel shader does not read left out");
+            Some(v)
+        });
+        let mesh = pruned.as_ref().or_else(|| find("mesh"));
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {

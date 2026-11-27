@@ -1995,6 +1995,10 @@ impl State {
     /// cannot run.
     #[cfg(windows)]
     fn metal_dispatch(&mut self, p: &crate::pipeline::host::HostPipeline, groups: [u32; 3], limit: u32) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if crate::backend::metal_draw::trace_scene() && crate::backend::metal_draw::trace_pipeline(&p.name) {
+            tracing::info!(frame=crate::frame::current(), detail=%self.op_text(format!("dispatch {groups:?}"), true), "scene request");
+        }
         use crate::backend::metal::backend;
         use crate::backend::metal::{Drop, count};
         let Some(m) = backend() else {
@@ -2006,7 +2010,7 @@ impl State {
             return false;
         };
         let _pool = victory_metal::Pool::new();
-        let bound = match self.metal_stage(m, p, &p.stages[0], true, mp.top_level.clone(), limit) {
+        let bound = match self.metal_stage(m, p, &p.stages[0], true, mp.top_level.clone(), limit, [groups[0], groups[1]]) {
             Ok(b) => b,
             Err(d) => {
                 count(d);
@@ -2025,6 +2029,63 @@ impl State {
         true
     }
 
+    /// An indirect compute dispatch on Metal, encoded via `IndirectTranslator`.
+    #[cfg(windows)]
+    fn metal_dispatch_indirect(&mut self, p: &crate::pipeline::host::HostPipeline, records: u64, stride: u32, max: u32, count: Option<u64>) -> bool {
+        use crate::backend::metal::{Drop, MetalDispatchIndirect, MetalOp, backend, count as count_outcome};
+        let Some(m) = backend() else {
+            count_outcome(Drop::NoBackend);
+            return false;
+        };
+        let Some(mp) = m.compute_pipeline(self.pipeline, p) else {
+            count_outcome(Drop::NoPipeline);
+            return false;
+        };
+        let bytes = u64::from(max.saturating_sub(1)) * u64::from(stride) + 12;
+        let (rb, ro, count_buf) = {
+            let mut chunks = m.chunks();
+            let Some((rb, ro)) = chunks.window_buffer(records, bytes) else {
+                count_outcome(Drop::SlotUnmapped);
+                return false;
+            };
+            let cb = match count {
+                Some(at) => match chunks.window_buffer(at, 4) {
+                    Some(c) => Some(c),
+                    None => {
+                        count_outcome(Drop::SlotUnmapped);
+                        return false;
+                    }
+                },
+                None => None,
+            };
+            (rb, ro, cb)
+        };
+        let _pool = victory_metal::Pool::new();
+        let bound = match self.metal_stage(m, p, &p.stages[0], true, mp.top_level.clone(), 0, [1, 1]) {
+            Ok(b) => b,
+            Err(d) => {
+                count_outcome(d);
+                return false;
+            }
+        };
+        count_outcome(bound.outcome);
+        self.metal.push(std::sync::Arc::new(MetalOp::DispatchIndirect(MetalDispatchIndirect {
+            pso: mp,
+            heap: bound.heap,
+            sampler_heap: bound.sampler_heap,
+            top: bound.top,
+            tables: bound.tables,
+            records: rb,
+            records_offset: ro,
+            stride,
+            max,
+            count: count_buf,
+            records_va: records,
+            count_va: count,
+        })));
+        true
+    }
+
     /// A draw on Metal too (`VICTORY_METAL_DRAW=1`): recorded into the
     /// list as [`crate::backend::metal::MetalOp::Draw`], counted.
     #[cfg(windows)]
@@ -2032,7 +2093,7 @@ impl State {
     /// read (index, handle, why it has no Metal entry), when capturing.
     #[cfg(windows)]
     fn note_slot(index: u32, handle: u64, missing: Option<crate::backend::metal_heap::Missing>) {
-        if crate::backend::metal_draw::capture_every() == 0 {
+        if crate::backend::metal_draw::capture_every() == 0 && !crate::backend::metal_draw::trace_scene() {
             return;
         }
         SLOTS.with(|s| s.borrow_mut().push((index, handle, missing)));
@@ -2059,6 +2120,10 @@ impl State {
             self.note_asked(7);
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        if crate::backend::metal_draw::trace_scene() && crate::backend::metal_draw::trace_pipeline(&p.name) {
+            tracing::info!(frame=crate::frame::current(), topology=self.topology, detail=%self.op_text("draw".into(), false), "scene request");
+        }
         // `VICTORY_METAL_RECTS=triangles` (experiment): rectangles drawn as
         // their first triangle, without MSC's geometry emulation.
         static RECTS_AS_TRIANGLES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2151,7 +2216,7 @@ impl State {
         SLOTS.with(|s| s.borrow_mut().clear());
         let mut stages = Vec::with_capacity(p.stages.len());
         for (stage, (top, bind)) in p.stages.iter().zip(&g.stages) {
-            match self.metal_stage(m, p, stage, false, top.clone(), 0) {
+            match self.metal_stage(m, p, stage, false, top.clone(), 0, [1, 1]) {
                 Ok(b) => stages.push(StageBind { bind: *bind, top: b.top, tables: b.tables, heap: b.heap, sampler_heap: b.sampler_heap }),
                 Err(_) => {
                     count_draw(DrawDrop::Bind);
@@ -2169,10 +2234,18 @@ impl State {
                     return;
                 }
             }
-        } else if let Some(config) = g.geometry {
+        } else if let Some(config) = g.geometry
+            && !(matches!(kind, DrawKindIn::Indirect { indexed: false, .. }) && {
+                static ENABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                *ENABLE.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_RECTS").as_deref() == Ok("1"))
+            })
+        {
             match kind {
                 DrawKindIn::Vertices { count, instances, first, first_instance } => {
                     let Some(draw) = config.draw(count, instances, first, first_instance, None) else {
+                        if count >= 3 && instances != 0 {
+                            crate::backend::metal_draw::note_once(format!("rectangle configuration refused: {}", p.name));
+                        }
                         count_draw(DrawDrop::Topology);
                         return;
                     };
@@ -2194,17 +2267,22 @@ impl State {
                         return;
                     }
                     let Some((buffer, view_offset)) = m.chunks().resident_window(v.address, u64::from(v.size)) else {
+                        crate::backend::metal_draw::note_once(format!("index buffer (rectangles) not resident: {:#x}+{:#x}", v.address, v.size));
                         count_draw(DrawDrop::IndexBuffer);
                         return;
                     };
                     let address = buffer.gpu_address + view_offset;
                     let Some(draw) = config.draw(count, instances, first, first_instance, Some((index_type, address, base))) else {
+                        if count >= 3 && instances != 0 {
+                            crate::backend::metal_draw::note_once(format!("indexed rectangle configuration refused: {}", p.name));
+                        }
                         count_draw(DrawDrop::Topology);
                         return;
                     };
                     DrawKind::Geometry { draw, _index: Some(buffer) }
                 }
                 DrawKindIn::Mesh { .. } | DrawKindIn::Indirect { .. } => {
+                    crate::backend::metal_draw::note_once(format!("unsupported mesh/indirect rectangle: {}", p.name));
                     count_draw(DrawDrop::Topology);
                     return;
                 }
@@ -2228,10 +2306,12 @@ impl State {
                         return;
                     }
                     let Some((buffer, view_offset)) = m.chunks().window_buffer(v.address, u64::from(v.size)) else {
+                        crate::backend::metal_draw::note_once(format!("index buffer not wrapped: {:#x}+{:#x}", v.address, v.size));
                         count_draw(DrawDrop::IndexBuffer);
                         return;
                     };
                     let Ok(offset) = u32::try_from(view_offset + first_byte) else {
+                        crate::backend::metal_draw::note_once(format!("index buffer offset past 4 GiB: {view_offset:#x}+{first_byte:#x} in a span of {:#x}", buffer.len));
                         count_draw(DrawDrop::IndexBuffer);
                         return;
                     };
@@ -2241,14 +2321,14 @@ impl State {
                 DrawKindIn::Indirect { indexed, records, stride, max, count } => {
                     // The records and count read in place by the GPU (zero
                     // copy), translated at replay (F42).
-                    let words: u64 = if indexed { 5 } else { 4 };
+                    let words: u64 = if indexed { 5 } else if p.mesh { 3 } else { 4 };
                     let bytes = u64::from(max.saturating_sub(1)) * u64::from(stride) + words * 4;
                     let mut chunks = m.chunks();
                     let Some((rb, ro)) = chunks.window_buffer(records, bytes) else {
                         count_draw(DrawDrop::IndexBuffer);
                         return;
                     };
-                    let count = match count {
+                    let count_buf = match count {
                         Some(at) => match chunks.window_buffer(at, 4) {
                             Some(c) => Some(c),
                             None => {
@@ -2276,7 +2356,7 @@ impl State {
                     } else {
                         None
                     };
-                    DrawKind::Indirect { records: rb, records_offset: ro, stride, max, count, index }
+                    DrawKind::Indirect { records: rb, records_offset: ro, records_va: records, stride, max, count: count_buf, count_va: count, index }
                 }
             }
         };
@@ -2302,6 +2382,17 @@ impl State {
         count_draw(DrawDrop::Ran);
         crate::backend::metal_draw::note_targets(&targets);
         let op = std::sync::Arc::new(crate::backend::metal::MetalOp::Draw(MetalDraw {
+            trace_inputs: if crate::backend::metal_draw::filtered_trace() && crate::backend::metal_draw::trace_pipeline(&g.name) {
+                // Recording can precede the selected replay frame. Resolve the explicit SRVs now.
+                p.stages.iter().flat_map(|stage| &stage.translated().used).filter_map(|u| {
+                    if u.root != RootType::Table { return None; }
+                    let Root::Table(base) = self.roots_ref(false).get(usize::from(u.slot))? else { return None };
+                    match crate::descriptor::view(base.checked_add(u64::from(u.table_offset_dwords) * 4)?) {
+                        Some(crate::descriptor::View::Shader(r, _)) if crate::resource::texture_memory(r as This).is_some() => Some(r),
+                        _ => None,
+                    }
+                }).collect()
+            } else { Vec::new() },
             pso: g,
             targets,
             stages,
@@ -2461,20 +2552,53 @@ impl State {
         compute: bool,
         mut top: victory_metal::ir::TopLevel,
         limit: u32,
+        groups_xy: [u32; 2],
     ) -> Result<MetalStage, crate::backend::metal::Drop> {
         use crate::backend::metal::Drop;
         use crate::backend::metal_heap::Missing;
-        use victory_shader::emit::{USER_DATA_SPACE, USER_GROUP_BASE};
+        use victory_shader::emit::{SLOT_STRIDES, SLOT_WAVE_SCRATCH, USER_DATA_SPACE, USER_GROUP_BASE, USER_GROUP_COUNT_X, USER_GROUP_COUNT_Y};
         static SKIPPED_HOST_WORDS: AtomicU64 = AtomicU64::new(0);
         let t = stage.translated();
         let host = &t.host;
+
+        // Title memory by address (`SLOT_MEMORY`): the views of what the
+        // root arguments name, in the run after the view heap's slots.
+        let memory = if host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+            if self.heaps[0] == 0 {
+                once!(pipeline = %p.name, "Metal: a shader reads title memory by address with no view heap bound: dropped");
+                return Err(Drop::MemoryDirectory);
+            }
+            let (mut addresses, mut constants) = (Vec::new(), Vec::new());
+            for root in self.roots_ref(compute) {
+                match root {
+                    Root::View(address) => addresses.push(*address),
+                    Root::Constants(values) => constants.extend_from_slice(values),
+                    _ => {}
+                }
+            }
+            let heap = crate::descriptor::heap(self.heaps[0] as This);
+            match m.memory_ready(self.heaps[0], heap.count(), &addresses, &constants) {
+                Some(r) => Some(r),
+                None => {
+                    once!(pipeline = %p.name, "Metal: no room for title memory views: dropped");
+                    return Err(Drop::MemoryDirectory);
+                }
+            }
+        } else {
+            None
+        };
 
         // User data.
         let mut words = vec![0u32; host.user_data_dwords() as usize];
         for u in &host.user_data {
             let v = match u.root {
+                RootType::Other(kind) if kind == victory_shader::emit::USER_MEMORY_BASE && memory.is_some() => {
+                    memory.as_ref().map_or(0, |r| r.base)
+                }
                 RootType::Other(kind) if kind == USER_GROUP_BASE => 0, // Metal needs no split dispatches
                 RootType::Other(kind) if kind == victory_shader::emit::USER_DISPATCH_THREADS_X => limit,
+                RootType::Other(kind) if kind == USER_GROUP_COUNT_X => groups_xy[0],
+                RootType::Other(kind) if kind == USER_GROUP_COUNT_Y => groups_xy[1],
                 // Metal's one-view tables begin at the title's address itself.
                 RootType::Other(kind) if kind == victory_shader::emit::USER_VIEW_BIAS => 0,
                 RootType::Other(kind)
@@ -2483,7 +2607,7 @@ impl State {
                     self.host_word(compute, kind, u.slot, u.dword, None)
                 }
                 RootType::Other(_) => {
-                    // victory's memory directory words: not built for Metal yet
+                    // A host word this backend does not build
                     if SKIPPED_HOST_WORDS.fetch_add(1, Ordering::Relaxed).is_power_of_two() {
                         tracing::info!(pipeline = %p.name, "Metal: a shader needs the memory directory: skipped");
                     }
@@ -2500,6 +2624,24 @@ impl State {
             return Err(Drop::UserDataLayout);
         }
 
+        // Sync dirty descriptor slots on the bound view and sampler heaps first so
+        // bindless reads and `SLOT_STRIDES` see up-to-date entries and strides.
+        let view_bound = (self.heaps[0] != 0)
+            .then(|| {
+                let heap = crate::descriptor::heap(self.heaps[0] as This);
+                m.sync_heap(self.heaps[0], heap.count(), heap.samplers())
+            })
+            .flatten();
+        let sampler_bound = (self.heaps[1] != 0)
+            .then(|| {
+                let heap = crate::descriptor::heap(self.heaps[1] as This);
+                m.sync_heap(self.heaps[1], heap.count(), heap.samplers())
+            })
+            .flatten();
+        let mut heap_buffer = view_bound.as_ref().map(|(b, _)| b.clone());
+        let mut sampler_buffer = sampler_bound.as_ref().map(|(b, _)| b.clone());
+        let strides_gpu = view_bound.as_ref().map_or(0, |(_, s)| *s);
+
         // Root views by the Metal root layout: victory's own as root
         // descriptors, the title's as one-view tables bounded by the title
         // buffer that holds them (zero copy: a stray write is corruption).
@@ -2510,6 +2652,22 @@ impl State {
             for (i, r) in root_layout(host).into_iter().enumerate() {
                 let slot = match r {
                     RootSlot::Constants(_) => continue,
+                    RootSlot::Srv(s) if s == SLOT_STRIDES => {
+                        top.set_u64(i, strides_gpu);
+                        continue;
+                    }
+                    RootSlot::Uav(s) if s == SLOT_WAVE_SCRATCH => {
+                        top.set_u64(i, m.wave_scratch_gpu());
+                        continue;
+                    }
+                    RootSlot::Srv(s) if s == victory_shader::emit::SLOT_MEMORY => {
+                        top.set_u64(i, memory.as_ref().map_or(0, |r| r.directory));
+                        continue;
+                    }
+                    RootSlot::Uav(s) if s == victory_shader::emit::SLOT_FAULTS => {
+                        top.set_u64(i, memory.as_ref().map_or(0, |r| r.faults));
+                        continue;
+                    }
                     RootSlot::Cbv(s) | RootSlot::Srv(s) | RootSlot::Uav(s) | RootSlot::TableSrv(s) | RootSlot::TableUav(s) => s,
                 };
                 let va = match self.roots_ref(compute).get(usize::from(slot)) {
@@ -2545,8 +2703,6 @@ impl State {
 
         // The heaps: the slots the shader reads, refreshed (view heap at
         // bind point 0, sampler heap at 1).
-        let mut heap_buffer = None;
-        let mut sampler_buffer = None;
         let mut worst: Option<Missing> = None;
         for u in &t.used {
             if u.root != RootType::Table {
@@ -2557,7 +2713,7 @@ impl State {
             let Some(heap) = self.heap_of(handle) else { continue };
             let Some(index) = heap.index(handle) else { continue };
             let key = std::ptr::from_ref(heap) as usize;
-            if let Some((buffer, missing)) = m.refresh_slot(key, heap.count(), index, handle) {
+            if let Some((buffer, _, missing)) = m.refresh_slot(key, heap.count(), heap.samplers(), index, handle) {
                 Self::note_slot(index, handle, missing);
                 worst = worst.or(missing);
                 if heap.samplers() {
@@ -2577,7 +2733,7 @@ impl State {
             let Some(heap) = self.heap_of(handle) else { continue };
             let Some(i) = heap.index(handle) else { continue };
             let key = std::ptr::from_ref(heap) as usize;
-            if let Some((buffer, missing)) = m.refresh_slot(key, heap.count(), i, handle) {
+            if let Some((buffer, _, missing)) = m.refresh_slot(key, heap.count(), heap.samplers(), i, handle) {
                 Self::note_slot(i, handle, missing);
                 worst = worst.or(missing);
                 if heap.samplers() {
@@ -2591,7 +2747,7 @@ impl State {
         for (h, out) in [(self.heaps[0], &mut heap_buffer), (self.heaps[1], &mut sampler_buffer)] {
             if h != 0 && out.is_none() {
                 let heap = crate::descriptor::heap(h as This);
-                *out = m.refresh_slot(h, heap.count(), 0, heap.handle(0).unwrap_or(0)).map(|(b, _)| b);
+                *out = m.refresh_slot(h, heap.count(), heap.samplers(), 0, heap.handle(0).unwrap_or(0)).map(|(b, _, _)| b);
             }
         }
         let outcome = match worst {
@@ -3279,9 +3435,15 @@ impl State {
             ));
             return false;
         }
-        // On Metal too (F42): plain and indexed indirect draws.
+        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
+            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
+            return false;
+        }
+        // Native mesh records contain only three group counts, not draw arguments.
         #[cfg(windows)]
-        if crate::backend::metal_draw::draws_on() && (kind == DRAW || kind == INDEXED) && !made_rects {
+        if kind == DISPATCH && crate::backend::metal::mode() != crate::backend::metal::Mode::Off {
+            self.metal_dispatch_indirect(p, arguments, stride, max, count);
+        } else if crate::backend::metal_draw::draws_on() && (kind == DRAW || kind == INDEXED || kind == MESH) && !made_rects {
             self.metal_draw(crate::backend::metal_draw::DrawKindIn::Indirect { indexed: kind == INDEXED, records: arguments, stride, max, count });
         }
         let len = u64::from(stride) * u64::from(max);
@@ -3306,10 +3468,6 @@ impl State {
             why("no host signature");
             return false;
         };
-        if kind == MESH && (mesh_test() == 1 || !mesh_kept(self.pipeline)) {
-            why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
-            return false;
-        }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no
         // buffer. Anything else ends the window: it uses the scratch buffer

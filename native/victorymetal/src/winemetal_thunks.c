@@ -570,6 +570,7 @@ MTLCaptureManager_startCapture(obj_handle_t mgr, struct WMTCaptureInfo *info) {
   struct unixcall_mtlcapturemanager_startcapture params;
   params.capture_manager = mgr;
   WMT_MEMPTR_SET(params.info, info);
+  params.ret = false;
   UNIX_CALL(54, &params);
   return params.ret;
 }

@@ -987,6 +987,10 @@ fn resolve_render_pass(
     pass.colors[0].resolve_texture = dst.texture.handle();
     pass.colors[0].resolve_level = dst.level;
     pass.colors[0].resolve_slice = dst.slice;
+    {
+        let mut work = cb.1.lock().unwrap_or_else(|e| e.into_inner());
+        work.resolve_pixels = work.resolve_pixels.saturating_add(u64::from(width) * u64::from(height));
+    }
 
     // SAFETY: `cb` and both textures are live for the encoding call.
     let encoder = unsafe { sys::MTLCommandBuffer_renderCommandEncoder(cb.handle(), &mut pass) };

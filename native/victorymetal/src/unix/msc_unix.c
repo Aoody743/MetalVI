@@ -224,6 +224,18 @@ static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params
           }
         }
         IRShaderReflectionDestroy(refl);
+      } else if (p->stage == IRShaderStageMesh) {
+        IRShaderReflection *refl = IRShaderReflectionCreate();
+        if (IRObjectGetReflection(output, IRShaderStageMesh, refl)) {
+          IRVersionedMSInfo info;
+          if (IRShaderReflectionCopyMeshInfo(refl, IRReflectionVersion_1_0, &info)) {
+            p->threadgroup[0] = info.info_1_0.num_threads[0];
+            p->threadgroup[1] = info.info_1_0.num_threads[1];
+            p->threadgroup[2] = info.info_1_0.num_threads[2];
+            IRShaderReflectionReleaseMeshInfo(&info);
+          }
+        }
+        IRShaderReflectionDestroy(refl);
       }
     }
     IRMetalLibBinaryDestroy(lib);

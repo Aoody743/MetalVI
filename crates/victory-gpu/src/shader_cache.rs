@@ -122,6 +122,9 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
         }
     };
     match CACHE.get() {
+        // The rectangle pixel and pruned mesh variants are not keyed apart:
+        // never cached.
+        Some(_) if victory_shader::emit::rect_primitive_varying() || victory_shader::emit::mesh_outputs_keep_active() => translate(container),
         Some(cache) => cached(cache, build(), container, translate),
         None => translate(container),
     }

@@ -1900,8 +1900,11 @@ impl Drop for Resource {
                 crate::host::retire(twin);
             }
         }
-        crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
+        let id = std::ptr::from_ref::<Resource>(self) as usize;
+        crate::texture::forget(id);
+        crate::descriptor::forget(id);
+        #[cfg(windows)]
+        crate::backend::metal::forget_resource(id);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,

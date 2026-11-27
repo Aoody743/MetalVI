@@ -97,6 +97,7 @@ vertex float4 vs(uint id [[vertex_id]]) {
         })
         .unwrap();
     let pso = Arc::new(MetalGraphics {
+        cost_ns: Default::default(),
         name: "F76 synthetic depth draw".into(),
         pso,
         dss,
@@ -119,6 +120,7 @@ vertex float4 vs(uint id [[vertex_id]]) {
     };
     targets.finish();
     let draw = MetalDraw {
+        trace_inputs: Vec::new(),
         pso,
         targets: Arc::new(targets),
         stages: Vec::new(),

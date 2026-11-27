@@ -9,6 +9,24 @@ const RECORD_BYTES: u64 = 20;
 // Both Metal and the MSC draw uniform accept 4-byte offsets on Apple silicon.
 const DRAW_PARAMS_BYTES: u64 = 20;
 const THREADS: u64 = 64;
+pub const RECORD_LIMIT: u32 = 64;
+pub const GROUPS_PER_RECORD: u32 = 32;
+pub const INPUTS_PER_RECORD: u32 = 512;
+
+pub struct ClampCounter(Buffer, *mut u8);
+
+impl ClampCounter {
+    pub fn new(device: &Device) -> Result<Self> {
+        let (b, ptr) = device.shared_buffer_mapped(&0u32.to_ne_bytes())?;
+        Ok(Self(b, ptr))
+    }
+
+    /// # Safety
+    /// All commands using this counter must have completed before reading.
+    pub unsafe fn completed_count(&self) -> u32 {
+        unsafe { self.1.cast::<u32>().read_volatile() }
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum IndirectKind {
@@ -21,6 +39,9 @@ pub enum IndirectKind {
     },
     Dispatch,
     DrawMesh,
+    TitleMesh1D,
+    /// Non-indexed three-vertex rectangles expanded by MSC's object/mesh pair.
+    Rectangles(crate::msc::GeometryConfig),
 }
 
 pub struct IndirectSource<'a> {
@@ -53,6 +74,17 @@ impl IndirectTranslator {
         command: &CommandBuffer,
         source: &IndirectSource<'_>,
     ) -> Result<Option<IndirectBatch>> {
+        self.encode_impl(device, command, source, None)
+    }
+
+    pub fn encode_bounded(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter) -> Result<Option<IndirectBatch>> {
+        if source.max_count > RECORD_LIMIT {
+            return Err(Error("indirect record budget exceeded".into()));
+        }
+        self.encode_impl(device, command, source, Some(counter))
+    }
+
+    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>) -> Result<Option<IndirectBatch>> {
         if source.max_count == 0 {
             return Ok(None);
         }
@@ -67,6 +99,8 @@ impl IndirectTranslator {
             }
             IndirectKind::Dispatch => (2, 3, 0),
             IndirectKind::DrawMesh => (10, 3, 0),
+            IndirectKind::TitleMesh1D => (12, 3, 0),
+            IndirectKind::Rectangles(_) => (11, 4, 0),
         };
         let stride = u64::from(source.stride);
         let (records, records_offset) = source.records;
@@ -81,20 +115,27 @@ impl IndirectTranslator {
         if source.count.is_some() && !valid_window(count, count_offset, 4) {
             return Err(Error("invalid indirect count window".into()));
         }
-        let values: [u32; 5] = [
+        let rect = if let IndirectKind::Rectangles(cfg) = source.kind {
+            Some((cfg.object_vertex_stride().ok_or_else(|| Error("invalid MSC geometry stride".into()))?, cfg.max_input_primitives))
+        } else { None };
+        let values = [
             kind,
             source.stride / 4,
             source.max_count,
             u32::from(source.count.is_some()),
             index_limit,
+            rect.map_or(0, |r| r.0),
+            rect.map_or(0, |r| r.1),
+            if counter.is_some() { GROUPS_PER_RECORD } else { 0 },
+            INPUTS_PER_RECORD,
         ];
-        let mut options = [0; 20];
+        let mut options = [0; 36];
         for (dst, value) in options.chunks_exact_mut(4).zip(values) {
             dst.copy_from_slice(&value.to_le_bytes());
         }
         let output = device.private_buffer(u64::from(source.max_count) * RECORD_BYTES)?;
-        let draw_params = (kind <= 1)
-            .then(|| device.private_buffer(u64::from(source.max_count) * DRAW_PARAMS_BYTES))
+        let draw_params = (kind <= 1 || rect.is_some())
+            .then(|| device.private_buffer(u64::from(source.max_count) * if rect.is_some() { 48 } else { DRAW_PARAMS_BYTES }))
             .transpose()?;
         command.compute(&[
             Compute::Pipeline {
@@ -126,6 +167,7 @@ impl IndirectTranslator {
                 offset: 0,
                 index: 4,
             },
+            Compute::Buffer { buffer: counter.map_or(&output, |c| &c.0), offset: 0, index: 5 },
             Compute::Dispatch {
                 groups: [u64::from(source.max_count).div_ceil(THREADS), 1, 1],
             },
@@ -171,7 +213,7 @@ impl IndirectBatch {
             draw_params: self
                 .draw_params
                 .as_ref()
-                .map(|buffer| (buffer, u64::from(index) * DRAW_PARAMS_BYTES)),
+                .map(|buffer| (buffer, u64::from(index) * if matches!(self.kind, IndirectKind::Rectangles(_)) {48} else {DRAW_PARAMS_BYTES})),
             kind: self.kind,
         })
     }
@@ -185,6 +227,16 @@ pub struct IndirectRecord<'a> {
 }
 
 impl<'a> IndirectRecord<'a> {
+    pub fn rectangle_bindings(&self) -> Option<[Render<'a>; 4]> {
+        let IndirectKind::Rectangles(_) = self.kind else { return None };
+        let (b, at) = self.draw_params?;
+        Some([
+            Render::ObjectBuffer { buffer: b, offset: at, index: DRAW_ARGUMENTS_BIND_POINT },
+            Render::MeshBuffer { buffer: b, offset: at, index: DRAW_ARGUMENTS_BIND_POINT },
+            Render::ObjectBuffer { buffer: b, offset: at + 24, index: DRAW_UNIFORMS_BIND_POINT },
+            Render::MeshBuffer { buffer: b, offset: at + 24, index: DRAW_UNIFORMS_BIND_POINT },
+        ])
+    }
     /// Apply these just before this record's draw. Real mesh and compute
     /// functions do not use the vertex draw-parameter ABI.
     pub fn msc_vertex_bindings(&self) -> Option<[Render<'a>; 2]> {

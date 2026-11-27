@@ -27,6 +27,12 @@ mod evict;
 
 pub const PAGE: u64 = 64 << 10;
 pub const CHUNK: u64 = 2 << 20;
+/// The least a new span covers (see [`Chunks::span_ranges`]).
+pub const SPAN_MIN: u64 = 16 << 20;
+
+/// Lookups that returned a span a remap made stale (`resident_window`
+/// takes `&self`).
+pub static STALE_USES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const PAGES_PER_CHUNK: u64 = CHUNK / PAGE;
 
 /// How one chunk is wrapped.
@@ -56,7 +62,28 @@ pub struct Chunks {
     residency: ResidencySet,
     /// Counters (wraps of whole chunks, of single pages, rewraps).
     pub stats: Stats,
+    /// No new span once live spans hold this many bytes: every span wires
+    /// its pages for the GPU and joins the one residency set every
+    /// submission makes resident.
+    pub span_cap: u64,
+    /// The longest live span's length (how far back a lookup looks).
+    longest_span: u64,
+    /// Spans whose pages a remap changed: they still show the old ones.
+    stale: std::collections::HashSet<(u64, u64)>,
+    /// Where else the bytes of a title range are mapped, never remapped
+    /// ([`Alias`]): spans are made there instead.
+    pub alias: Option<Alias>,
 }
+
+/// The host address of the same bytes as title range `[va, va+len)` in a
+/// mapping nobody remaps (xmem's persistent views of its physical-page
+/// sections), or `None` to wrap the title addresses themselves. Title
+/// views of physical pages are remapped thousands of times a second while
+/// streaming: a wrapper over them keeps the old pages (the GPU then reads
+/// stale data, and the old pages stay wired), and wrapping the new ones
+/// beside it is what panicked macOS (2026-11-26). The section's own view
+/// shows every page where it always is.
+pub type Alias = fn(u64, u64) -> Option<u64>;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Stats {
@@ -65,6 +92,15 @@ pub struct Stats {
     pub rewrapped_chunks: u64,
     pub spans: u64,
     pub refused: u64,
+    /// Bytes under live span buffers (they overlap chunks and each other).
+    pub span_bytes: u64,
+    /// Spans refused by [`Chunks::span_cap`].
+    pub capped: u64,
+    /// Remaps that changed pages under a live span ([`Chunks::note_remap`]),
+    /// the spans they made stale, and lookups that returned a stale span.
+    pub remaps_under_spans: u64,
+    pub stale_spans: u64,
+    pub stale_uses: u64,
 }
 
 /// Whether `[at, at+len)` is committed memory one could wrap.
@@ -138,6 +174,10 @@ impl Chunks {
             sparse: None,
             residency,
             stats: Stats::default(),
+            span_cap: u64::MAX,
+            longest_span: 0,
+            stale: std::collections::HashSet::new(),
+            alias: None,
         })
     }
 
@@ -166,6 +206,10 @@ impl Chunks {
             sparse: Some(std::collections::HashMap::new()),
             residency,
             stats: Stats::default(),
+            span_cap: u64::MAX,
+            longest_span: 0,
+            stale: std::collections::HashSet::new(),
+            alias: None,
         })
     }
 
@@ -197,8 +241,20 @@ impl Chunks {
         self.window_buffer(va, len).map_or(0, |(b, off)| b.gpu_address + off)
     }
 
+    /// `[va, va+len)` where spans are made for it: its [`Alias`], else itself.
+    fn home(&self, va: u64, len: u64) -> u64 {
+        self.alias.and_then(|f| f(va, len)).unwrap_or(va)
+    }
+
     /// A contiguous range in a buffer already in this residency set.
     pub fn resident_window(&self, va: u64, len: u64) -> Option<(Buffer, u64)> {
+        // The same bytes can have a span at either address: a longer view
+        // that crosses non-consecutive pages has none at the alias.
+        let home = self.home(va, len);
+        self.lookup(home, len).or_else(|| if home != va { self.lookup(va, len) } else { None })
+    }
+
+    fn lookup(&self, va: u64, len: u64) -> Option<(Buffer, u64)> {
         let end = va.checked_add(len)?;
         if len == 0 || va < self.base || end > self.base + self.size {
             return None;
@@ -218,10 +274,66 @@ impl Chunks {
                 _ => {}
             }
         }
-        let start = va & !(PAGE - 1);
-        self.spans.range(..=(start, u64::MAX)).next_back()
-            .filter(|((s, e), _)| *s <= start && end <= *e)
-            .map(|(&(s, _), b)| (b.clone(), va - s))
+        // Any span holding the range, not only the one starting last
+        // before it: spans of every start no further back than the longest.
+        let floor = va.saturating_sub(self.longest_span);
+        self.spans
+            .range((floor, 0)..=(va, u64::MAX))
+            .rev()
+            .find(|((s, e), _)| *s <= va && end <= *e)
+            .map(|(&(s, e), b)| {
+                if self.stale.contains(&(s, e)) {
+                    STALE_USES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                (b.clone(), va - s)
+            })
+    }
+
+    /// Notes that the pages of `[at, at+len)` changed (counts only: the
+    /// spans over them are left as they are).
+    pub fn note_remap(&mut self, at: u64, len: u64) {
+        let end = at.saturating_add(len);
+        let floor = at.saturating_sub(self.longest_span);
+        let hit: Vec<(u64, u64)> = self
+            .spans
+            .range((floor, 0)..(end, 0))
+            .map(|(k, _)| *k)
+            .filter(|&(s, e)| s < end && at < e)
+            .collect();
+        if !hit.is_empty() {
+            self.stats.remaps_under_spans += 1;
+        }
+        for k in hit {
+            if self.stale.insert(k) {
+                self.stats.stale_spans += 1;
+            }
+        }
+    }
+
+    /// The range a new span over `[va, end)` covers: 2 MiB aligned and at
+    /// least [`SPAN_MIN`] where the memory there is committed (candidates, widest first), so that the
+    /// views of one region share a buffer (exact ranges made a span per
+    /// draw: 14,000 of them before the first 3D frame, each wiring its
+    /// pages, 2026-11-27); else the committed run from the page, else the
+    /// pages of the range.
+    fn span_ranges(va: u64, end: u64) -> Vec<(u64, u64)> {
+        let need = end.next_multiple_of(PAGE);
+        let page = va & !(PAGE - 1);
+        let aligned = va & !(CHUNK - 1);
+        let want = need.max(aligned + SPAN_MIN).next_multiple_of(CHUNK);
+        let mut out = Vec::new();
+        for start in [aligned, page] {
+            let run = committed_extent(start, want - start) & !(PAGE - 1);
+            if start + run >= need && !out.contains(&(start, start + run)) {
+                out.push((start, start + run));
+            }
+        }
+        // Metal can refuse a range over mappings of different kinds: the
+        // pages of the range itself come last.
+        if !out.contains(&(page, need)) && mapped(page, need - page) {
+            out.push((page, need));
+        }
+        out
     }
 
     /// The buffer holding `[va, va+len)` contiguously and the range's offset
@@ -234,25 +346,29 @@ impl Chunks {
         if let Some(window) = self.resident_window(va, len) {
             return Some(window);
         }
-        let start = va & !(PAGE - 1);
-        let end = end.next_multiple_of(PAGE);
-        if !mapped(start, end - start) {
-            return None;
-        }
-        // SAFETY: committed now; a remap there retires the span first.
-        match unsafe { self.device.wrap(start as *mut c_void, end - start) } {
-            Ok(b) => {
-                self.residency.add(&[b.handle()]);
-                self.residency.commit();
-                self.spans.insert((start, end), b.clone());
-                self.stats.spans += 1;
-                Some((b, va - start))
+        let va = self.home(va, len);
+        let end = va.checked_add(len)?;
+        for (start, end) in Self::span_ranges(va, end) {
+            if self.stats.span_bytes.saturating_add(end - start) > self.span_cap {
+                self.stats.capped += 1;
+                return None;
             }
-            Err(_) => {
-                self.stats.refused += 1;
-                None
+            // SAFETY: committed now; the alias, where there is one, is
+            // never remapped.
+            match unsafe { self.device.wrap(start as *mut c_void, end - start) } {
+                Ok(b) => {
+                    self.residency.add(&[b.handle()]);
+                    self.residency.commit();
+                    self.spans.insert((start, end), b.clone());
+                    self.stats.spans += 1;
+                    self.stats.span_bytes += end - start;
+                    self.longest_span = self.longest_span.max(end - start);
+                    return Some((b, va - start));
+                }
+                Err(_) => self.stats.refused += 1,
             }
         }
+        None
     }
 
     /// Wraps every chunk touching `[at, at+len)` that is not wrapped yet.
@@ -283,6 +399,7 @@ impl Chunks {
         let stale: Vec<(u64, u64)> = self.spans.keys().copied().filter(|&(s, e)| s < hi && lo < e).collect();
         for key in stale {
             if let Some(b) = self.spans.remove(&key) {
+                self.stats.span_bytes -= key.1 - key.0;
                 old_buffers.push(b);
             }
         }
@@ -382,3 +499,114 @@ impl Chunks {
 
 // The raw table pointer is only touched through &mut self / &self.
 unsafe impl Send for Chunks {}
+
+#[cfg(test)]
+mod span_tests {
+    use super::*;
+
+    /// Views at many offsets and lengths in one region share a few spans,
+    /// and each resolves to its own bytes.
+    #[test]
+    fn views_of_one_region_share_spans() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Ok(device) = Device::first() else { return };
+        let mut chunks = Chunks::sparse(&device).unwrap();
+        let bytes = 64usize << 20;
+        // SAFETY: a fresh allocation of our own, never freed (test).
+        let base = unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let mut n = 0;
+        for k in 0..2000u64 {
+            let va = base + (k * 7919 * 256) % (48 << 20);
+            let len = 256 + (k * 104_729) % (4 << 20);
+            let (b, off) = chunks.window_buffer(va, len).expect("committed");
+            assert!(off + len <= b.len, "the view lies inside its span");
+            // The span's first byte is the title address `va - off`.
+            assert!(va - off >= base && va - off + b.len <= base + bytes as u64);
+            n += 1;
+        }
+        assert_eq!(n, 2000);
+        assert!(chunks.stats.spans <= 16, "spans: {}", chunks.stats.spans);
+    }
+
+    static TITLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// One title view of one 64 KiB page, aliased at `HOST`.
+    fn alias(va: u64, len: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let title = TITLE.load(SeqCst);
+        (va >= title && va + len <= title + PAGE).then(|| HOST.load(SeqCst) + (va - title))
+    }
+
+    /// The GPU copy of `len` bytes at `offset` in `src` (the destination is
+    /// in no residency set: the command buffer makes its bound buffers
+    /// resident).
+    fn gpu_read(device: &Device, queue: &crate::Queue, src: &Buffer, offset: u64, len: u64) -> Vec<u8> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let bytes = len.next_multiple_of(PAGE);
+        // SAFETY: a fresh allocation of our own, never freed (test).
+        let mem = unsafe { VirtualAlloc(core::ptr::null(), bytes as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!mem.is_null());
+        // SAFETY: committed memory of ours that outlives the copy.
+        let dst = unsafe { device.wrap(mem, bytes) }.unwrap();
+        let cb = queue.command_buffer().unwrap();
+        let mut blit = cb.blit_encoder().unwrap();
+        blit.copy_buffer(src, offset, &dst, 0, len);
+        blit.finish();
+        cb.commit();
+        cb.wait().unwrap();
+        // SAFETY: a shared buffer of `len` bytes the GPU is done with.
+        unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), len as usize).to_vec() }
+    }
+
+    /// A title view of a physical page is remapped to another page of the
+    /// same section: spans go to the section's own view, so the GPU reads
+    /// the page the title shows now, the old span still reads the old page
+    /// (its memory never moved), and no wrapper is made over remapped
+    /// title addresses.
+    #[test]
+    fn remapped_title_views_read_through_the_section_view() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE, SEC_COMMIT, UnmapViewOfFile};
+        let Ok(device) = Device::first() else { return };
+        let queue = device.new_queue(4).unwrap();
+        let mut chunks = Chunks::sparse(&device).unwrap();
+        queue.add_residency_set(chunks.residency());
+        chunks.alias = Some(alias);
+        let pages = 16u64;
+        // SAFETY: a fresh pagefile-backed section and views of it (test).
+        let (section, host) = unsafe {
+            let h = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, (pages * PAGE) as u32, std::ptr::null());
+            assert!(!h.is_null());
+            let v = MapViewOfFile(h, FILE_MAP_WRITE, 0, 0, (pages * PAGE) as usize);
+            assert!(!v.Value.is_null());
+            (h, v.Value as u64)
+        };
+        let title_view = |page: u64, fill: u8| {
+            // SAFETY: a view of a page of our section, written whole.
+            unsafe {
+                let v = MapViewOfFile(section, FILE_MAP_WRITE, 0, (page * PAGE) as u32, PAGE as usize);
+                assert!(!v.Value.is_null());
+                std::ptr::write_bytes(v.Value.cast::<u8>(), fill, PAGE as usize);
+                TITLE.store(v.Value as u64, SeqCst);
+                HOST.store(host + page * PAGE, SeqCst);
+                v
+            }
+        };
+        let first = title_view(2, 0xA1);
+        let (old, old_off) = chunks.window_buffer(TITLE.load(SeqCst) + 256, 4096).expect("aliased");
+        assert!(gpu_read(&device, &queue, &old, old_off, 4096).iter().all(|&b| b == 0xA1));
+        // The title remaps its address to page 5.
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(first) };
+        let second = title_view(5, 0xB2);
+        let (now, now_off) = chunks.window_buffer(TITLE.load(SeqCst) + 256, 4096).expect("aliased");
+        assert!(gpu_read(&device, &queue, &now, now_off, 4096).iter().all(|&b| b == 0xB2));
+        assert!(gpu_read(&device, &queue, &old, old_off, 4096).iter().all(|&b| b == 0xA1));
+        assert_eq!(chunks.stats.spans, 1, "both pages are in the section view's one span");
+        // SAFETY: our view.
+        unsafe { UnmapViewOfFile(second) };
+    }
+}

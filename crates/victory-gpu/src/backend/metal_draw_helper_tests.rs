@@ -250,6 +250,7 @@ fn targets_require_exact_formats_and_sample_count() {
         .unwrap();
     // fit reads cached metadata only; the real PSO/state are never drawn.
     let mut pipeline = MetalGraphics {
+        cost_ns: Default::default(),
         name: String::new(),
         depth_write: true,
         pso: device
@@ -379,4 +380,85 @@ fn depth_resource_views_use_only_compatible_formats() {
         ..t
     };
     assert_eq!(view_format(&plain, 62), pixel);
+}
+
+#[test]
+fn stand_in_and_packed_texture_views_use_only_compatible_formats() {
+    use super::super::metal_texture::{MetalTexture, identity, view_format};
+    use victory_metal::Object;
+    use victory_metal::sys::{self, WMTTextureType, WMTTextureUsage};
+
+    let device = Device::first().unwrap();
+    let mut stand_in_desc: ResourceDesc = unsafe { std::mem::zeroed() };
+    stand_in_desc.format = 86; // DXGI_FORMAT_B5G5R5A1_UNORM
+    stand_in_desc.flags = 1; // RENDER_TARGET (stands in as RGBA8Unorm on Metal)
+
+    let tex_stand_in = device
+        .new_texture(&TextureDescriptor {
+            pixel_format: Pixel::WMTPixelFormatRGBA8Unorm,
+            width: 8,
+            height: 8,
+            usage: WMTTextureUsage(1 | 4 | 0x10),
+            ..Default::default()
+        })
+        .unwrap();
+    let t_stand_in = MetalTexture {
+        texture: tex_stand_in.clone(),
+        pixel: Pixel::WMTPixelFormatRGBA8Unorm,
+        desc: stand_in_desc,
+        mips: 1,
+        slices: 1,
+        companion: Default::default(),
+    };
+    assert_eq!(view_format(&t_stand_in, 86), Pixel::WMTPixelFormatRGBA8Unorm);
+    assert_eq!(view_format(&t_stand_in, 115), Pixel::WMTPixelFormatRGBA8Unorm);
+    let view_srgb = view_format(&t_stand_in, 29);
+    assert_eq!(view_srgb, Pixel::WMTPixelFormatRGBA8Unorm_sRGB);
+
+    for fmt in [
+        view_format(&t_stand_in, 86),
+        view_format(&t_stand_in, 115),
+        view_srgb,
+    ] {
+        let _pool = victory_metal::Pool::new();
+        let mut id = 0u64;
+        // SAFETY: live texture with PixelFormatView usage and view-compatible format.
+        let view = unsafe {
+            sys::MTLTexture_newTextureView(
+                tex_stand_in.handle(),
+                fmt,
+                WMTTextureType::WMTTextureType2D,
+                0,
+                1,
+                0,
+                1,
+                identity(),
+                &mut id,
+            )
+        };
+        assert!(Object::adopt(view).is_some(), "view creation failed for {:?}", fmt);
+    }
+
+    let mut packed_desc: ResourceDesc = unsafe { std::mem::zeroed() };
+    packed_desc.format = 86;
+    packed_desc.flags = 0;
+    let tex_packed = device
+        .new_texture(&TextureDescriptor {
+            pixel_format: Pixel::WMTPixelFormatA1BGR5Unorm,
+            width: 8,
+            height: 8,
+            usage: WMTTextureUsage(1 | 0x10),
+            ..Default::default()
+        })
+        .unwrap();
+    let t_packed = MetalTexture {
+        texture: tex_packed,
+        pixel: Pixel::WMTPixelFormatA1BGR5Unorm,
+        desc: packed_desc,
+        mips: 1,
+        slices: 1,
+        companion: Default::default(),
+    };
+    assert_eq!(view_format(&t_packed, 86), Pixel::WMTPixelFormatA1BGR5Unorm);
+    assert_eq!(view_format(&t_packed, 57), Pixel::WMTPixelFormatA1BGR5Unorm);
 }

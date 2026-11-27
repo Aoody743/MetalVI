@@ -148,12 +148,13 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    if crate::watch::skip_d3d12_host() {
-        return;
-    }
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
+    crate::backend::metal::note_slot_dirty(std::ptr::from_ref(heap) as usize, index, handle);
+    if crate::watch::skip_d3d12_host() {
+        return;
+    }
     let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
     match heap.host.get() {
         None => pending.push(index),
@@ -183,6 +184,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
+        crate::backend::metal::forget_heap(at);
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
@@ -705,8 +707,11 @@ pub(crate) fn make_waiting() {
                 Some(View::Shader(r, _) | View::Unordered(r, _, _)) => r == resource,
                 _ => false,
             };
-            if same && let Some(Some(host)) = heap.host.get() {
-                host.mirror(index, handle, true);
+            if same {
+                crate::backend::metal::note_slot_dirty(std::ptr::from_ref(heap) as usize, index, handle);
+                if let Some(Some(host)) = heap.host.get() {
+                    host.mirror(index, handle, true);
+                }
             }
         }
     }

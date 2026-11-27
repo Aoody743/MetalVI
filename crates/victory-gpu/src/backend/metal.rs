@@ -61,6 +61,20 @@ pub(crate) fn texture_fill_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_METAL_TEXTURES").map_or(true, |v| v != "nofill"))
 }
 
+/// The runtime's answer to where a title range's physical pages are
+/// mapped for good ([`victory_metal::chunks::Alias`]); set once at start.
+static PHYSICAL_ALIAS: OnceLock<fn(u64, u64) -> Option<u64>> = OnceLock::new();
+
+/// Registers [`PHYSICAL_ALIAS`] (xmem, before the first draw). It may take
+/// the runtime's page-table lock: it must not call back into the GPU side.
+pub fn set_physical_alias(f: fn(u64, u64) -> Option<u64>) {
+    let _ = PHYSICAL_ALIAS.set(f);
+}
+
+fn physical_alias(va: u64, len: u64) -> Option<u64> {
+    PHYSICAL_ALIAS.get().and_then(|f| f(va, len))
+}
+
 /// Counts mapping changes. Recorded Metal lists can still contain old GPU
 /// addresses, so the post-map notification cannot safely re-wrap memory.
 pub(crate) fn title_memory_remapped(at: u64, len: u64) {
@@ -71,6 +85,14 @@ pub(crate) fn title_memory_remapped(at: u64, len: u64) {
     }
     if n.is_power_of_two() {
         tracing::info!(calls = n, at = format_args!("{at:#x}"), len, "Metal: title memory remapped");
+    }
+    super::metal_texture::note_remap_partial(at, len);
+    // Counted only, and never waited for: the runtime calls this holding
+    // its page table, which span lookups take under `chunks`.
+    if let Some(Some(m)) = BACKEND.get()
+        && let Ok(mut chunks) = m.chunks.try_lock()
+    {
+        chunks.note_remap(at, len);
     }
 }
 
@@ -143,6 +165,9 @@ pub(crate) fn count(what: Drop) {
 
 /// A title pipeline as a Metal compute pipeline.
 pub(crate) struct MetalCompute {
+    pub(crate) cost_ns: std::sync::atomic::AtomicU64,
+    /// The title pipeline's name, as logged.
+    pub(crate) name: String,
     pub(crate) pso: ComputePipeline,
     pub(crate) threadgroup: [u64; 3],
     /// An empty top-level argument buffer of its root signature.
@@ -163,13 +188,89 @@ pub(crate) struct MetalCmd {
     pub(crate) tables: Vec<(u32, DescriptorEntry)>,
 }
 
+/// One indirect compute dispatch as recorded into a title list.
+pub(crate) struct MetalDispatchIndirect {
+    pub(crate) pso: Arc<MetalCompute>,
+    pub(crate) heap: Option<Buffer>,
+    pub(crate) sampler_heap: Option<Buffer>,
+    pub(crate) top: Vec<u8>,
+    pub(crate) tables: Vec<(u32, DescriptorEntry)>,
+    pub(crate) records: Buffer,
+    pub(crate) records_offset: u64,
+    pub(crate) stride: u32,
+    pub(crate) max: u32,
+    pub(crate) count: Option<(Buffer, u64)>,
+    /// Title addresses of the records and the count (diagnostics).
+    pub(crate) records_va: u64,
+    pub(crate) count_va: Option<u64>,
+}
+
 /// What a title list records for Metal, in its order.
 pub(crate) enum MetalOp {
     Dispatch(MetalCmd),
+    DispatchIndirect(MetalDispatchIndirect),
     Draw(super::metal_draw::MetalDraw),
     Clear(super::metal_draw::MetalClear),
     Copy(super::metal_draw::MetalTexCopy),
+    FloatRowReadback { src: victory_metal::texture::Texture, dst: Buffer, offset: u64, width: u32 },
+    BufferCopy { dst: usize, src: usize, bytes: usize },
     Resolve(super::metal_draw::MetalResolve),
+}
+
+/// Serialize every backend command buffer through completion and the fuse.
+/// This cannot interrupt a command buffer which has already been submitted.
+pub(crate) fn submit_checked(
+    cb: &victory_metal::CommandBuffer,
+    ops: &[Arc<MetalOp>],
+    has_work: bool,
+    label: &'static str,
+) -> victory_metal::Result<()> {
+    completion::submit(cb, ops, has_work, label)
+}
+
+fn complete_checked(
+    cb: &victory_metal::CommandBuffer,
+    ops: &[Arc<MetalOp>],
+    has_work: bool,
+    label: &'static str,
+) -> victory_metal::Result<()> {
+    let encoded = cb.encoded_work();
+    if !work::within_limits(encoded) {
+        tracing::error!(%label, ?encoded, "Metal: command buffer exceeds physical encoder budget");
+        work::reject("physical encoder budget");
+        return Err(victory_metal::Error("physical encoder budget exceeded".into()));
+    }
+    if !fuse::commit_if_open(cb) {
+        return Err(victory_metal::Error("Metal safety stop already tripped".into()));
+    }
+    let watch = inflight::watch(ops);
+    let result = cb.wait();
+    #[cfg(test)]
+    let result = result.and_then(|()| if completion::INJECT_TIMEOUT.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        Err(victory_metal::Error("injected system timeout after bounded GPU completion".into()))
+    } else { Ok(()) });
+    drop(watch);
+    if let Err(e) = result {
+        fuse::stop();
+        tracing::error!(%label, error = %e, "Metal safety stop: submission failed");
+        return Err(e);
+    }
+    let unsafe_time = if ops.is_empty() {
+        (has_work || encoded != Default::default()) && fuse::check_aux(cb)
+    } else {
+        fuse::check(std::iter::once((cb, 0..ops.len())), ops)
+    };
+    if unsafe_time {
+        tracing::error!(%label, "Metal safety stop: submission failed");
+        return Err(victory_metal::Error("Metal safety stop: unsafe GPU duration".into()));
+    }
+    work::observe(ops, cb.gpu_time_ns());
+    Ok(())
+}
+
+pub(crate) fn stop_submissions(reason: &'static str) {
+    fuse::stop();
+    tracing::error!(%reason, "Metal safety stop: submission failed");
 }
 
 /// Memory for the one-view tables of a submission (resident, GPU reads it
@@ -208,6 +309,9 @@ pub(crate) struct MetalBackend {
     /// goes in the entry; a compare function with comparison off) share
     /// one. Apple7 samples wrong past 1024 distinct samplers (F8/F9).
     sampler_states: Mutex<HashMap<[u32; 11], victory_metal::sampler::SamplerState>>,
+    /// Resident tables of `DescriptorEntry`s for MSC's static samplers, keyed
+    /// by serialized entries so identical static sampler sets share one buffer.
+    static_sampler_tables: Mutex<HashMap<Vec<u8>, Buffer>>,
     /// The GPU detile kernels, compiled on first use (`None`: they failed).
     detiler: OnceLock<Option<super::metal_detile::Detiler>>,
     /// Graphics pipelines by (title pipeline object, rectangle emulation) (`None`: refused).
@@ -216,21 +320,71 @@ pub(crate) struct MetalBackend {
     pub(crate) depth_stencils: Mutex<HashMap<victory_metal::render::DepthStencilDesc, victory_metal::render::DepthStencilState>>,
     /// Render target views in another pixel format, by (resource, format).
     pub(crate) target_views: Mutex<HashMap<(usize, u32), victory_metal::texture::Texture>>,
+    /// Per-threadgroup scratch buffer for spilled wave64-on-wave32 helpers (`u249, space1`).
+    wave_scratch: OnceLock<Option<Buffer>>,
+    /// Whether allocations have been added to `chunks.residency()` since the last `commit()`.
+    residency_dirty: std::sync::atomic::AtomicBool,
+    /// Batched CPU-detiled texture uploads waiting for a single command buffer.
+    pub(crate) pending_uploads: Mutex<super::metal_texture::PendingUploads>,
+    /// Fast-path count of pending batched uploads.
+    pub(crate) uploads_pending: std::sync::atomic::AtomicUsize,
 }
 
 /// A title view heap as Metal Shader Converter descriptor entries, in
-/// memory of our own the GPU reads in place. Slots are refreshed when a
-/// shader that reads them is bound ([`MetalBackend::refresh_slot`]).
+/// memory of our own the GPU reads in place. Slots are refreshed when
+/// written via [`note_slot_dirty`] / [`MetalBackend::sync_heap`] and on bind
+/// via [`MetalBackend::refresh_slot`].
 pub(crate) struct MetalHeap {
     pub(crate) buffer: Buffer,
     entries: *mut DescriptorEntry,
     count: u32,
+    /// Entries the buffer holds: a view heap's `count` and then the run of
+    /// title-memory views (`memory`, `COPIES + 1` slots).
+    capacity: u32,
+    strides: Option<(Buffer, *mut u32)>,
 }
 
-// The entries are only written under the heaps lock.
+// The entries and stride table are only written under the heaps lock.
 unsafe impl Send for MetalHeap {}
 
+/// Title descriptor slots written since the last [`MetalBackend::sync_heap`]:
+/// `heap -> (index -> handle)`. Always a leaf lock.
+static DIRTY_SLOTS: Mutex<Option<HashMap<usize, HashMap<u32, u64>>>> = Mutex::new(None);
+
+pub(crate) fn note_slot_dirty(heap: usize, index: u32, handle: u64) {
+    if mode() == Mode::Off || handle == 0 {
+        return;
+    }
+    DIRTY_SLOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry(heap)
+        .or_default()
+        .insert(index, handle);
+}
+
+pub(crate) fn forget_heap(heap: usize) {
+    if let Some(map) = DIRTY_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&heap);
+    }
+    if let Some(Some(b)) = BACKEND.get() {
+        b.heaps.lock().unwrap_or_else(|e| e.into_inner()).remove(&heap);
+    }
+}
+
+pub(crate) fn forget_resource(resource: usize) {
+    super::metal_texture::forget_resource_textures(resource);
+    let Some(Some(b)) = BACKEND.get() else { return };
+    b.textures.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
+    b.views.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k.0 != resource);
+    b.target_views.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| k.0 != resource);
+}
+
 static BACKEND: OnceLock<Option<MetalBackend>> = OnceLock::new();
+
+#[path = "metal_memory.rs"]
+mod memory;
 
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stall_locks() -> impl Iterator<Item = (&'static str, usize)> {
@@ -269,7 +423,17 @@ impl MetalBackend {
         }
         let _pool = victory_metal::Pool::new();
         let device = Device::first()?;
-        let chunks = Chunks::sparse(&device)?;
+        let mut chunks = Chunks::sparse(&device)?;
+        // `VICTORY_METAL_SPAN_CAP_MB` (default 6144): what span buffers over
+        // title memory may hold before new ones are refused (their draws
+        // drop). Unbounded, they wired tens of GB for the GPU and stalled
+        // the window server in the kernel (2026-11-27, whole-machine hang).
+        chunks.span_cap = std::env::var("VICTORY_METAL_SPAN_CAP_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(6144)
+            << 20;
+        chunks.alias = Some(physical_alias);
         let queue = device.new_queue(64)?;
         queue.add_residency_set(chunks.residency());
         Ok(Self {
@@ -281,14 +445,35 @@ impl MetalBackend {
             typed: Mutex::new(HashMap::new()),
             samplers: Mutex::new(HashMap::new()),
             sampler_states: Mutex::new(HashMap::new()),
+            static_sampler_tables: Mutex::new(HashMap::new()),
             detiler: OnceLock::new(),
             graphics: Mutex::new(HashMap::new()),
             depth_stencils: Mutex::new(HashMap::new()),
             target_views: Mutex::new(HashMap::new()),
+            wave_scratch: OnceLock::new(),
+            residency_dirty: std::sync::atomic::AtomicBool::new(false),
+            pending_uploads: Mutex::new(Default::default()),
+            uploads_pending: std::sync::atomic::AtomicUsize::new(0),
             ring: Mutex::new(None),
             textures: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn add_resident(&self, handles: &[victory_metal::sys::obj_handle_t]) {
+        if handles.is_empty() {
+            return;
+        }
+        let chunks = self.chunks();
+        chunks.residency().add(handles);
+        self.residency_dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn commit_residency(&self) {
+        if self.residency_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let chunks = self.chunks();
+            chunks.residency().commit();
+        }
     }
 
     /// The Metal pipeline for title compute pipeline `key` (its object's
@@ -313,12 +498,155 @@ impl MetalBackend {
     /// of their own) and waits for it: the title's fences may be signalled
     /// after this returns. False if it failed.
     pub(crate) fn run(&self, ops: &[Arc<MetalOp>]) -> bool {
+        static SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = self.run_serial(ops);
+        if !ok {
+            fuse::stop();
+            static REPORTED: OnceLock<()> = OnceLock::new();
+            REPORTED.get_or_init(|| tracing::error!("Metal safety stop: submission failed"));
+        }
+        ok
+    }
+
+    pub(crate) fn submissions_stopped(&self) -> bool {
+        fuse::tripped()
+    }
+
+    fn run_serial(&self, ops: &[Arc<MetalOp>]) -> bool {
+        if super::metal_draw::trace_scene() {
+            static ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let frame = crate::frame::current();
+            let mut start = 0;
+            for (i, op) in ops.iter().enumerate() {
+                let MetalOp::Draw(d) = &**op else { continue };
+                if !super::metal_draw::trace_pipeline(&d.pso.name) { continue; }
+                let Some(t) = d.targets.colors.iter().flatten().find(|t| (t.width == 3840 || !d.trace_inputs.is_empty()) && t.level == 0 && t.slice == 0) else { continue };
+                if !self.run_batch(&ops[start..i]) { return false; }
+                let id = ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let name = format!("writer-{frame}-{id:04}-{:x}", t.resource);
+                tracing::info!(%name, pipeline=%d.pso.name, "scene writer");
+                self.capture(t.resource as crate::object::This, &format!("{name}-in"));
+                for (k, &input) in d.trace_inputs.iter().enumerate() {
+                    self.capture(input as crate::object::This, &format!("{name}-srv{k}-{input:x}"));
+                }
+                if !self.run_batch(&ops[i..=i]) { return false; }
+                self.capture(t.resource as crate::object::This, &format!("{name}-out"));
+                start = i + 1;
+            }
+            return self.run_batch(&ops[start..]);
+        }
+        self.run_batch(ops)
+    }
+
+    fn run_batch(&self, ops: &[Arc<MetalOp>]) -> bool {
+        if fuse::tripped() {
+            return false;
+        }
+        {
+            static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let st = self.chunks().stats;
+            let last = LOGGED.load(std::sync::atomic::Ordering::Relaxed);
+            if st.spans >= (last * 2).max(64) || st.spans >= last + 2048 || (st.capped > 0 && last != u64::MAX && st.spans == last) {
+                LOGGED.store(if st.capped > 0 && st.spans == last { u64::MAX } else { st.spans }, std::sync::atomic::Ordering::Relaxed);
+                let stale_uses = victory_metal::chunks::STALE_USES.load(std::sync::atomic::Ordering::Relaxed);
+                tracing::info!(spans = st.spans, span_mb = st.span_bytes >> 20, capped = st.capped, refused = st.refused, remaps_under_spans = st.remaps_under_spans, stale_spans = st.stale_spans, stale_uses, "Metal: title memory span buffers");
+            }
+        }
         use super::metal_draw::{DrawKind, STAGE_VERTEX, draw_params, stage_buffer};
         use victory_metal::render::{PassColor, PassDepth, Render, RenderPass};
         use victory_metal::{Compute, msc, sys};
+        fn describe_fault_ops(ops: &[Arc<MetalOp>]) -> Vec<String> {
+            let peek_u32s = |va: u64, n: usize| -> Option<Vec<u32>> {
+                if va == 0 || va % 4 != 0 || n == 0 {
+                    return None;
+                }
+                let bytes = n * 4;
+                let _reading = crate::watch::title_memory_reading_range(va as usize, bytes);
+                if victory_metal::chunks::committed_extent(va, bytes as u64) < bytes as u64 {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(n);
+                for k in 0..n {
+                    // SAFETY: committed, guarded against remapping, and 4-byte aligned.
+                    out.push(unsafe { (va as *const u32).add(k).read_volatile() });
+                }
+                Some(out)
+            };
+            let indirect_ops = ops
+                .iter()
+                .filter(|o| matches!(&***o, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. })));
+            let other_ops = ops
+                .iter()
+                .filter(|o| !matches!(&***o, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. })));
+            indirect_ops
+                .chain(other_ops)
+                .take(12)
+                .map(|o| match &**o {
+                    MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_) => "dispatch".to_string(),
+                    MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
+                    MetalOp::Draw(d) => match &d.kind {
+                        DrawKind::Indirect { stride, max, index, records_va, count_va, .. } => format!(
+                            "draw {} indirect(max={}, stride={}, indexed={}, rect={:?}, rec0={:?}, count={:?})",
+                            d.pso.name,
+                            max,
+                            stride,
+                            index.is_some(),
+                            d.pso.geometry,
+                            peek_u32s(*records_va, 4),
+                            count_va.and_then(|c| peek_u32s(c, 1)),
+                        ),
+                        _ => format!("draw {}", d.pso.name),
+                    },
+                    MetalOp::Copy(c) => format!("copy {} → {}", c.src.pixel.0, c.dst.pixel.0),
+                    MetalOp::FloatRowReadback { width, .. } => format!("readback {width} float pixels"),
+                    MetalOp::Resolve(r) => format!("resolve {} mip {} slice {}", r.format.0, r.dst_level, r.dst_slice),
+                    MetalOp::Clear(c) => {
+                        let t = &c.target.texture;
+                        format!(
+                            "clear {} format {} level {} slice {} ({}x{}, texture {}x{} mips {} layers {} samples {}){}",
+                            if c.color.is_some() { "color" } else { "depth" },
+                            c.target.pixel,
+                            c.target.level,
+                            c.target.slice,
+                            c.target.width,
+                            c.target.height,
+                            t.width(),
+                            t.height(),
+                            t.mipmap_level_count(),
+                            t.array_length(),
+                            c.target.samples,
+                            if c.has_stencil { " +stencil" } else { "" }
+                        )
+                    }
+                })
+                .collect()
+        }
         if ops.is_empty() {
             return true;
         }
+        // Title buffers are shared memory. Complete preceding GPU work before
+        // the CPU copy, and publish its write before encoding later consumers.
+        if ops.iter().any(|op| matches!(&**op, MetalOp::BufferCopy { .. })) {
+            let mut start = 0;
+            for (i, op) in ops.iter().enumerate() {
+                if let MetalOp::BufferCopy { dst, src, bytes } = **op {
+                    if !self.run_batch(&ops[start..i]) { return false; }
+                    crate::host::copy_mapped(dst as *mut u8, src as *const u8, bytes, true);
+                    crate::watch::wrote(dst, bytes);
+                    start = i + 1;
+                }
+            }
+            return self.run_batch(&ops[start..]);
+        }
+        let started = std::time::Instant::now();
+        super::metal_texture::drain_remap_partial();
+        if !self.flush_uploads() {
+            return false;
+        }
+        let uploaded = started.elapsed();
+        self.commit_residency();
+        let prologue = started.elapsed();
         let _pool = victory_metal::Pool::new();
         let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
         // Ring space: the one-view tables' entries, then the bytes draws
@@ -329,6 +657,7 @@ impl MetalBackend {
         for op in ops {
             match &**op {
                 MetalOp::Dispatch(c) => tables += c.tables.len(),
+                MetalOp::DispatchIndirect(c) => tables += c.tables.len(),
                 MetalOp::Draw(d) => {
                     for s in &d.stages {
                         tables += s.tables.len();
@@ -339,14 +668,17 @@ impl MetalBackend {
                         blob += (indices.len() * 4).next_multiple_of(256);
                     }
                 }
-                MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => {}
+                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) => {}
             }
         }
         let need = tables + blob.div_ceil(entry) + 256 / entry + 1;
         if ring.as_ref().is_none_or(|r| r.capacity < need) {
             *ring = self.new_ring(need.max(1 << 16));
+            self.commit_residency();
         }
-        let Some(r) = ring.as_ref() else { return false };
+        let Some(r) = ring.as_ref() else {
+            return work::reject("descriptor ring unavailable");
+        };
         let base = r.entries.cast::<u8>();
         let mut next_entry = 0usize;
         let mut next_byte = (tables * entry).next_multiple_of(256);
@@ -384,6 +716,10 @@ impl MetalBackend {
                     dispatch_tops.push(patch(&c.top, &c.tables));
                     draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
+                MetalOp::DispatchIndirect(c) => {
+                    dispatch_tops.push(patch(&c.top, &c.tables));
+                    draw_offsets.push((Vec::new(), 0, 0, 0, 0));
+                }
                 MetalOp::Draw(d) => {
                     let tops = d.stages.iter().map(|s| { let t = patch(&s.top, &s.tables); put(&t) }).collect();
                     let (a, u, vt, zt) = match &d.kind {
@@ -397,6 +733,15 @@ impl MetalBackend {
                             };
                             let zt = put(&[0u8; 8]);
                             (a, u, vt, zt)
+                        }
+                        DrawKind::Indirect { .. } if d.pso.geometry.is_some() => {
+                            let vt = if let Some(fetch) = &d.vertex {
+                                put(&fetch.table)
+                            } else {
+                                put(&[0u8; msc::VERTEX_TABLE_SLOTS * 16])
+                            };
+                            let zero = put(&[0u8; 24]);
+                            (zero, zero, vt, zero)
                         }
                         DrawKind::Generated { indices, .. } => {
                             // The indices in the ring; MSC's draw arguments
@@ -417,18 +762,56 @@ impl MetalBackend {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((tops, a, u, vt, zt));
                 }
-                MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => {
+                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) => {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
             }
         }
         let Ok(mut cb) = self.queue.command_buffer() else { return false };
+        // Compute goes out a few dispatches per command buffer. Wait before
+        // submitting the next buffer so a failure or fuse trip cannot leave
+        // more of this batch queued. One command buffer of seconds of compute kept the window
+        // server from the GPU until macOS's watchdog panicked the machine
+        // (2026-11-27). `VICTORY_METAL_PASS_DISPATCHES` (default 4; 0: one
+        // command buffer per batch, as before).
+        static PASS_DISPATCHES: OnceLock<u32> = OnceLock::new();
+        let pass_cap = *PASS_DISPATCHES.get_or_init(|| {
+            std::env::var("VICTORY_METAL_PASS_DISPATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
+        });
+        static SPLIT_EVENT: OnceLock<Option<victory_metal::events::SharedEvent>> = OnceLock::new();
+        static SPLIT_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let split_event = SPLIT_EVENT.get_or_init(|| {
+            #[cfg(test)]
+            if work::FAULT.get() == Some("event") { return None; }
+            victory_metal::events::SharedEvent::new(&self.device).ok()
+        }).as_ref();
+        if pass_cap > 0 && split_event.is_none() {
+            return work::reject("split event unavailable");
+        }
+        let bounded = pass_cap > 0 && split_event.is_some();
+        let pass_dispatches = if bounded { pass_cap } else { u32::MAX };
+        // Keep the earlier completed command buffers and their operation ranges
+        // until the batch finishes.
+        let mut earlier: Vec<(victory_metal::CommandBuffer, std::ops::Range<usize>)> = Vec::new();
+        let mut cb_start = 0usize;
         // `VICTORY_METAL_SPLIT=1`: every pass in a command buffer of its own,
         // waited for, so a GPU fault names the pass that made it.
-        static SPLIT: OnceLock<bool> = OnceLock::new();
+        // `VICTORY_METAL_SPLIT=rects`: split only batches that contain an
+        // indirect rectangle draw (`geometry.is_some()`).
+        static SPLIT: OnceLock<u8> = OnceLock::new();
         static CR: OnceLock<victory_metal::Result<victory_metal::clear_resolve::ClearResolve>> = OnceLock::new();
-        let split = *SPLIT.get_or_init(|| std::env::var("VICTORY_METAL_SPLIT").is_ok_and(|v| v == "1"));
+        static TRANSLATOR: OnceLock<Option<victory_metal::indirect::IndirectTranslator>> = OnceLock::new();
+        let split_mode = *SPLIT.get_or_init(|| match std::env::var("VICTORY_METAL_SPLIT").as_deref() {
+            Ok("1") => 1,
+            Ok("rects") => 2,
+            _ => 0,
+        });
+        let split = match split_mode {
+            1 => true,
+            2 => ops.iter().any(|o| matches!(&**o, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }) && d.pso.geometry.is_some())),
+            _ => false,
+        };
         let load = sys::WMTLoadAction::WMTLoadActionLoad;
         let store = sys::WMTStoreAction::WMTStoreActionStore;
         let mut depth_sync = super::metal_depth::DepthSync::default();
@@ -443,13 +826,33 @@ impl MetalBackend {
             })
         };
         let mut i = 0;
+        let mut budget = work::Budget::default();
+        let mut clamp_counter = None;
         let mut ok = true;
+        let mut copy_scratch = None;
+        let mut readback_scratch: Option<Buffer> = None;
         while i < ops.len() && ok {
             let group_start = i;
             match &*ops[i] {
+                MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
                 MetalOp::Dispatch(_) => {
                     let mut steps = Vec::new();
+                    let mut in_pass = 0u32;
                     while let Some(MetalOp::Dispatch(c)) = ops.get(i).map(|o| &**o) {
+                        // A pass of at most `pass_dispatches` (see `bounded`).
+                        if in_pass >= pass_dispatches {
+                            break;
+                        }
+                        if fuse::blown(&c.pso) {
+                            i += 1;
+                            continue;
+                        }
+                        if !budget.charge(c.groups, 0) {
+                            tracing::error!(pipeline = %c.pso.name, groups = ?c.groups, "Metal: direct dispatch rejected");
+                            return work::reject("direct dispatch budget");
+                        }
+                        if !budget.charge_time(&ops[i]) { return work::reject("estimated compute time"); }
+                        in_pass += 1;
                         if !steps.is_empty() {
                             steps.push(Compute::Barrier);
                         }
@@ -469,6 +872,82 @@ impl MetalBackend {
                     ok = encoded("compute pass", cb.compute(&steps), || String::new());
                     depth_sync.colour_may_change();
                 }
+                MetalOp::DispatchIndirect(c) if fuse::blown(&c.pso) => {
+                    i += 1;
+                }
+                MetalOp::DispatchIndirect(c) => {
+                    if !budget.charge_time(&ops[i]) { return work::reject("estimated indirect compute time"); }
+                    if c.max > 256 {
+                        static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if LARGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            tracing::info!(max = c.max, stride = c.stride, kind = "dispatch", "Metal: large ExecuteIndirect max_count");
+                        }
+                    }
+                    if let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok()) {
+                        use victory_metal::indirect::{IndirectKind, IndirectSource};
+                        let source = IndirectSource {
+                            kind: IndirectKind::Dispatch,
+                            records: (&c.records, c.records_offset),
+                            stride: c.stride,
+                            max_count: c.max,
+                            count: c.count.as_ref().map(|(b, o)| (b, *o)),
+                        };
+                        if !budget.reserve_indirect(c.max, true, false) {
+                            return work::reject("indirect dispatch budget");
+                        }
+                        if clamp_counter.is_none() {
+                            clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
+                        }
+                        let Some(counter) = clamp_counter.as_ref() else { return work::reject("indirect counter unavailable") };
+                        match tr.encode_bounded(&self.device, &cb, &source, counter) {
+                            Ok(Some(batch)) => {
+                                let mut steps = Vec::new();
+                                for rec_idx in 0..batch.record_count() {
+                                    let Some(rec) = batch.record(rec_idx) else { continue };
+                                    if !steps.is_empty() {
+                                        steps.push(Compute::Barrier);
+                                    }
+                                    steps.push(Compute::Pipeline { pipeline: &c.pso.pso, threads_per_group: c.pso.threadgroup });
+                                    if let Some(b) = &c.heap {
+                                        steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::DESCRIPTOR_HEAP_BIND_POINT });
+                                    }
+                                    if let Some(b) = &c.sampler_heap {
+                                        steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::SAMPLER_HEAP_BIND_POINT });
+                                    }
+                                    if !dispatch_tops[i].is_empty() {
+                                        steps.push(Compute::Bytes { bytes: &dispatch_tops[i], index: msc::ARGUMENT_BUFFER_BIND_POINT });
+                                    }
+                                    steps.push(Compute::DispatchIndirect { arguments: rec.buffer, offset: rec.offset });
+                                }
+                                if !steps.is_empty() {
+                                    ok = encoded("indirect compute pass", cb.compute(&steps), || String::new());
+                                    depth_sync.colour_may_change();
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                tracing::error!(error = %e, "Metal: indirect dispatch translation failed");
+                                return work::reject("indirect dispatch translation");
+                            }
+                        }
+                    } else { return work::reject("indirect translator unavailable"); }
+                    i += 1;
+                }
+                MetalOp::FloatRowReadback { src, dst, offset, width } => {
+                    let bytes = width * 16;
+                    let pitch = bytes.next_multiple_of(256);
+                    if readback_scratch.as_ref().is_none_or(|b| b.len < u64::from(pitch)) {
+                        readback_scratch = self.device.private_buffer(u64::from(pitch)).ok();
+                    }
+                    if let Some(staging) = &readback_scratch && let Ok(mut blit) = cb.blit_encoder() {
+                        blit.copy_from_texture_to_buffer(src, 0, 0, [0; 3], [u64::from(*width), 1, 1], staging, 0, pitch, pitch);
+                        blit.copy_buffer(staging, 0, dst, *offset, u64::from(bytes));
+                        blit.finish();
+                    } else {
+                        ok = false;
+                    }
+                    i += 1;
+                }
                 MetalOp::Copy(c) => {
                     if let Err(e) = super::metal_copy::encode_texture_to_texture(
                         &cb,
@@ -482,11 +961,12 @@ impl MetalBackend {
                         c.dst_level,
                         c.dst_origin,
                         c.whole,
-                        None,
+                        &self.device,
+                        &mut copy_scratch,
                     ) {
                         static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                            tracing::info!(error = %e, "Metal: a texture copy left out");
+                            tracing::info!(src = c.src.pixel.0, dst = c.dst.pixel.0, size = ?c.size, error = %e, "Metal: a texture copy left out");
                         }
                     }
                     depth_sync.colour_may_change();
@@ -580,7 +1060,6 @@ impl MetalBackend {
                     }
                     // Indirect records of this run of draws, translated on
                     // the GPU before its render pass opens (F42).
-                    static TRANSLATOR: OnceLock<Option<victory_metal::indirect::IndirectTranslator>> = OnceLock::new();
                     let mut batches: Vec<Option<victory_metal::indirect::IndirectBatch>> = Vec::new();
                     {
                         let mut j = i;
@@ -588,13 +1067,28 @@ impl MetalBackend {
                             if !d.targets.same(&t) {
                                 break;
                             }
+                            if !budget.draw(&d.kind) {
+                                return work::reject("direct draw budget");
+                            }
+                            if !budget.charge_time(&ops[j]) { return work::reject("estimated draw time"); }
                             let mut batch = None;
-                            if let DrawKind::Indirect { records, records_offset, stride, max, count, index } = &d.kind
-                                && let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok())
-                            {
+                            if let DrawKind::Indirect { records, records_offset, stride, max, count, index, .. } = &d.kind {
+                                let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok())
+                                    else { return work::reject("indirect translator unavailable") };
+                                if *max > 256 {
+                                    static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                                    if LARGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                        tracing::info!(max = *max, stride = *stride, kind = if index.is_some() { "indexed" } else if d.pso.mesh { "mesh" } else { "draw" }, "Metal: large ExecuteIndirect max_count");
+                                    }
+                                }
                                 use victory_metal::indirect::{IndirectKind, IndirectSource};
+                                if index.is_some() && (d.pso.mesh || d.pso.geometry.is_some()) {
+                                    return work::reject("indexed indirect mesh ABI unsupported");
+                                }
                                 let kind = match index {
                                     Some((_, _, ty, cap)) => IndirectKind::DrawIndexed { index_capacity: *cap, index_type: *ty },
+                                    None if let Some(cfg) = d.pso.geometry => IndirectKind::Rectangles(cfg),
+                                    None if d.pso.mesh => IndirectKind::TitleMesh1D,
                                     None => IndirectKind::Draw,
                                 };
                                 let source = IndirectSource {
@@ -604,13 +1098,18 @@ impl MetalBackend {
                                     max_count: *max,
                                     count: count.as_ref().map(|(b, o)| (b, *o)),
                                 };
-                                match tr.encode(&self.device, &cb, &source) {
+                                if !budget.reserve_indirect(*max, d.pso.mesh || d.pso.geometry.is_some(), !d.pso.mesh || d.pso.geometry.is_some() || index.is_some()) {
+                                    return work::reject("indirect draw budget");
+                                }
+                                if clamp_counter.is_none() {
+                                    clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
+                                }
+                                let Some(counter) = clamp_counter.as_ref() else { return work::reject("indirect counter unavailable") };
+                                match tr.encode_bounded(&self.device, &cb, &source, counter) {
                                     Ok(b) => batch = b,
                                     Err(e) => {
-                                        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                                            tracing::info!(error = %e, "Metal: indirect records left out");
-                                        }
+                                        tracing::error!(error = %e, "Metal: indirect draw translation failed");
+                                        return work::reject("indirect draw translation");
                                     }
                                 }
                             }
@@ -708,6 +1207,22 @@ impl MetalBackend {
                                 if let Some(batch) = batches.get(i - group_first).and_then(Option::as_ref) {
                                     for r in 0..batch.record_count() {
                                         let Some(rec) = batch.record(r) else { continue };
+                                        if g.mesh && g.geometry.is_none() {
+                                            steps.push(Render::DrawMeshIndirect { arguments: rec.buffer, offset: rec.offset,
+                                                object_threads: [1, 1, 1], mesh_threads: g.mesh_threads });
+                                            continue;
+                                        }
+                                        if let Some(cfg) = g.geometry
+                                            && let Some(template) = cfg.draw(3, 1, 0, 0, None)
+                                            && let Some(bindings) = rec.rectangle_bindings()
+                                        {
+                                            steps.extend(bindings);
+                                            steps.push(Render::DrawMeshIndirect {
+                                                arguments: rec.buffer, offset: rec.offset,
+                                                object_threads: template.object_threads, mesh_threads: template.mesh_threads,
+                                            });
+                                            continue;
+                                        }
                                         if let Some(bind) = rec.msc_vertex_bindings() {
                                             steps.extend(bind);
                                         }
@@ -760,54 +1275,86 @@ impl MetalBackend {
                 }
             }
             if split && ok {
-                cb.commit();
-                if let Err(e) = cb.wait() {
+                let result = submit_checked(&cb, &ops[group_start..i], true, "split pass");
+                work::report(&cb, clamp_counter.take());
+                if let Err(e) = result {
                     depth_sync.colour_may_change();
-                    let what: Vec<String> = ops[group_start..i]
-                        .iter()
-                        .take(4)
-                        .map(|o| match &**o {
-                            MetalOp::Dispatch(_) => "dispatch".to_string(),
-                            MetalOp::Draw(d) => format!("draw {}", d.pso.name),
-                            MetalOp::Copy(c) => format!("copy {} → {}", c.src.pixel.0, c.dst.pixel.0),
-                            MetalOp::Resolve(r) => format!("resolve {} mip {} slice {}", r.format.0, r.dst_level, r.dst_slice),
-                            MetalOp::Clear(c) => {
-                                let t = &c.target.texture;
-                                format!(
-                                    "clear {} format {} level {} slice {} ({}x{}, texture {}x{} mips {} layers {} samples {}){}",
-                                    if c.color.is_some() { "color" } else { "depth" },
-                                    c.target.pixel,
-                                    c.target.level,
-                                    c.target.slice,
-                                    c.target.width,
-                                    c.target.height,
-                                    t.width(),
-                                    t.height(),
-                                    t.mipmap_level_count(),
-                                    t.array_length(),
-                                    c.target.samples,
-                                    if c.has_stencil { " +stencil" } else { "" }
-                                )
-                            }
-                        })
-                        .collect();
+                    let what = describe_fault_ops(&ops[group_start..i]);
                     // SAFETY: a live device.
                     let allocated = unsafe { sys::MTLDevice_currentAllocatedSize(self.device.handle()) } >> 20;
-                    tracing::warn!(ops = i - group_start, first = ?what, allocated_mb = allocated, error = %e, "Metal: a pass failed on the GPU (split)");
+                    // SAFETY: a live device.
+                    let recommended = unsafe { sys::MTLDevice_recommendedMaxWorkingSetSize(self.device.handle()) } >> 20;
+                    tracing::warn!(ops = i - group_start, first = ?what, allocated_mb = allocated, recommended_mb = recommended, error = %e, "Metal: a pass failed on the GPU (split)");
+                    fuse::stop();
+                    return false;
                 }
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 cb = next;
+                budget = work::Budget::default();
+                cb_start = i;
+            } else if let Some(split_event) = split_event
+                && bounded
+                && ok
+                && i < ops.len()
+                && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))
+            {
+                // The next command buffer waits for this one to finish: the
+                // queue starts them in order but does not order their memory
+                // (views reach title memory by GPU address, untracked), so
+                // without the event they overlapped and raced
+                // (`split_compute_runs_in_order`).
+                let value = SPLIT_VALUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                cb.encode_signal_event(split_event, value);
+                let result = submit_checked(&cb, &ops[cb_start..i], true, "bounded pass");
+                work::report(&cb, clamp_counter.take());
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "Metal: a bounded command buffer failed");
+                    fuse::stop();
+                    return false;
+                }
+                let Ok(next) = self.queue.command_buffer() else { return false };
+                next.encode_wait_for_event(split_event, value);
+                earlier.push((std::mem::replace(&mut cb, next), cb_start..i));
+                budget = work::Budget::default();
+                cb_start = i;
             }
         }
         if !ok {
             return false;
         }
         // GPU-written ocean textures back into title memory (F44).
-        if ops.iter().any(|o| matches!(**o, MetalOp::Dispatch(_))) {
-            self.writeback_all(&cb);
+        if ops.iter().any(|o| matches!(**o, MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))) {
+            if let Err(e) = self.writeback_all(&cb) {
+                tracing::error!(error = %e, "Metal: writeback failed before commit");
+                return work::reject("writeback unavailable");
+            }
         }
-        cb.commit();
-        match cb.wait() {
+        let encoded_at = started.elapsed();
+        self.commit_residency();
+        let committed_at = started.elapsed();
+        let mut waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
+        work::report(&cb, clamp_counter.take());
+        // The queue ran the earlier ones before it: done; a fault in one is
+        // this batch's fault.
+        for (e, _) in &earlier {
+            if let Err(err) = e.wait()
+                && waited.is_ok()
+            {
+                waited = Err(err);
+            }
+        }
+        if waited.is_err() {
+            fuse::stop();
+        }
+        // The fuse: a command buffer that kept the GPU too long has its
+        // compute pipelines left out from now on (`fuse`).
+        if waited.is_ok()
+            && fuse::check(earlier.iter().map(|(c, r)| (c, r.clone())).chain(std::iter::once((&cb, cb_start..ops.len()))), ops)
+        {
+            return false;
+        }
+        let waited_at = started.elapsed();
+        let res = match waited {
             Ok(()) => {
                 // The final-draw dossier: the presented texture right after
                 // the draw into it ran (before a later clear).
@@ -821,42 +1368,50 @@ impl MetalBackend {
                 let (mut dispatches, mut draws, mut clears) = (0, 0, 0);
                 for op in ops {
                     match &**op {
-                        MetalOp::Dispatch(_) => dispatches += 1,
+                        MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_) => dispatches += 1,
+                        MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
                         MetalOp::Draw(_) => draws += 1,
-                        MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => clears += 1,
+                        MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) => clears += 1,
                     }
                 }
                 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    tracing::warn!(dispatches, draws, clears, error = %e, "Metal: a submission failed on the GPU");
+                    let what = describe_fault_ops(ops);
+                    // SAFETY: a live device.
+                    let allocated = unsafe { sys::MTLDevice_currentAllocatedSize(self.device.handle()) } >> 20;
+                    // SAFETY: a live device.
+                    let recommended = unsafe { sys::MTLDevice_recommendedMaxWorkingSetSize(self.device.handle()) } >> 20;
+                    tracing::warn!(dispatches, draws, clears, first = ?what, allocated_mb = allocated, recommended_mb = recommended, error = %e, "Metal: a submission failed on the GPU");
                 }
                 if draws + clears > 0 && !super::metal_draw::DRAWS_BROKEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     tracing::warn!("Metal: draws stop for this run (a submission with draws faulted); compute goes on");
                 }
                 false
             }
+        };
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        if elapsed_ms > 500 {
+            let ms = |d: std::time::Duration| d.as_millis() as u64;
+            tracing::warn!(
+                ops = ops.len(),
+                elapsed_ms,
+                uploads_ms = ms(uploaded),
+                residency_ms = ms(prologue - uploaded),
+                encode_ms = ms(encoded_at - prologue),
+                commit_ms = ms(committed_at - encoded_at),
+                gpu_ms = ms(waited_at - committed_at),
+                "Metal: slow run_batch"
+            );
         }
+        res
     }
 
-    /// Writes slot `index` of title heap `heap` (`count` slots) from the
-    /// view at `handle`; returns the Metal heap buffer, and why the slot was
-    /// left empty if it was.
-    pub(crate) fn refresh_slot(
-        &self,
-        heap: usize,
-        count: u32,
-        index: u32,
-        handle: u64,
-    ) -> Option<(Buffer, Option<super::metal_heap::Missing>)> {
-        let mut heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
-        if !heaps.contains_key(&heap) {
-            heaps.insert(heap, self.new_heap(count)?);
-        }
-        let h = heaps.get(&heap)?;
-        if index >= h.count {
-            return None;
+    fn resolve_slot(&self, handle: u64) -> (DescriptorEntry, u32, Option<super::metal_heap::Missing>) {
+        if handle == 0 {
+            return (DescriptorEntry::NULL, 0, None);
         }
         let view = crate::descriptor::view(handle);
+        let stride_word = view.as_ref().map_or(0, crate::descriptor::host::view_stride_word);
         let entry = match view.clone() {
             Some(crate::descriptor::View::Sampler(words)) => self.sampler_entry(&words).ok_or(super::metal_heap::Missing::NotYet),
             Some(crate::descriptor::View::ConsoleSampler(console)) => {
@@ -879,9 +1434,9 @@ impl MetalBackend {
                 ];
                 self.sampler_entry(&words).ok_or(super::metal_heap::Missing::NotYet)
             }
-            Some(crate::descriptor::View::Shader(..) | crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(false, ..))
+            Some(crate::descriptor::View::Shader(..) | crate::descriptor::View::Unordered(..) | crate::descriptor::View::Placed(..))
                 if !textures_on()
-                    && !matches!(&view, Some(crate::descriptor::View::Placed(_, _, d)) if d[1] == 1)
+                    && !matches!(&view, Some(crate::descriptor::View::Placed(_, resource, _)) if resource[0] == 1)
                     && !matches!(&view, Some(crate::descriptor::View::Shader(r, _)) | Some(crate::descriptor::View::Unordered(r, _, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_some()) =>
             {
                 Err(super::metal_heap::Missing::NotYet)
@@ -892,11 +1447,11 @@ impl MetalBackend {
             Some(crate::descriptor::View::Unordered(r, _, desc)) if crate::resource::buffer_bytes(r as crate::object::This).is_none() => self
                 .texture_entry(r as crate::object::This, desc.as_ref().map(|d| &d[..]), true)
                 .ok_or(super::metal_heap::Missing::NotYet),
-            Some(crate::descriptor::View::Placed(false, resource, desc)) if desc[1] != 1 => {
+            Some(crate::descriptor::View::Placed(unordered, resource, desc)) if resource[0] != 1 => {
                 // a placed texture view: one resource per (address, description)
                 let address = super::metal_views::placed_address(&desc);
                 crate::resource::texture_at(address, &resource)
-                    .and_then(|t| self.texture_entry(t, Some(&desc[..10]), false))
+                    .and_then(|t| self.texture_entry(t, Some(&desc[..10]), unordered))
                     .ok_or(super::metal_heap::Missing::NotYet)
             }
             Some(view) => {
@@ -919,9 +1474,147 @@ impl MetalBackend {
         {
             EMPTY[empty_kind(v)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        // SAFETY: index < count, the entries' memory holds count entries.
-        unsafe { h.entries.add(index as usize).write(entry.unwrap_or(DescriptorEntry::NULL)) };
-        Some((h.buffer.clone(), missing))
+        (entry.unwrap_or(DescriptorEntry::NULL), stride_word, missing)
+    }
+
+    fn ensure_heap(&self, heap: usize, count: u32, samplers: bool) -> bool {
+        if self.heaps.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&heap) {
+            return true;
+        }
+        let Some(made) = self.new_heap(count, samplers) else {
+            return false;
+        };
+        self.heaps.lock().unwrap_or_else(|e| e.into_inner()).entry(heap).or_insert(made);
+        true
+    }
+
+    /// The run of title-memory view slots after the `count` slots of view
+    /// heap `heap`: its null view (`first`) and `entries` from view
+    /// `made + 1` on. The run's first slot.
+    pub(crate) fn memory_run(&self, heap: usize, count: u32, first: bool, made: u32, entries: &[DescriptorEntry]) -> Option<u32> {
+        if !self.ensure_heap(heap, count, false) {
+            return None;
+        }
+        let heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let h = heaps.get(&heap)?;
+        let base = h.count.max(victory_shader::emit::SLOT_STRIDES_COUNT);
+        if base + 1 + made + entries.len() as u32 > h.capacity {
+            return None;
+        }
+        // SAFETY: every slot written is below the capacity checked above.
+        unsafe {
+            if first {
+                h.entries.add(base as usize).write(DescriptorEntry::NULL);
+            }
+            for (k, e) in entries.iter().enumerate() {
+                h.entries.add((base + 1 + made) as usize + k).write(*e);
+            }
+        }
+        Some(base)
+    }
+
+    /// Writes slot `index` of title heap `heap` (`count` slots) from the
+    /// view at `handle`; returns the Metal heap buffer, stride table GPU address,
+    /// and why the slot was left empty if it was.
+    pub(crate) fn refresh_slot(
+        &self,
+        heap: usize,
+        count: u32,
+        samplers: bool,
+        index: u32,
+        handle: u64,
+    ) -> Option<(Buffer, u64, Option<super::metal_heap::Missing>)> {
+        let (entry, stride_word, missing) = self.resolve_slot(handle);
+        if !self.ensure_heap(heap, count, samplers) {
+            return None;
+        }
+        let heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let h = heaps.get(&heap)?;
+        if index >= h.count {
+            return None;
+        }
+        // SAFETY: index < count, the entries' memory holds >= count entries.
+        unsafe { h.entries.add(index as usize).write(entry) };
+        if let Some((_, strides_ptr)) = h.strides
+            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+        {
+            // SAFETY: index < SLOT_STRIDES_COUNT, the strides table holds SLOT_STRIDES_COUNT dwords.
+            unsafe { strides_ptr.add(index as usize).write(stride_word) };
+        }
+        let strides_gpu = h.strides.as_ref().map_or(0, |(b, _)| b.gpu_address);
+        Some((h.buffer.clone(), strides_gpu, missing))
+    }
+
+    /// Mirrors all descriptor slots dirtied since the last sync for `heap`,
+    /// returning `(heap_buffer, strides_gpu)`.
+    pub(crate) fn sync_heap(&self, heap: usize, count: u32, samplers: bool) -> Option<(Buffer, u64)> {
+        super::metal_texture::drain_remap_partial();
+        let dirty: Vec<(u32, u64)> = DIRTY_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .and_then(|m| m.remove(&heap))
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        let started = (!dirty.is_empty()).then(std::time::Instant::now);
+        let slots = dirty.len();
+        let resolved: Vec<(u32, DescriptorEntry, u32)> = dirty
+            .into_iter()
+            .filter(|&(idx, _)| idx < count)
+            .map(|(idx, handle)| {
+                let (entry, stride_word, _) = self.resolve_slot(handle);
+                (idx, entry, stride_word)
+            })
+            .collect();
+        if !self.flush_uploads() {
+            return None;
+        }
+        if !self.ensure_heap(heap, count, samplers) {
+            return None;
+        }
+        let heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let h = heaps.get(&heap)?;
+        for (idx, entry, stride_word) in resolved {
+            if idx < h.count {
+                // SAFETY: idx < h.count.
+                unsafe { h.entries.add(idx as usize).write(entry) };
+                if let Some((_, strides_ptr)) = h.strides
+                    && idx < victory_shader::emit::SLOT_STRIDES_COUNT
+                {
+                    // SAFETY: idx < SLOT_STRIDES_COUNT.
+                    unsafe { strides_ptr.add(idx as usize).write(stride_word) };
+                }
+            }
+        }
+        let strides_gpu = h.strides.as_ref().map_or(0, |(b, _)| b.gpu_address);
+        let out = Some((h.buffer.clone(), strides_gpu));
+        if let Some(started) = started {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            if elapsed_ms > 500 {
+                tracing::warn!(slots, elapsed_ms, "Metal: slow sync_heap");
+            }
+        }
+        out
+    }
+
+    /// Resident 32 MiB zero-initialized scratch buffer for spilled wave64-on-wave32 helpers.
+    pub(crate) fn wave_scratch_gpu(&self) -> u64 {
+        self.wave_scratch
+            .get_or_init(|| {
+                use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+                let bytes = 32usize << 20;
+                // SAFETY: fresh page-aligned allocation kept for the run.
+                let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+                if mem.is_null() {
+                    return None;
+                }
+                // SAFETY: lives for the run (never freed).
+                let buffer = unsafe { self.device.wrap(mem, bytes as u64) }.ok()?;
+                self.add_resident(&[buffer.handle()]);
+                Some(buffer)
+            })
+            .as_ref()
+            .map_or(0, |b| b.gpu_address)
     }
 
     /// The entry of a typed buffer view: a texture buffer view of the
@@ -1058,7 +1751,74 @@ impl MetalBackend {
         Some(entry)
     }
 
+    fn static_sampler_entry(&self, s: &StaticSampler) -> Option<DescriptorEntry> {
+        let border: [f32; 4] = match s.border_color {
+            0 => [0.0, 0.0, 0.0, 0.0],
+            1 | 3 => [0.0, 0.0, 0.0, 1.0],
+            _ => [1.0, 1.0, 1.0, 1.0],
+        };
+        let words = [
+            s.filter,
+            s.address_u,
+            s.address_v,
+            s.address_w,
+            s.mip_lod_bias.to_bits(),
+            s.max_anisotropy,
+            s.comparison_func,
+            border[0].to_bits(),
+            border[1].to_bits(),
+            border[2].to_bits(),
+            border[3].to_bits(),
+            s.min_lod.to_bits(),
+            s.max_lod.to_bits(),
+        ];
+        self.sampler_entry(&words)
+    }
+
+    /// Binds MSC's static sampler table (the `Table` location at `num_params`
+    /// in `top`) to a resident Metal buffer of `DescriptorEntry`s. Without it
+    /// that pointer stays 0 in the top-level argument buffer and every sample
+    /// through a static sampler reads zeros.
+    pub(crate) fn bind_static_samplers(
+        &self,
+        top: &mut TopLevel,
+        num_params: usize,
+        samplers: &[StaticSampler],
+    ) -> Result<(), String> {
+        if samplers.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(samplers.len() * size_of::<DescriptorEntry>());
+        for s in samplers {
+            let e = self.static_sampler_entry(s).ok_or_else(|| format!("unsupported static sampler {s:?}"))?;
+            bytes.extend_from_slice(&e.gpu_va.to_le_bytes());
+            bytes.extend_from_slice(&e.texture_view_id.to_le_bytes());
+            bytes.extend_from_slice(&e.metadata.to_le_bytes());
+        }
+        let gpu_address = {
+            let mut tables = self.static_sampler_tables.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(buf) = tables.get(&bytes) {
+                buf.gpu_address
+            } else {
+                let buf = self.device.shared_buffer(&bytes).map_err(|e| e.to_string())?;
+                self.add_resident(&[buf.handle()]);
+                let addr = buf.gpu_address;
+                tables.insert(bytes, buf);
+                addr
+            }
+        };
+        if !top.set_static_samplers(num_params, gpu_address) {
+            return Err(format!(
+                "static sampler table missing from top-level layout (num_params={num_params}, layout={:?})",
+                top.layout
+            ));
+        }
+        Ok(())
+    }
+
     fn new_ring(&self, capacity: usize) -> Option<Ring> {
+        #[cfg(test)]
+        if work::FAULT.get() == Some("ring") { return None; }
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
         let bytes = (capacity * size_of::<DescriptorEntry>()).next_multiple_of(64 << 10);
         // SAFETY: a fresh allocation, kept for the run (a smaller old ring
@@ -1069,15 +1829,18 @@ impl MetalBackend {
         }
         // SAFETY: as above.
         let buffer = unsafe { self.device.wrap(mem, bytes as u64) }.ok()?;
-        let chunks = self.chunks();
-        chunks.residency().add(&[buffer.handle()]);
-        chunks.residency().commit();
+        self.add_resident(&[buffer.handle()]);
         Some(Ring { buffer, entries: mem.cast(), capacity: bytes / size_of::<DescriptorEntry>() })
     }
 
-    fn new_heap(&self, count: u32) -> Option<MetalHeap> {
+    fn new_heap(&self, count: u32, samplers: bool) -> Option<MetalHeap> {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        let bytes = (count as usize * size_of::<DescriptorEntry>()).next_multiple_of(64 << 10);
+        let capacity = if samplers {
+            count
+        } else {
+            count.max(victory_shader::emit::SLOT_STRIDES_COUNT) + memory::COPIES + 1
+        };
+        let bytes = (capacity as usize * size_of::<DescriptorEntry>()).next_multiple_of(64 << 10);
         // SAFETY: a fresh allocation (zero: every slot empty), never freed
         // (heaps live as long as the title's).
         let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
@@ -1086,10 +1849,25 @@ impl MetalBackend {
         }
         // SAFETY: as above.
         let buffer = unsafe { self.device.wrap(mem, bytes as u64) }.ok()?;
-        let chunks = self.chunks();
-        chunks.residency().add(&[buffer.handle()]);
-        chunks.residency().commit();
-        Some(MetalHeap { buffer, entries: mem.cast(), count })
+        let strides = if samplers {
+            None
+        } else {
+            let sbytes = (victory_shader::emit::SLOT_STRIDES_COUNT as usize * 4).next_multiple_of(64 << 10);
+            // SAFETY: fresh allocation for SLOT_STRIDES table (zero-initialized).
+            let smem = unsafe { VirtualAlloc(std::ptr::null(), sbytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            if smem.is_null() {
+                return None;
+            }
+            // SAFETY: as above.
+            let sbuf = unsafe { self.device.wrap(smem, sbytes as u64) }.ok()?;
+            Some((sbuf, smem.cast::<u32>()))
+        };
+        if let Some((sbuf, _)) = &strides {
+            self.add_resident(&[buffer.handle(), sbuf.handle()]);
+        } else {
+            self.add_resident(&[buffer.handle()]);
+        }
+        Some(MetalHeap { buffer, entries: mem.cast(), count, capacity, strides })
     }
 
     fn make_compute(&self, p: &HostPipeline) -> Result<MetalCompute, String> {
@@ -1104,23 +1882,25 @@ impl MetalBackend {
         let path = msc_cache_path(&host.dxil, &params, &samplers);
         if let Some(path) = &path
             && let Ok(bytes) = crate::read_file(path)
-            && let Some(converted) = victory_metal::msc::Converted::from_bytes(&bytes)
+            && let Some(mut converted) = victory_metal::msc::Converted::from_bytes(&bytes)
         {
             match self.device.compute_pipeline_converted(&converted) {
                 Ok(pso) => {
-                    return Ok(MetalCompute { pso, threadgroup: converted.threadgroup.map(u64::from), top_level: converted.top_level });
+                    self.bind_static_samplers(&mut converted.top_level, params.len(), &samplers)?;
+                    return Ok(MetalCompute { cost_ns: Default::default(), name: p.name.clone(), pso, threadgroup: converted.threadgroup.map(u64::from), top_level: converted.top_level });
                 }
                 Err(e) => tracing::debug!(error = %e, "a cached Metal pipeline did not load; converting again"),
             }
         }
-        let (pso, converted) = self.device.compute_pipeline_dxil(&host.dxil, &params, &samplers).map_err(|e| e.to_string())?;
+        let (pso, mut converted) = self.device.compute_pipeline_dxil(&host.dxil, &params, &samplers).map_err(|e| e.to_string())?;
         if let Some(path) = &path {
             let tmp = path.with_extension(format!("tmp{}", std::process::id()));
             if std::fs::write(&tmp, converted.to_bytes()).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
             }
         }
-        Ok(MetalCompute { pso, threadgroup: converted.threadgroup.map(u64::from), top_level: converted.top_level })
+        self.bind_static_samplers(&mut converted.top_level, params.len(), &samplers)?;
+        Ok(MetalCompute { cost_ns: Default::default(), name: p.name.clone(), pso, threadgroup: converted.threadgroup.map(u64::from), top_level: converted.top_level })
     }
 }
 
@@ -1166,7 +1946,7 @@ pub(crate) enum RootSlot {
 }
 
 pub(crate) fn root_layout(t: &HostShader) -> Vec<RootSlot> {
-    use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES};
+    use victory_shader::emit::{SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES, SLOT_WAVE_SCRATCH};
     let mut out = Vec::new();
     let dwords = t.user_data_dwords();
     if dwords > 0 {
@@ -1174,7 +1954,7 @@ pub(crate) fn root_layout(t: &HostShader) -> Vec<RootSlot> {
     }
     out.extend(t.root_cbvs.iter().map(|&s| RootSlot::Cbv(s)));
     out.extend(t.root_srvs.iter().map(|&s| if s == SLOT_STRIDES || s == SLOT_MEMORY { RootSlot::Srv(s) } else { RootSlot::TableSrv(s) }));
-    out.extend(t.root_uavs.iter().map(|&s| if s == SLOT_FAULTS { RootSlot::Uav(s) } else { RootSlot::TableUav(s) }));
+    out.extend(t.root_uavs.iter().map(|&s| if s == SLOT_FAULTS || s == SLOT_WAVE_SCRATCH { RootSlot::Uav(s) } else { RootSlot::TableUav(s) }));
     out
 }
 
@@ -1357,6 +2137,7 @@ pub(crate) fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage
     if let Some(path) = &path
         && let Ok(bytes) = crate::read_file(path)
         && let Some(c) = victory_metal::msc::Converted::from_bytes(&bytes)
+        && !(stage == victory_metal::msc::Stage::Mesh && c.threadgroup == [0, 0, 0])
     {
         return Ok(c);
     }
@@ -1418,3 +2199,246 @@ fn encoded(what: &str, r: victory_metal::Result<()>, detail: impl FnOnce() -> St
 #[cfg(test)]
 #[path = "metal_depth_replay_tests.rs"]
 mod depth_replay_tests;
+
+#[cfg(test)]
+#[path = "metal_static_sampler_repro_tests.rs"]
+mod static_sampler_repro_tests;
+
+#[path = "metal_work.rs"]
+mod work;
+
+#[path = "metal_completion.rs"]
+mod completion;
+
+/// Names what a command buffer that does not complete was running: a
+/// GPU-side hang (a shader that never ends) blocks `cb.wait()` with no
+/// error and no log, and the title stops presenting.
+mod inflight {
+    use super::MetalOp;
+    use std::sync::{Arc, Mutex, Once};
+    use std::time::{Duration, Instant};
+
+    /// An indirect dispatch's arguments: name, records, stride, max, count.
+    type Args = (String, u64, u32, u32, Option<u64>);
+    /// (serial, started, what it holds, its first indirect dispatches) of
+    /// the command buffer waited for.
+    static NOW: Mutex<Option<(u64, Instant, String, Vec<Args>)>> = Mutex::new(None);
+
+    /// Up to `n` dwords of title memory at `va`, when committed.
+    fn peek(va: u64, n: usize) -> Option<Vec<u32>> {
+        if va == 0 || va % 4 != 0 {
+            return None;
+        }
+        let bytes = n * 4;
+        let _reading = crate::watch::title_memory_reading_range(va as usize, bytes);
+        if victory_metal::chunks::committed_extent(va, bytes as u64) < bytes as u64 {
+            return None;
+        }
+        // SAFETY: committed, guarded against remapping, 4-byte aligned.
+        Some((0..n).map(|k| unsafe { (va as *const u32).add(k).read_volatile() }).collect())
+    }
+
+    fn args_now(args: &[Args]) -> String {
+        args.iter()
+            .map(|(name, va, stride, max, count)| {
+                let live = count.and_then(|c| peek(c, 1)).map(|v| v[0]);
+                let shown = (*max).min(live.unwrap_or(*max)).min(4) as usize;
+                let records: Vec<Option<Vec<u32>>> = (0..shown).map(|k| peek(va + k as u64 * u64::from(*stride), 3)).collect();
+                format!("{name} max={max} count={live:?} records={records:?}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) struct Watch;
+
+    impl Drop for Watch {
+        fn drop(&mut self) {
+            *NOW.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    fn describe(ops: &[Arc<MetalOp>]) -> String {
+        let mut names: Vec<(String, u32)> = Vec::new();
+        for op in ops {
+            let name = match &**op {
+                MetalOp::Dispatch(c) => format!("compute {}", c.pso.name),
+                MetalOp::DispatchIndirect(c) => format!("indirect {}", c.pso.name),
+                MetalOp::Draw(d) => d.pso.name.clone(),
+                MetalOp::Clear(_) => "clear".into(),
+                MetalOp::Copy(_) => "copy".into(),
+                MetalOp::FloatRowReadback { .. } => "readback".into(),
+                MetalOp::BufferCopy { .. } => "buffer copy".into(),
+                MetalOp::Resolve(_) => "resolve".into(),
+            };
+            match names.last_mut() {
+                Some((last, n)) if *last == name => *n += 1,
+                _ => names.push((name, 1)),
+            }
+        }
+        let mut out = names.iter().map(|(n, k)| format!("{n} x{k}")).collect::<Vec<_>>().join("; ");
+        // The first draws' sizes: a cheap shader can still run long.
+        use crate::backend::metal_draw::DrawKind;
+        let draws: Vec<String> = ops
+            .iter()
+            .filter_map(|op| match &**op {
+                MetalOp::Draw(d) => Some(d),
+                _ => None,
+            })
+            .take(6)
+            .map(|d| {
+                let kind = match &d.kind {
+                    DrawKind::Vertices { count, instances, .. } => format!("vertices {count}x{instances}"),
+                    DrawKind::Indexed { count, instances, .. } => format!("indexed {count}x{instances}"),
+                    DrawKind::Mesh { groups } => format!("mesh {groups:?}"),
+                    DrawKind::Geometry { draw, .. } => format!("geometry {:?}", draw.groups),
+                    DrawKind::Generated { indices, instances, .. } => format!("generated {}x{instances}", indices.len()),
+                    DrawKind::Indirect { max, .. } => format!("indirect max {max}"),
+                };
+                format!("{kind} into {}x{}x{} prim {}", d.targets.width, d.targets.height, d.targets.samples, d.primitive)
+            })
+            .collect();
+        if !draws.is_empty() {
+            out.push_str(&format!(" draws={draws:?}"));
+        }
+        out
+    }
+
+    /// Marks `ops` in flight until the returned guard drops; a monitor
+    /// thread logs them once if that takes over 8 s.
+    pub(super) fn watch(ops: &[Arc<MetalOp>]) -> Watch {
+        static MONITOR: Once = Once::new();
+        MONITOR.call_once(|| {
+            let _ = std::thread::Builder::new().name("metal-hang-watch".into()).spawn(|| {
+                let mut told = 0;
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    let now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some((serial, started, what, args)) = &*now
+                        && *serial != told
+                        && started.elapsed() > Duration::from_secs(8)
+                    {
+                        told = *serial;
+                        let args = args_now(args);
+                        tracing::warn!(elapsed_s = started.elapsed().as_secs(), ops = %what, indirect = %args, "Metal: a command buffer has not completed (GPU hang?)");
+                    }
+                }
+            });
+        });
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut args: Vec<Args> = Vec::new();
+        for op in ops {
+            if let MetalOp::DispatchIndirect(c) = &**op
+                && !args.iter().any(|a| a.0 == c.pso.name)
+                && args.len() < 6
+            {
+                args.push((c.pso.name.clone(), c.records_va, c.stride, c.max, c.count_va));
+            }
+        }
+        *NOW.lock().unwrap_or_else(|e| e.into_inner()) = Some((serial, Instant::now(), describe(ops), args));
+        Watch
+    }
+}
+
+/// Stop further `run` submissions after a command buffer exceeds
+/// `VICTORY_METAL_FUSE_MS` (default 1500; 0: off). This is measured only
+/// after completion and cannot interrupt an already running command buffer.
+mod fuse {
+    use super::{MetalCompute, MetalOp};
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static BLOWN: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+    static TRIPPED: AtomicBool = AtomicBool::new(false);
+    static COMMIT: Mutex<()> = Mutex::new(());
+
+    pub(super) fn commit_if_open(cb: &victory_metal::CommandBuffer) -> bool {
+        let _gate = COMMIT.lock().unwrap_or_else(|e| e.into_inner());
+        if tripped() { return false; }
+        cb.commit();
+        true
+    }
+
+    pub(super) fn tripped() -> bool {
+        TRIPPED.load(Ordering::Acquire)
+    }
+
+    pub(super) fn stop() {
+        let _gate = COMMIT.lock().unwrap_or_else(|e| e.into_inner());
+        TRIPPED.store(true, Ordering::Release);
+    }
+
+    fn limit_ns() -> u64 {
+        #[cfg(test)]
+        if TEST_ONE_NS.load(Ordering::Relaxed) { return 1; }
+        static MS: OnceLock<u64> = OnceLock::new();
+        MS.get_or_init(|| std::env::var("VICTORY_METAL_FUSE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500)).saturating_mul(1_000_000)
+    }
+    #[cfg(test)]
+    pub(super) static TEST_ONE_NS: AtomicBool = AtomicBool::new(false);
+
+    fn unsafe_timing(ns: u64, limit: u64) -> bool {
+        limit != 0 && (ns == 0 || ns > limit)
+    }
+
+    pub(super) fn check_aux(cb: &victory_metal::CommandBuffer) -> bool {
+        let limit = limit_ns();
+        let ns = cb.gpu_time_ns();
+        if !unsafe_timing(ns, limit) {
+            return false;
+        }
+        stop();
+        tracing::warn!(gpu_ms = ns / 1_000_000, limit_ms = limit / 1_000_000, "Metal: missing or excessive GPU time; stopping subsequent submissions");
+        true
+    }
+
+    pub(super) fn blown(p: &Arc<MetalCompute>) -> bool {
+        BLOWN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.contains(&(Arc::as_ptr(p) as usize)))
+    }
+
+    pub(super) fn check<'a>(cbs: impl Iterator<Item = (&'a victory_metal::CommandBuffer, std::ops::Range<usize>)>, ops: &[Arc<MetalOp>]) -> bool {
+        let limit = limit_ns();
+        if limit == 0 {
+            return false;
+        }
+        let mut exceeded = false;
+        for (cb, range) in cbs {
+            if range.is_empty() {
+                continue;
+            }
+            let ns = cb.gpu_time_ns();
+            if !unsafe_timing(ns, limit) {
+                continue;
+            }
+            exceeded = true;
+            stop();
+            tracing::warn!(gpu_ms = ns / 1_000_000, limit_ms = limit / 1_000_000, "Metal: missing or excessive GPU time; stopping subsequent submissions");
+            let mut set = BLOWN.lock().unwrap_or_else(|e| e.into_inner());
+            let set = set.get_or_insert_with(HashSet::new);
+            for op in ops.get(range).unwrap_or(&[]) {
+                let p = match &**op {
+                    MetalOp::Dispatch(c) => &c.pso,
+                    MetalOp::DispatchIndirect(c) => &c.pso,
+                    _ => continue,
+                };
+                if set.insert(Arc::as_ptr(p) as usize) {
+                    tracing::warn!(pipeline = %p.name, gpu_ms = ns / 1_000_000, "Metal: a command buffer kept the GPU too long: this compute pipeline no longer runs (VICTORY_METAL_FUSE_MS)");
+                }
+            }
+        }
+        exceeded
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn timing_rejects_missing_or_excessive_duration() {
+            assert!(super::unsafe_timing(0, 100));
+            assert!(super::unsafe_timing(101, 100));
+            assert!(!super::unsafe_timing(100, 100));
+            assert!(!super::unsafe_timing(0, 0));
+        }
+    }
+}

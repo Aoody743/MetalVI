@@ -751,7 +751,8 @@ pub fn map_color_attachment(
     let mut dst_a = None;
     let mut op_a = None;
 
-    if rt.blend_enable {
+    let blend = rt.blend_enable && !pixel_format.is_some_and(integer_attachment);
+    if blend {
         src_rgb = f1::map_blend_factor(rt.src_blend);
         dst_rgb = f1::map_blend_factor(rt.dest_blend);
         op_rgb = f1::map_blend_op(rt.blend_op);
@@ -767,7 +768,7 @@ pub fn map_color_attachment(
 
     ColorAttachmentMap {
         pixel_format,
-        blending_enabled: rt.blend_enable,
+        blending_enabled: blend,
         source_rgb_factor: src_rgb,
         destination_rgb_factor: dst_rgb,
         rgb_operation: op_rgb,
@@ -778,21 +779,19 @@ pub fn map_color_attachment(
     }
 }
 
+fn integer_attachment(format: f1::MtlPixelFormat) -> bool {
+    use f1::MtlPixelFormat::*;
+    matches!(format, R8Uint | R8Sint | RG8Uint | RG8Sint | RGBA8Uint | RGBA8Sint
+        | R16Uint | R16Sint | RG16Uint | RG16Sint | RGBA16Uint | RGBA16Sint
+        | R32Uint | R32Sint | RG32Uint | RG32Sint | RGBA32Uint | RGBA32Sint | RGB10A2Uint)
+}
+
 /// Metal cannot blend with a signed or unsigned integer color attachment.
 pub(crate) fn check_integer_blending(color: &[Option<ColorAttachmentMap>; 8]) -> Result<(), String> {
-    use f1::MtlPixelFormat::*;
     for (slot, attachment) in color.iter().enumerate() {
         let Some(attachment) = attachment else { continue };
         let Some(format) = attachment.pixel_format else { continue };
-        if attachment.blending_enabled
-            && matches!(
-                format,
-                R8Uint | R8Sint | RG8Uint | RG8Sint | RGBA8Uint | RGBA8Sint
-                    | R16Uint | R16Sint | RG16Uint | RG16Sint | RGBA16Uint | RGBA16Sint
-                    | R32Uint | R32Sint | RG32Uint | RG32Sint | RGBA32Uint | RGBA32Sint
-                    | RGB10A2Uint
-            )
-        {
+        if attachment.blending_enabled && integer_attachment(format) {
             return Err(format!("render target {slot} uses integer Metal format {format:?} with blending enabled"));
         }
     }
@@ -878,12 +877,32 @@ mod tests {
         let mut colors = [None; 8];
         colors[0] = Some(map_color_attachment(&rt, dxgi_format::R8G8B8A8_UNORM, &mut notes));
         colors[2] = Some(map_color_attachment(&rt, dxgi_format::R8_UINT, &mut notes));
+        assert!(colors[0].unwrap().blending_enabled);
+        assert!(!colors[2].unwrap().blending_enabled);
+        assert_eq!(check_integer_blending(&colors), Ok(()));
+        rt.dest_blend = d3d12_blend::ONE;
+        assert!(!map_color_attachment(&rt, dxgi_format::R8_UINT, &mut notes).blending_enabled);
+        colors[2] = Some(ColorAttachmentMap {
+            pixel_format: f1::map_pixel_format(dxgi_format::R8_UINT),
+            blending_enabled: true,
+            source_rgb_factor: None,
+            destination_rgb_factor: None,
+            rgb_operation: None,
+            source_alpha_factor: None,
+            destination_alpha_factor: None,
+            alpha_operation: None,
+            write_mask: f1::MtlColorWriteMask(0xF),
+        });
         assert_eq!(
             check_integer_blending(&colors).unwrap_err(),
             "render target 2 uses integer Metal format R8Uint with blending enabled"
         );
 
-        colors[2] = Some(map_color_attachment(&rt, dxgi_format::R32G32_SINT, &mut notes));
+        colors[2] = Some(ColorAttachmentMap {
+            pixel_format: f1::map_pixel_format(dxgi_format::R32G32_SINT),
+            blending_enabled: true,
+            ..colors[2].unwrap()
+        });
         assert_eq!(
             check_integer_blending(&colors).unwrap_err(),
             "render target 2 uses integer Metal format RG32Sint with blending enabled"

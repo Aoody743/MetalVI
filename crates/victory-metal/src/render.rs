@@ -449,7 +449,8 @@ impl Device {
         };
         let mut info = Self::mesh_pipeline_info(desc);
         info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
-        info.payload_memory_length = config.max_payload_size.saturating_add(32).min(16384) as u16;
+        let stride_payload = config.object_vertex_stride().unwrap_or(0).saturating_mul(config.vertex_output_size);
+        info.payload_memory_length = config.max_payload_size.max(stride_payload).saturating_add(32).min(16384) as u16;
         let raw = sys::symbol(b"VM_NewGeometryPipeline\0");
         if raw.is_null() {
             return Err(Error("victorymetal.dll has no VM_NewGeometryPipeline (rebuild native/victorymetal)".into()));
@@ -531,6 +532,23 @@ impl CommandBuffer {
     /// Opens the render pass `desc`, encodes `steps`, and ends the pass.
     /// The command buffer is not committed here.
     pub fn render_pass_with(&self, desc: &RenderPass<'_>, steps: &[Render<'_>]) -> Result<()> {
+        {
+            let mut w = self.1.lock().unwrap_or_else(|e| e.into_inner());
+            let attachments = desc.colors.iter().flatten().count() + usize::from(desc.depth.is_some()) + usize::from(desc.stencil.is_some());
+            let area = crate::volume([desc.width.into(), desc.height.into(), u64::from(desc.samples.max(1)) * u64::from(desc.array_length.max(1))]);
+            w.attachment_samples = w.attachment_samples.saturating_add(area.saturating_mul(attachments.max(1) as u64));
+            for step in steps {
+                let inputs = match *step {
+                    Render::Draw { vertex_count, instance_count, .. } => vertex_count.saturating_mul(instance_count.into()),
+                    Render::DrawIndexed { index_count, instance_count, .. } => index_count.saturating_mul(instance_count.into()),
+                    Render::DrawIndirect { .. } | Render::DrawIndexedIndirect { .. } => crate::indirect::INPUTS_PER_RECORD.into(),
+                    Render::DrawMesh { groups, .. } => { w.groups = w.groups.saturating_add(crate::volume(groups)); continue; }
+                    Render::DrawMeshIndirect { .. } => { w.groups = w.groups.saturating_add(crate::indirect::GROUPS_PER_RECORD.into()); continue; }
+                    _ => continue,
+                };
+                w.draw_inputs = w.draw_inputs.saturating_add(inputs);
+            }
+        }
         let _pool = Pool::new();
         // SAFETY: all-zero pass descriptor; fields set below.
         let mut pass: sys::WMTRenderPassInfo = unsafe { std::mem::zeroed() };

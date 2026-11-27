@@ -637,6 +637,12 @@ fn view_stride(view: &View) -> Option<u32> {
     })
 }
 
+/// Dword of the stride table (`victory_shader::emit::SLOT_STRIDES`):
+/// element stride plus integer/signed view flags.
+pub(crate) fn view_stride_word(view: &View) -> u32 {
+    view_stride(view).unwrap_or(0) | view_kind(view)
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());

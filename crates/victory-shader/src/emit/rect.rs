@@ -95,8 +95,12 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
     // The primitive id the pixel shader declares, as one more output.
     let wanted = ps_inputs
         .iter()
-        .find(|e| e.kind == 10 && e.row.is_some())
-        .filter(|_| !outputs.iter().any(|o| o.kind == 10));
+        .find(|e| (e.kind == 10 || e.name == super::RECT_PRIMITIVE_VARYING) && e.row.is_some())
+        .filter(|_| {
+            !outputs
+                .iter()
+                .any(|o| o.kind == 10 || o.name == super::RECT_PRIMITIVE_VARYING)
+        });
     let primitive = match wanted {
         Some(e) => {
             // Alone in its columns, and in a row of constant elements.

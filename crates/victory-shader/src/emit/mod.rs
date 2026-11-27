@@ -115,7 +115,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{
-    host_attribute_at_vertex, host_has_image_atomic64, host_max_wave, set_host_attribute_at_vertex, set_host_f64,
+    RECT_PRIMITIVE_VARYING, host_attribute_at_vertex, host_has_image_atomic64, host_max_wave, rect_primitive_varying,
+    set_host_attribute_at_vertex, set_host_f64, set_rect_primitive_varying, set_mesh_outputs_keep, mesh_outputs_keep_active,
     set_host_image_atomic64, set_host_max_wave,
 };
 pub use rect::rect_list_gs;
@@ -316,6 +317,20 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    if std::env::var_os("VICTORY_DESC_WHY").is_some()
+        && let crate::native::StageIo::Ps { db_shader_control, input_addr, .. } = &native.io
+    {
+        eprintln!("PS-IO db_shader_control={db_shader_control:#x} pops={} input_addr={input_addr:#x}", db_shader_control >> 19 & 1);
+    }
+    // `VICTORY_DUMP_CODE=<dir>`: each program's GFX10 code, by its hash,
+    // for `llvm-mc --disassemble -triple=amdgcn -mcpu=gfx1030`.
+    if let Some(dir) = std::env::var_os("VICTORY_DUMP_CODE") {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        native.code.hash(&mut h);
+        let path = std::path::Path::new(&dir).join(format!("{:016x}.bin", h.finish()));
+        let _ = std::fs::write(path, &native.code);
+    }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -743,6 +758,28 @@ fn vertex_output_interpolation(
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
+/// The (semantic name, index) of each input a host pixel shader declares
+/// (its `ISG1`), user semantics only.
+pub fn input_semantics(dxil: &[u8]) -> Option<Vec<(String, u32)>> {
+    let c = Container::parse(dxil).ok()?;
+    let part = c.part(FourCC::ISG1)?;
+    let elements = signature(part.data).ok()?;
+    Some(elements.into_iter().filter(|e| e.kind == 0).map(|e| (e.name, e.index)).collect())
+}
+
+/// Every element (name, index, kind) of a host shader's output signature
+/// and, for a mesh shader, its primitive signature.
+pub fn output_semantics(dxil: &[u8]) -> Option<Vec<(String, u32, u8)>> {
+    let c = Container::parse(dxil).ok()?;
+    let mut out = Vec::new();
+    for fourcc in [FourCC::OSG1, FourCC::PSG1] {
+        if let Some(part) = c.part(fourcc) {
+            out.extend(signature(part.data).ok()?.into_iter().map(|e| (e.name, e.index, e.kind)));
+        }
+    }
+    Some(out)
+}
+
 fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
     use crate::dxbc::u32_at;
     let count = u32_at(part, 0)? as usize;

@@ -57,6 +57,9 @@ struct Global {
     space: u32,
     /// An internal constant with this initialiser (a constant table).
     init: Option<u32>,
+    /// With `init`: an internal variable (a thread-private `static`), not
+    /// a constant.
+    writable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -359,8 +362,19 @@ impl Module {
             ptr,
             space,
             init: None,
+            writable: false,
         });
         V::Global(self.globals.len() as u32 - 1)
+    }
+
+    /// An internal thread-private variable initialised with the constant
+    /// `init` (an HLSL `static`).
+    pub fn private_global(&mut self, name: &str, init: V) -> V {
+        let g = self.constant_global(name, init);
+        if let V::Global(n) = g {
+            self.globals[n as usize].writable = true;
+        }
+        g
     }
 
     /// An internal constant global initialised with the constant `init`.
@@ -438,6 +452,17 @@ impl Module {
             t => panic!("extractvalue from {t:?}"),
         };
         self.push(block, ty, Op::Extract(agg, index))
+    }
+    /// Call `call` again in `block` with argument `index` (0: the first
+    /// after the callee) replaced by `value`; `None` if `call` is no call.
+    pub fn call_with_arg(&mut self, block: usize, call: V, index: usize, value: V) -> Option<V> {
+        let V::Inst(i) = call else { return None };
+        let Inst { ty, op: Op::Call(f, args) } = &self.insts[i as usize] else {
+            return None;
+        };
+        let (ty, f, mut args) = (*ty, *f, args.clone());
+        *args.get_mut(index)? = value;
+        Some(self.push(block, ty, Op::Call(f, args)))
     }
     pub fn call(&mut self, block: usize, f: V, args: Vec<V>) -> V {
         let V::Func(i) = f else {
@@ -645,7 +670,7 @@ impl Module {
             // + 1, linkage (external 0, internal 3), log2 alignment + 1,
             // section]
             let (constant, init, linkage) = match g.init {
-                Some(i) => (1, first_const + u64::from(i) + 1, 3),
+                Some(i) => (u64::from(!g.writable), first_const + u64::from(i) + 1, 3),
                 None => (0, 0, 0),
             };
             w.record(

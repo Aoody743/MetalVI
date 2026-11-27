@@ -830,10 +830,21 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        record_buffer_copy(this, list, to, from, len as usize);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
+}
+
+#[cfg(windows)]
+fn record_buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *const u8, bytes: usize) {
+    if bytes != 0 && crate::host::null_gpu() && crate::backend::metal_draw::draws_on() {
+        let op = crate::backend::metal::MetalOp::BufferCopy { dst: to as usize, src: from as usize, bytes };
+        // SAFETY: this is the title's live command list.
+        unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner()).metal.push(std::sync::Arc::new(op));
+    } else {
+        list.defer_copy(to, from, bytes);
+    }
 }
 
 /// Whether one of two resources is a target in a stand-in format and the
@@ -886,7 +897,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            record_buffer_copy(this, list, to, from, a.min(b) as usize);
         }
     }
     #[cfg(not(windows))]
@@ -942,7 +953,11 @@ extern "system" fn copy_texture_region(
             // before.
             static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            let made = read_back(list, dst, x, y, z, src, source_box);
+            let made = if crate::host::null_gpu() && crate::backend::metal_draw::draws_on() {
+                metal_readback_row(this, dst, [x, y, z], src, source_box)
+            } else {
+                read_back(list, dst, x, y, z, src, source_box)
+            };
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
@@ -1082,9 +1097,12 @@ fn metal_copy(this: This, src: This, si: u32, dst: This, di: u32, at: [u32; 3], 
     let (Some(s), Some(d)) = (m.texture_for(src), m.texture_for(dst)) else { return };
     crate::backend::metal_draw::note_write(dst as usize, 2);
     // (plane, mip, slice)
-    let (Some((_, sl, ss)), Some((_, dl, ds))) = (decode_subresource(si, s.mips, s.slices.max(1)), decode_subresource(di, d.mips, d.slices.max(1))) else {
+    let (Some((sp, sl, ss)), Some((dp, dl, ds))) = (decode_subresource(si, s.mips, s.slices.max(1)), decode_subresource(di, d.mips, d.slices.max(1))) else {
         return;
     };
+    if s.pixel.0 == 260 && d.pixel.0 == 252 &&
+        (sp != 0 || dp != 0 || s.desc.sample_count > 1 || d.desc.sample_count > 1 ||
+         (whole && (s.mips > 1 || d.mips > 1 || s.slices > 1 || d.slices > 1))) { return; }
     let three_d = s.desc.dimension == 4;
     let dims = subresource_dims(s.desc.width, s.desc.height.max(1), u32::from(s.desc.depth_or_array_size.max(1)), sl, three_d);
     let (origin, size) = match source {
@@ -1116,6 +1134,32 @@ fn metal_copy(this: This, src: This, si: u32, dst: This, di: u32, at: [u32; 3], 
 
 /// Records a texture to buffer copy (a read back) of [`copy_texture_region`]
 /// into `list`, or says why not.
+#[cfg(windows)]
+fn metal_readback_row(this: This, dst: CopyLocation, at: [u32; 3], src: CopyLocation, source_box: *const [u32; 6]) -> Result<(), &'static str> {
+    if dst.kind != 1 || src.kind != 0 || src.footprint.offset as u32 != 0 || at != [0; 3] {
+        return Err("unsupported Metal readback location");
+    }
+    let m = crate::backend::metal::backend().ok_or("no Metal device")?;
+    let t = m.texture_for(src.resource).ok_or("no Metal readback source")?;
+    let w = t.texture.width();
+    if t.pixel.0 != 125 || t.desc.dimension != 3 || t.texture.height() != 1 || t.desc.sample_count > 1 || w > 16384 {
+        return Err("not a single RGBA32F row");
+    }
+    // SAFETY: a non-null source box is supplied by the title for this call.
+    if !source_box.is_null() && unsafe { *source_box } != [0, 0, 0, w as u32, 1, 1] {
+        return Err("partial Metal readback");
+    }
+    let (_, [_, bytes, rows, _]) = dst.footprint.host_rows().ok_or("unknown readback footprint")?;
+    if rows != 1 || bytes != w * 16 { return Err("Metal readback footprint mismatch"); }
+    let ptr = buffer_range(dst.resource, dst.footprint.offset, bytes).ok_or("outside readback destination")?;
+    let (buffer, offset) = m.chunks().window_buffer(ptr as u64, bytes).ok_or("unmapped readback destination")?;
+    if offset % 4 != 0 { return Err("unaligned Metal readback"); }
+    let op = crate::backend::metal::MetalOp::FloatRowReadback { src: t.texture.clone(), dst: buffer, offset, width: w as u32 };
+    // SAFETY: this is the title's live command list.
+    unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner()).metal.push(std::sync::Arc::new(op));
+    Ok(())
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)] // the method's own arguments
 fn read_back(

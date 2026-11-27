@@ -134,7 +134,6 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
-        let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
                 let src = self
@@ -143,6 +142,7 @@ impl<'a> Lower<'a> {
                     .copied()
                     .ok_or("an untracked ray-tracing structure")?;
                 let handle = self.handle(site, src, false, (11, 0))?;
+                let c = self.cur;
                 // (pointer >> 3) << 6 from the buffer's start.
                 let (kind_bits, k3) = (self.s.m.i32(!7), self.s.m.i32(3));
                 let byte = self.s.m.bin(c, Bin::And, pointer, kind_bits);

@@ -1452,7 +1452,11 @@ _MTLCaptureManager_startCapture(void *obj) {
   NSString *path_str = [[NSString alloc] initWithCString:info->output_url.ptr encoding:NSUTF8StringEncoding];
   NSURL *url = [[NSURL alloc] initFileURLWithPath:path_str];
   desc.outputURL = url;
-  [(MTLCaptureManager *)params->capture_manager startCaptureWithDescriptor:desc error:nil];
+  NSError *error = nil;
+  params->ret = [(MTLCaptureManager *)params->capture_manager startCaptureWithDescriptor:desc error:&error];
+  if (!params->ret && error) {
+    fprintf(stderr, "victorymetal: Metal capture failed: %s\n", [[error localizedDescription] UTF8String]);
+  }
   [url release];
   [path_str release];
   [desc release];

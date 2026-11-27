@@ -152,6 +152,18 @@ impl TopLevel {
         true
     }
 
+    /// Static samplers' descriptor table: when a root signature declares
+    /// static samplers, MSC appends one `Table` location at `layout[num_params]`
+    /// (after the `0..num_params` root parameters, which may themselves
+    /// include `Table` locations with `space`/`slot` `u32::MAX`).
+    pub fn set_static_samplers(&mut self, num_params: usize, gpu_va: u64) -> bool {
+        let Some(l) = self.layout.get(num_params) else { return false };
+        if l.kind != ResourceType::Table || l.size < 8 {
+            return false;
+        }
+        self.set_u64(num_params, gpu_va)
+    }
+
     /// A root descriptor (CBV/SRV/UAV) at `<slot>, space<space>`: the GPU
     /// address it points at.
     pub fn set_root_descriptor(&mut self, kind: ResourceType, space: u32, slot: u32, gpu_va: u64) -> bool {
@@ -246,5 +258,20 @@ mod tests {
         assert_eq!(n, b.len());
         assert_eq!(u.layout, t.layout);
         assert_eq!(u.bytes.len(), t.bytes.len());
+    }
+
+    #[test]
+    fn static_sampler_table_follows_root_tables() {
+        let layout = vec![
+            Location { kind: ResourceType::Constant, space: 0, slot: 0, offset: 0, size: 16 },
+            Location { kind: ResourceType::Table, space: u32::MAX, slot: u32::MAX, offset: 16, size: 8 },
+            Location { kind: ResourceType::Table, space: u32::MAX, slot: u32::MAX, offset: 24, size: 8 },
+        ];
+        let mut t = TopLevel::new(layout, 32);
+        assert!(t.set_u64(1, 0x1111_2222_3333_4444));
+        assert!(t.set_static_samplers(2, 0xAAAA_BBBB_CCCC_DDDD));
+        assert!(!t.set_static_samplers(3, 0x1));
+        assert_eq!(&t.bytes[16..24], &0x1111_2222_3333_4444u64.to_le_bytes());
+        assert_eq!(&t.bytes[24..32], &0xAAAA_BBBB_CCCC_DDDDu64.to_le_bytes());
     }
 }

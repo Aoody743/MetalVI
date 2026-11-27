@@ -20,6 +20,7 @@ pub const BLIT_OPTION_STENCIL: u16 = 1 << 1;
 /// A blit encoder for one command buffer; commands accumulate until
 /// [`BlitEncoder::finish`] (also runs on drop).
 pub struct BlitEncoder {
+    work: std::sync::Arc<std::sync::Mutex<crate::EncodedWork>>,
     encoder: obj_handle_t,
     commands: Vec<Box<dyn BlitCmd>>,
     finished: bool,
@@ -66,11 +67,16 @@ impl CommandBuffer {
         if encoder == 0 {
             return Err(Error("blitCommandEncoder".into()));
         }
-        Ok(BlitEncoder { encoder, commands: Vec::new(), finished: false })
+        Ok(BlitEncoder { work: self.1.clone(), encoder, commands: Vec::new(), finished: false })
     }
 }
 
 impl BlitEncoder {
+    fn account(&self, bytes: u64, texels: u64) {
+        let mut work = self.work.lock().unwrap_or_else(|e| e.into_inner());
+        work.blit_bytes = work.blit_bytes.saturating_add(bytes);
+        work.blit_texels = work.blit_texels.saturating_add(texels);
+    }
     /// `copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:`
     pub fn copy_buffer(
         &mut self,
@@ -80,6 +86,7 @@ impl BlitEncoder {
         dst_offset: u64,
         length: u64,
     ) {
+        self.account(length, 0);
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_buffer_to_buffer {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromBufferToBuffer,
             reserved: [0; 3],
@@ -106,6 +113,7 @@ impl BlitEncoder {
         level: u32,
         origin: [u64; 3],
     ) {
+        self.account(0, crate::volume(size));
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_buffer_to_texture {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromBufferToTexture,
             reserved: [0; 3],
@@ -136,6 +144,7 @@ impl BlitEncoder {
         bytes_per_row: u32,
         bytes_per_image: u32,
     ) {
+        self.account(0, crate::volume(size));
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_texture_to_buffer {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromTextureToBuffer,
             reserved: [0; 3],
@@ -168,6 +177,7 @@ impl BlitEncoder {
         origin: [u64; 3],
         options: u16,
     ) {
+        self.account(0, crate::volume(size));
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_buffer_to_texture_withblitoption {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromBufferToTextureWithBlitOption,
             reserved: [0; 3],
@@ -201,6 +211,7 @@ impl BlitEncoder {
         bytes_per_image: u32,
         options: u16,
     ) {
+        self.account(0, crate::volume(size));
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_texture_to_buffer_withblitoption {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromTextureToBufferWithBlitOption,
             reserved: [0; 3],
@@ -233,6 +244,7 @@ impl BlitEncoder {
         dst_level: u32,
         dst_origin: [u64; 3],
     ) {
+        self.account(0, crate::volume(src_size));
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_from_texture_to_texture {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyFromTextureToTexture,
             reserved: [0; 3],
@@ -251,6 +263,9 @@ impl BlitEncoder {
 
     /// `copyFromTexture:toTexture:` (whole resource, identical dimensions & format).
     pub fn copy_texture(&mut self, src: &Texture, dst: &Texture) {
+        // Charge every mip as full size and every slice as six cube faces.
+        self.account(0, crate::volume([src.width(), src.height(), src.depth()])
+            .saturating_mul(src.array_length()).saturating_mul(src.mipmap_level_count()).saturating_mul(6));
         self.commands.push(Box::new(sys::wmtcmd_blit_copy_texture {
             type_: sys::WMTBlitCommandType::WMTBlitCommandCopyTexture,
             reserved: [0; 3],
@@ -262,6 +277,7 @@ impl BlitEncoder {
 
     /// `fillBuffer:range:value:`
     pub fn fill_buffer(&mut self, buffer: &Buffer, offset: u64, length: u64, value: u8) {
+        self.account(length, 0);
         self.commands.push(Box::new(sys::wmtcmd_blit_fillbuffer {
             type_: sys::WMTBlitCommandType::WMTBlitCommandFillBuffer,
             reserved: [0; 3],

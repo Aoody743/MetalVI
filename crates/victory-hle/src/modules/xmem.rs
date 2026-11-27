@@ -447,6 +447,71 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A mapped view as [`physical_alias`] sees it: its length, its section
+/// (by address), the index of its first page and the section's persistent
+/// view (address and length; 0 for none).
+#[derive(Clone, Copy)]
+struct AliasView {
+    len: usize,
+    section: usize,
+    index: usize,
+    persistent: usize,
+    persistent_len: usize,
+}
+
+/// [`Physical::views`] again, behind a lock of its own that is held for
+/// nothing but its own update: [`physical_alias`] runs under the GPU side's
+/// locks, and the page table's lock is held while waiting for GPU-side
+/// readers of title memory (`title_memory_remapping_range`).
+static ALIASES: std::sync::RwLock<BTreeMap<usize, AliasView>> = std::sync::RwLock::new(BTreeMap::new());
+
+fn alias_insert(base: usize, len: usize, slice: &Slice) {
+    let (persistent, persistent_len) = slice
+        .section
+        .persistent
+        .as_ref()
+        .map_or((0, 0), |v| (v.at.Value as usize, v.len));
+    let view = AliasView {
+        len,
+        section: Arc::as_ptr(&slice.section) as usize,
+        index: slice.index,
+        persistent,
+        persistent_len,
+    };
+    ALIASES.write().unwrap_or_else(|e| e.into_inner()).insert(base, view);
+}
+
+fn alias_remove(base: usize) {
+    ALIASES.write().unwrap_or_else(|e| e.into_inner()).remove(&base);
+}
+
+/// Where the bytes of title range `[va, va+len)` lie in their section's
+/// persistent view, when the range is in mapped views of consecutive pages
+/// of one section that has one: the address the GPU side wraps instead of
+/// the title's, which the title remaps while streaming (see
+/// `victory_metal::chunks::Alias`). Takes [`ALIASES`] only.
+pub fn physical_alias(va: u64, len: u64) -> Option<u64> {
+    let (va, len) = (usize::try_from(va).ok()?, usize::try_from(len).ok()?);
+    let end = va.checked_add(len)?;
+    let views = ALIASES.read().unwrap_or_else(|e| e.into_inner());
+    let (&start, first) = views.range(..=va).next_back()?;
+    if va >= start + first.len || first.persistent == 0 {
+        return None;
+    }
+    let offset = first.index * PAGE + (va - start);
+    // On through views that show the next pages of the same section.
+    let (mut covered, mut next) = (start + first.len, first.index + first.len / PAGE);
+    while covered < end {
+        let (&s, v) = views.range(covered..).next()?;
+        if s != covered || v.section != first.section || v.index != next {
+            return None;
+        }
+        covered += v.len;
+        next += v.len / PAGE;
+    }
+    (offset + len <= first.persistent_len).then(|| (first.persistent + offset) as u64)
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -456,6 +521,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if count.is_null() || pages.is_null() {
         return 0;
     }
+    victory_gpu::set_physical_alias(physical_alias);
     // SAFETY: checked non-null.
     let n = unsafe { *count };
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
@@ -979,6 +1045,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         let shown = physical.shown.entry(slice.key(k)).or_default();
         shown.push(base + k * PAGE);
     }
+    alias_insert(base, len, &slice);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1058,6 +1125,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        alias_remove(at);
         for k in 0..size / PAGE {
             if let std::collections::hash_map::Entry::Occupied(mut o) =
                 physical.shown.entry(slice.key(k))

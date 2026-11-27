@@ -106,16 +106,258 @@ pub(crate) fn pixel_format(dxgi: u32) -> Option<WMTPixelFormat> {
     })
 }
 
+#[derive(Clone, Copy)]
+struct PartialEntry {
+    mem: u64,
+    size: u64,
+    first_mip: u32,
+    dirty: bool,
+}
+
 /// Title memory of title-filled Metal textures: address to resource.
 static FILLED: std::sync::Mutex<std::collections::BTreeMap<usize, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Title-filled textures that only had tail mips committed on first fill.
+static PARTIAL_FILLED: std::sync::Mutex<std::collections::BTreeMap<usize, PartialEntry>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static PARTIAL_DIRTY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PARTIAL_HAS_REMAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static PARTIAL_ALL_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REMAP_RANGES: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn tracks_memory(address: usize) -> bool {
+    FILLED.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&address)
+}
+
+pub(crate) fn forget_resource_textures(resource: usize) {
+    FILLED.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, &mut r| r != resource);
+    if matches!(PARTIAL_FILLED.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource), Some(e) if e.dirty) {
+        PARTIAL_DIRTY.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Records a remapped title range in O(1) while the runtime holds `MAPPING.write()`.
+/// Never touches `PARTIAL_FILLED`; [`drain_remap_partial`] applies the batch later.
+pub(crate) fn note_remap_partial(at: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    {
+        let mut ranges = REMAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = ranges.last_mut()
+            && last.1 == at
+        {
+            last.1 = end;
+        } else if ranges.len() < 65536 {
+            ranges.push((at, end));
+        } else {
+            PARTIAL_ALL_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+            ranges.clear();
+        }
+    }
+    PARTIAL_HAS_REMAPS.store(true, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn drain_remap_partial() {
+    if !PARTIAL_HAS_REMAPS.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let all_dirty = PARTIAL_ALL_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let mut ranges = {
+        let mut guard = REMAP_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    let mut partial = PARTIAL_FILLED.lock().unwrap_or_else(|e| e.into_inner());
+    if partial.is_empty() {
+        return;
+    }
+    if all_dirty {
+        for v in partial.values_mut() {
+            if !v.dirty {
+                v.dirty = true;
+                PARTIAL_DIRTY.fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+        return;
+    }
+    if ranges.is_empty() {
+        return;
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len().min(4096));
+    for (s, e) in ranges {
+        if let Some(last) = merged.last_mut()
+            && s <= last.1
+        {
+            last.1 = last.1.max(e);
+        } else {
+            merged.push((s, e));
+        }
+    }
+    for v in partial.values_mut() {
+        if v.dirty {
+            continue;
+        }
+        let tex_end = v.mem.saturating_add(v.size);
+        let idx = merged.partition_point(|&(s, _)| s < tex_end);
+        if idx > 0 && merged[idx - 1].1 > v.mem {
+            v.dirty = true;
+            PARTIAL_DIRTY.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+const UPLOAD_ARENA_BYTES: u64 = 32 << 20;
+
+struct UploadArena {
+    buffer: Option<victory_metal::Buffer>,
+    mem: *mut u8,
+    capacity: u64,
+    cursor: u64,
+}
+
+impl Drop for UploadArena {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // Release the Metal buffer wrapper before freeing the backing memory.
+        self.buffer.take();
+        if !self.mem.is_null() {
+            // SAFETY: allocated by VirtualAlloc in UploadArena::new.
+            unsafe { VirtualFree(self.mem.cast(), 0, MEM_RELEASE) };
+            self.mem = std::ptr::null_mut();
+        }
+    }
+}
+
+struct PendingCopy {
+    texture: victory_metal::texture::Texture,
+    offset: u64,
+    row: u32,
+    image: u32,
+    size: [u64; 3],
+    slice: u32,
+    mip: u32,
+}
+
+/// Reusable CPU-detile staging arena and queued texture blits flushed in one command buffer.
+#[derive(Default)]
+pub(crate) struct PendingUploads {
+    arena: Option<UploadArena>,
+    copies: Vec<PendingCopy>,
+}
+
+// SAFETY: only accessed under `MetalBackend::pending_uploads`.
+unsafe impl Send for PendingUploads {}
+
+impl PendingUploads {
+    fn ensure_arena(&mut self, device: &victory_metal::Device) -> Option<&mut UploadArena> {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        if self.arena.is_none() {
+            // SAFETY: fresh page-aligned 32 MiB upload arena freed on Drop.
+            let mem = unsafe { VirtualAlloc(std::ptr::null(), UPLOAD_ARENA_BYTES as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+            if mem.is_null() {
+                return None;
+            }
+            // SAFETY: kept alive inside `UploadArena` until `Drop`.
+            let Ok(buffer) = (unsafe { device.wrap(mem, UPLOAD_ARENA_BYTES) }) else {
+                unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+                return None;
+            };
+            self.arena = Some(UploadArena {
+                buffer: Some(buffer),
+                mem: mem.cast(),
+                capacity: UPLOAD_ARENA_BYTES,
+                cursor: 0,
+            });
+        }
+        self.arena.as_mut()
+    }
+
+    fn flush(&mut self, queue: &victory_metal::Queue) -> bool {
+        if self.copies.is_empty() {
+            return true;
+        }
+        let succeeded = if let Some(arena) = &mut self.arena
+            && let Some(buf) = &arena.buffer
+            && let Ok(cb) = queue.command_buffer()
+            && let Ok(mut blit) = cb.blit_encoder()
+        {
+            for c in &self.copies {
+                blit.copy_from_buffer_to_texture(buf, c.offset, c.row, c.image, c.size, &c.texture, c.slice, c.mip, [0, 0, 0]);
+            }
+            blit.finish();
+            super::metal::submit_checked(&cb, &[], true, "texture uploads").is_ok()
+        } else {
+            false
+        };
+        if !succeeded {
+            return false;
+        }
+        self.copies.clear();
+        if let Some(arena) = &mut self.arena {
+            arena.cursor = 0;
+        }
+        true
+    }
+}
 
 impl MetalBackend {
+    pub(crate) fn flush_uploads(&self) -> bool {
+        if self.uploads_pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return true;
+        }
+        let mut uploads = self.pending_uploads.lock().unwrap_or_else(|e| e.into_inner());
+        if !uploads.flush(&self.queue) {
+            super::metal::stop_submissions("texture upload could not complete");
+            return false;
+        }
+        self.uploads_pending.store(0, std::sync::atomic::Ordering::Release);
+        true
+    }
+
+    fn maybe_refill_partial(&self, key: usize) {
+        if PARTIAL_DIRTY.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return;
+        }
+        let entry = {
+            let mut partial = PARTIAL_FILLED.lock().unwrap_or_else(|e| e.into_inner());
+            partial.get_mut(&key).and_then(|v| {
+                if v.dirty {
+                    v.dirty = false;
+                    PARTIAL_DIRTY.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    Some((v.mem, v.first_mip))
+                } else {
+                    None
+                }
+            })
+        };
+        let Some((mem, prev_first)) = entry else { return };
+        if mem == 0 {
+            return;
+        }
+        let Some(Some(t)) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() else { return };
+        let first = self.fill(&t, mem as *const u8, prev_first);
+        if first < prev_first {
+            let mut partial = PARTIAL_FILLED.lock().unwrap_or_else(|e| e.into_inner());
+            if first == 0 {
+                if matches!(partial.remove(&key), Some(e) if e.dirty) {
+                    PARTIAL_DIRTY.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                }
+            } else if let Some(v) = partial.get_mut(&key) {
+                v.first_mip = first;
+            }
+        }
+    }
+
     /// The Metal texture of title texture `r`, made (and for title-filled
     /// textures, filled) on first use.
     pub(crate) fn texture_for(&self, r: This) -> Option<Arc<MetalTexture>> {
         let key = r as usize;
-        if let Some(t) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-            return t.clone();
+        if let Some(t) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+            if t.is_some() {
+                self.maybe_refill_partial(key);
+            }
+            return t;
         }
         let made = self.make_texture(r).map(Arc::new);
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(made).clone()
@@ -126,7 +368,12 @@ impl MetalBackend {
             fail("not a texture", None, None);
             return None;
         };
-        let Some(pixel) = pixel_format(d.format) else {
+        let fmt = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
+            crate::resource::target_format(crate::resource::pc_format(d.format))
+        } else {
+            d.format
+        };
+        let Some(pixel) = pixel_format(fmt) else {
             fail("no pixel format", Some(&d), None);
             return None;
         };
@@ -179,15 +426,32 @@ impl MetalBackend {
         };
         // Shaders reach it through argument buffers (its gpuResourceID):
         // it must be resident, as title memory is (T4 §3.6).
-        {
-            let chunks = self.chunks();
-            chunks.residency().add(&[texture.handle()]);
-            chunks.residency().commit();
-        }
-        let t = MetalTexture { texture, pixel, desc: d, mips, slices, companion: Default::default() };
+        self.add_resident(&[texture.handle()]);
+        let tiled_size = texture_layout(&d)
+            .and_then(|l| l.planes.first().map(|p| p.layout.size))
+            .unwrap_or(0);
+        let t = MetalTexture {
+            texture,
+            pixel,
+            desc: d,
+            mips,
+            slices,
+            companion: Default::default(),
+        };
         if d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0 && super::metal::texture_fill_on() {
-            self.fill(&t, memory);
+            let first = self.fill(&t, memory, t.mips);
             FILLED.lock().unwrap_or_else(|e| e.into_inner()).insert(memory as usize, r as usize);
+            if first > 0 && tiled_size > 0 {
+                PARTIAL_FILLED.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                    r as usize,
+                    PartialEntry {
+                        mem: memory as u64,
+                        size: tiled_size,
+                        first_mip: first,
+                        dirty: false,
+                    },
+                );
+            }
         }
         Some(t)
     }
@@ -207,36 +471,57 @@ impl MetalBackend {
         if n.is_power_of_two() {
             tracing::info!(refills = n, "Metal textures filled again from title memory");
         }
-        self.fill(&t, memory);
+        let first = self.fill(&t, memory, t.mips);
+        let mut partial = PARTIAL_FILLED.lock().unwrap_or_else(|e| e.into_inner());
+        if first == 0 {
+            if matches!(partial.remove(&r), Some(e) if e.dirty) {
+                PARTIAL_DIRTY.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        } else if let Some(v) = partial.get_mut(&r) {
+            v.first_mip = first;
+        }
     }
 
-    /// Detiles a title-filled texture's console memory into it (all mips
-    /// and slices of plane 0). Skipped (left undefined) when the layout is
-    /// not addressable (XOR modes, MSAA) or the memory is not all mapped.
-    fn fill(&self, t: &MetalTexture, memory: *const u8) {
+    /// Detiles a title-filled texture's console memory into it (`first_mip..prev_first_mip`
+    /// across slices of plane 0). Small CPU-detiled uploads batch into the shared upload arena;
+    /// large/GPU-detiled uploads snapshot title memory out of `MAPPING.read()` first.
+    /// Returns the finest mip filled (or `prev_first_mip` if nothing new was committed).
+    fn fill(&self, t: &MetalTexture, memory: *const u8, prev_first_mip: u32) -> u32 {
+        use std::cell::RefCell;
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
-        let Some(layout) = texture_layout(&t.desc) else { return };
-        let Some(plane) = layout.planes.first() else { return };
+        thread_local! {
+            static TILE_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+        }
+        let Some(layout) = texture_layout(&t.desc) else { return prev_first_mip };
+        let Some(plane) = layout.planes.first() else { return prev_first_mip };
         let layout = &plane.layout;
         if !layout.addressable() {
-            return;
+            return prev_first_mip;
         }
-        let Some(props) = format_props(crate::resource::pc_format(t.desc.format) as i32) else { return };
+        let Some(props) = format_props(crate::resource::pc_format(t.desc.format) as i32) else { return prev_first_mip };
         let (bw, bh, bytes) = (props.block_width.max(1), props.block_height.max(1), props.block_size_bytes);
         let tiled_size = layout.size;
-        if bytes == 0 || victory_metal::chunks::committed_extent(memory as u64, tiled_size) < tiled_size {
-            return;
+        if bytes == 0 || tiled_size == 0 || prev_first_mip == 0 {
+            return prev_first_mip;
         }
-        // SAFETY: committed, read only.
-        let tiled = unsafe { std::slice::from_raw_parts(memory, tiled_size as usize) };
+        let (first_mip, read_bytes) = {
+            let _reading = crate::watch::title_memory_reading_range(memory as usize, tiled_size as usize);
+            let committed = victory_metal::chunks::committed_extent(memory as u64, tiled_size);
+            let Some(first_mip) = (0..t.mips).find(|&m| layout.bytes_from(m) <= committed) else {
+                return prev_first_mip;
+            };
+            if first_mip >= prev_first_mip {
+                return prev_first_mip;
+            }
+            (first_mip, layout.bytes_from(first_mip))
+        };
         let w = u64::from(t.desc.width as u32);
         let h = if t.desc.dimension == TEXTURE_1D { 1 } else { u64::from(t.desc.height.max(1)) };
         let d3 = if t.desc.dimension == TEXTURE_3D { u64::from(t.desc.depth_or_array_size.max(1)) } else { 1 };
-        // Rows of every subresource, one after the other, in a staging buffer.
         let mut plan = Vec::new();
         let mut total = 0u64;
         for slice in 0..t.slices {
-            for mip in 0..t.mips {
+            for mip in first_mip..prev_first_mip {
                 let mw = (w >> mip).max(1).div_ceil(u64::from(bw));
                 let mh = (h >> mip).max(1).div_ceil(u64::from(bh));
                 let md = (d3 >> mip).max(1);
@@ -246,50 +531,118 @@ impl MetalBackend {
                 total += (image * md).next_multiple_of(256);
             }
         }
-        let size = total.next_multiple_of(64 << 10) as usize;
-        // SAFETY: a fresh allocation, released below after the GPU is done.
-        let staging = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-        if staging.is_null() {
-            return;
-        }
-        let _pool = victory_metal::Pool::new();
-        // SAFETY: the staging memory lives until the command buffer is waited for.
-        let Ok(buffer) = (unsafe { self.device.wrap(staging, size as u64) }) else {
-            // SAFETY: ours.
-            unsafe { VirtualFree(staging, 0, MEM_RELEASE) };
-            return;
-        };
-        // The detile on the GPU, reading the title's memory where it is
-        // (zero copy), for every subresource the kernels take (F10,
-        // `metal_detile`); the CPU does the rest into the same staging.
-        // On the GPU only where it pays (F16: under ~6 MB a command buffer's
-        // fixed cost outweighs it, and linear layouts copy faster on the CPU).
         static MIN_BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let min_bytes = *MIN_BYTES.get_or_init(|| {
             std::env::var("VICTORY_METAL_GPU_DETILE_MIN_KB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(4096) << 10
         });
-        let worth_gpu = tiled_size >= min_bytes && layout.desc.swizzle.0 != 0;
-        let window = if super::metal::gpu_detile_on() && worth_gpu {
-            self.chunks().window_buffer(memory as u64, tiled_size)
-        } else {
-            None
+        let worth_gpu = read_bytes >= min_bytes && layout.desc.swizzle.0 != 0 && super::metal::gpu_detile_on();
+        // Fast batched path: snapshot title memory under the reading lock, then detile directly
+        // into the reusable 32 MiB upload arena without VirtualAlloc or blocking on cb.wait().
+        if !worth_gpu && total <= (16 << 20) {
+            return TILE_SCRATCH.with(|scratch| {
+                let mut scratch = scratch.borrow_mut();
+                scratch.resize(read_bytes as usize, 0);
+                {
+                    let _reading = crate::watch::title_memory_reading_range(memory as usize, read_bytes as usize);
+                    if victory_metal::chunks::committed_extent(memory as u64, read_bytes) < read_bytes {
+                        return prev_first_mip;
+                    }
+                    // SAFETY: verified committed and guarded against remapping.
+                    unsafe { std::ptr::copy_nonoverlapping(memory, scratch.as_mut_ptr(), read_bytes as usize) };
+                }
+                let need = total.next_multiple_of(256);
+                let mut uploads = self.pending_uploads.lock().unwrap_or_else(|e| e.into_inner());
+                if uploads.arena.as_ref().is_some_and(|a| a.cursor + need > a.capacity) {
+                    if !uploads.flush(&self.queue) {
+                        super::metal::stop_submissions("texture upload arena could not flush");
+                        return prev_first_mip;
+                    }
+                    self.uploads_pending.store(0, std::sync::atomic::Ordering::Release);
+                }
+                let Some(arena) = uploads.ensure_arena(&self.device) else { return prev_first_mip };
+                let base = arena.cursor;
+                let dst_ptr = arena.mem;
+                let mut batch_copies = Vec::with_capacity(plan.len());
+                for &(slice, mip, at, row, image, md, size3) in &plan {
+                    let offset = base + at;
+                    let len = (image * md) as usize;
+                    // SAFETY: `[offset .. offset + len)` is exclusively in `arena.mem` under `pending_uploads`.
+                    let linear = unsafe { std::slice::from_raw_parts_mut(dst_ptr.add(offset as usize), len) };
+                    if layout.detile(&scratch, mip, slice, linear, row as usize, image as usize).is_err() {
+                        return prev_first_mip;
+                    }
+                    batch_copies.push(PendingCopy {
+                        texture: t.texture.clone(),
+                        offset,
+                        row: row as u32,
+                        image: image as u32,
+                        size: size3,
+                        slice,
+                        mip,
+                    });
+                }
+                arena.cursor = base + need;
+                uploads.copies.extend(batch_copies);
+                self.uploads_pending.fetch_add(1, std::sync::atomic::Ordering::Release);
+                first_mip
+            });
+        }
+
+        // Large / GPU-detile path: snapshot into page-aligned source outside MAPPING.read(),
+        // then run GPU detile + blit in one command buffer completely unlocked from title memory.
+        let src_size = (read_bytes as usize).next_multiple_of(64 << 10);
+        // SAFETY: temporary snapshot buffer freed below.
+        let src_mem = unsafe { VirtualAlloc(std::ptr::null(), src_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if src_mem.is_null() {
+            return prev_first_mip;
+        }
+        {
+            let _reading = crate::watch::title_memory_reading_range(memory as usize, read_bytes as usize);
+            if victory_metal::chunks::committed_extent(memory as u64, read_bytes) < read_bytes {
+                // SAFETY: ours.
+                unsafe { VirtualFree(src_mem, 0, MEM_RELEASE) };
+                return prev_first_mip;
+            }
+            // SAFETY: verified committed and guarded against remapping.
+            unsafe { std::ptr::copy_nonoverlapping(memory, src_mem.cast::<u8>(), read_bytes as usize) };
+        }
+        let size = total.next_multiple_of(64 << 10) as usize;
+        // SAFETY: a fresh allocation, released below after the GPU is done.
+        let staging = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if staging.is_null() {
+            unsafe { VirtualFree(src_mem, 0, MEM_RELEASE) };
+            return prev_first_mip;
+        }
+        let _pool = victory_metal::Pool::new();
+        // SAFETY: the snapshot and staging memory live until the command buffer is waited for.
+        let Ok(src_buf) = (unsafe { self.device.wrap(src_mem, src_size as u64) }) else {
+            unsafe { VirtualFree(staging, 0, MEM_RELEASE) };
+            unsafe { VirtualFree(src_mem, 0, MEM_RELEASE) };
+            return prev_first_mip;
         };
-        let detiler = window.as_ref().and_then(|_| self.detiler());
-        // Each subresource's kernel parameters, if the GPU takes it.
+        let Ok(buffer) = (unsafe { self.device.wrap(staging, size as u64) }) else {
+            drop(src_buf);
+            unsafe { VirtualFree(staging, 0, MEM_RELEASE) };
+            unsafe { VirtualFree(src_mem, 0, MEM_RELEASE) };
+            return prev_first_mip;
+        };
+        let detiler = if worth_gpu { self.detiler() } else { None };
         let params: Vec<Option<super::metal_detile::Params>> = plan
             .iter()
             .map(|&(slice, mip, ..)| {
-                (window.is_some() && detiler.is_some()).then(|| super::metal_detile::kernel_params(layout, mip, slice)).flatten()
+                detiler.and_then(|_| super::metal_detile::kernel_params(layout, mip, slice))
             })
             .collect();
         let mut steps = Vec::new();
-        if let (Some((src, src_offset)), Some(d)) = (&window, detiler) {
+        if let Some(d) = detiler {
             for (&(_, _, at, ..), p) in plan.iter().zip(&params) {
                 if let Some(p) = p {
-                    d.encode(&mut steps, src, *src_offset, &buffer, at, p);
+                    d.encode(&mut steps, &src_buf, 0, &buffer, at, p);
                 }
             }
         }
+        // SAFETY: committed above; snapshot covers `read_bytes`.
+        let tiled = unsafe { std::slice::from_raw_parts(src_mem.cast::<u8>(), read_bytes as usize) };
         // SAFETY: committed above; the GPU writes other ranges of it.
         let linear = unsafe { std::slice::from_raw_parts_mut(staging.cast::<u8>(), size) };
         for (&(slice, mip, at, row, image, md, _), p) in plan.iter().zip(&params) {
@@ -300,25 +653,37 @@ impl MetalBackend {
             if layout.detile(tiled, mip, slice, &mut linear[at as usize..end], row as usize, image as usize).is_err() {
                 drop(steps);
                 drop(buffer);
-                // SAFETY: ours, the GPU never saw it.
+                drop(src_buf);
                 unsafe { VirtualFree(staging, 0, MEM_RELEASE) };
-                return;
+                unsafe { VirtualFree(src_mem, 0, MEM_RELEASE) };
+                return prev_first_mip;
             }
         }
-        if let Ok(cb) = self.queue.command_buffer() {
+        let uploaded = if let Ok(cb) = self.queue.command_buffer() {
             let detiled = steps.is_empty() || cb.compute(&steps).is_ok();
             if detiled && let Ok(mut blit) = cb.blit_encoder() {
                 for &(slice, mip, at, row, image, _md, size3) in &plan {
                     blit.copy_from_buffer_to_texture(&buffer, at, row as u32, image as u32, size3, &t.texture, slice, mip, [0, 0, 0]);
                 }
                 blit.finish();
+                super::metal::submit_checked(&cb, &[], true, "texture detile and upload").is_ok()
+            } else {
+                false
             }
-            cb.commit();
-            let _ = cb.wait();
-        }
+        } else {
+            false
+        };
         drop(buffer);
-        // SAFETY: the GPU is done with it.
+        drop(src_buf);
+        // SAFETY: the GPU is done with both allocations.
         unsafe { VirtualFree(staging, 0, MEM_RELEASE) };
+        unsafe { VirtualFree(src_mem, 0, MEM_RELEASE) };
+        if uploaded {
+            first_mip
+        } else {
+            super::metal::stop_submissions("texture detile or upload could not complete");
+            prev_first_mip
+        }
     }
 
     /// The entry of a texture view: `words` is the D3D12 SRV (or, with
@@ -337,6 +702,7 @@ impl MetalBackend {
         if unordered {
             super::metal_draw::note_write(r as usize, 5);
         }
+        self.maybe_refill_partial(r as usize);
         if let Some((_, e)) = self.views.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Some(*e);
         }
@@ -407,11 +773,8 @@ impl MetalBackend {
             [0, 0, 0],
         );
         blit.finish();
-        cb.commit();
-        cb.wait().ok()?;
-        let chunks = self.chunks();
-        chunks.residency().add(&[staging.handle()]);
-        chunks.residency().commit();
+        super::metal::submit_checked(&cb, &[], true, "partial texture upload").ok()?;
+        self.add_resident(&[staging.handle()]);
         if format == t.pixel {
             let id = staging.gpu_resource_id();
             if id == 0 {
@@ -553,16 +916,13 @@ impl MetalBackend {
             blit.copy_from_buffer_to_texture(&buffer, 0, 256, 256, [1, 1, 1], &texture, slice, 0, [0, 0, 0]);
         }
         blit.finish();
-        cb.commit();
-        cb.wait().ok()?;
+        super::metal::submit_checked(&cb, &[], true, "null texture upload").ok()?;
         let id = texture.gpu_resource_id();
         if id == 0 {
             fail("null texture id", None, words);
             return None;
         }
-        let chunks = self.chunks();
-        chunks.residency().add(&[texture.handle()]);
-        chunks.residency().commit();
+        self.add_resident(&[texture.handle()]);
         let entry = DescriptorEntry::texture(id, 0.0, 0);
         Some((texture.into_object(), entry))
     }
@@ -587,24 +947,42 @@ fn null_texture_shape(words: Option<&[u32]>, unordered: bool) -> (WMTTextureType
     (type_, slices, format)
 }
 
+fn mtl_view_group(p: u32) -> Option<u8> {
+    match p {
+        10..=14 => Some(1),
+        20..=34 => Some(2),
+        53..=94 => Some(3),
+        103..=115 => Some(4),
+        123..=125 => Some(5),
+        130 | 131 => Some(10),
+        132 | 133 => Some(11),
+        134 | 135 => Some(12),
+        140 | 141 => Some(13),
+        142 | 143 => Some(14),
+        150 | 151 => Some(15),
+        152 | 153 => Some(16),
+        _ => None,
+    }
+}
+
 /// The pixel format of a view in DXGI format `wanted` of texture `t`, as
 /// Metal allows it (a disallowed view is an assertion that kills the
 /// thread, not an error):
 /// - a depth texture: a stencil view for 8-bit integer / stencil formats,
 ///   else its own depth format (D3D12 reads depth as a colour format; a
 ///   depth view samples the same value in red);
-/// - a colour texture: `wanted` only if its texel or block size is the
-///   texture's (Metal's pixel format views), else its own format.
+/// - a colour texture: `wanted` only if its Metal pixel format is
+///   view-compatible with the backing texture's `t.pixel` (including
+///   stand-in targets whose `t.pixel` differs from `t.desc.format`), else
+///   `t.pixel`.
 pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
     if wanted == 0 {
         return t.pixel;
     }
     let own = format_props(crate::resource::pc_format(t.desc.format) as i32);
-    let want = format_props(crate::resource::pc_format(wanted) as i32);
-    let (Some(own), Some(want)) = (own, want) else { return t.pixel };
     // A depth texture by its Metal format (a typeless title format made a
     // depth one, `depth_pixel`): depth formats cast to nothing else.
-    if own.depth_stencil || is_depth_pixel(t.pixel.0) {
+    if own.is_some_and(|o| o.depth_stencil) || is_depth_pixel(t.pixel.0) {
         // R8_UINT (62), X24_TYPELESS_G8_UINT (47), X32_TYPELESS_G8X24_UINT (21)
         let stencil = matches!(wanted, 62 | 47 | 21);
         return match (stencil, t.pixel) {
@@ -612,14 +990,16 @@ pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
             _ => t.pixel,
         };
     }
-    if want.depth_stencil
-        || want.block_size_bytes != own.block_size_bytes
-        || want.block_width != own.block_width
-        || want.block_height != own.block_height
-    {
+    let Some(candidate) = pixel_format(wanted) else {
+        return t.pixel;
+    };
+    if candidate == t.pixel || is_depth_pixel(candidate.0) {
         return t.pixel;
     }
-    pixel_format(wanted).unwrap_or(t.pixel)
+    match (mtl_view_group(t.pixel.0), mtl_view_group(candidate.0)) {
+        (Some(a), Some(b)) if a == b => candidate,
+        _ => t.pixel,
+    }
 }
 
 /// The view type `wanted` if Metal allows it on `t` (a disallowed view type

@@ -58,7 +58,11 @@ enum Held {
 
 /// What a submission's lists recorded for Metal (`VICTORY_METAL`).
 #[cfg(windows)]
-type MetalOps = Vec<std::sync::Arc<crate::backend::metal::MetalOp>>;
+#[derive(Default)]
+struct MetalOps {
+    commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
+    textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
 #[cfg(not(windows))]
 type MetalOps = Vec<()>;
 
@@ -67,19 +71,40 @@ type MetalOps = Vec<()>;
 fn metal_ops(lists: &[This]) -> MetalOps {
     #[cfg(windows)]
     if crate::backend::metal::backend().is_some() {
-        return lists.iter().flat_map(|&l| crate::list::metal_commands(l)).collect();
+        let mut ops = MetalOps::default();
+        for &l in lists {
+            let commands = crate::list::metal_commands(l);
+            if !commands.is_empty() && crate::host::null_gpu()
+                && let Some(host) = crate::list::host_list(l)
+            {
+                host.metal_texture_inputs(&mut ops.textures);
+            }
+            ops.commands.extend(commands);
+        }
+        return ops;
     }
-    Vec::new()
+    Default::default()
 }
 
 /// Runs a submission's Metal ops (waited for before returning).
 #[allow(unused_variables)]
 fn run_metal(ops: &MetalOps) {
     #[cfg(windows)]
-    if !ops.is_empty()
+    if !ops.commands.is_empty()
         && let Some(m) = crate::backend::metal::backend()
     {
-        m.run(ops);
+        if m.submissions_stopped() {
+            return;
+        }
+        // Null D3D12 submissions skip deferred texture checks. Perform those
+        // checks after queue waits, before Metal samples the private copies.
+        for texture in &ops.textures {
+            if m.submissions_stopped() {
+                return;
+            }
+            texture.refresh();
+        }
+        m.run(&ops.commands);
     }
 }
 
@@ -223,7 +248,7 @@ fn submit_cut(this: This, lists: &[This]) {
             let n = parts.len();
             for (k, (waits, taken, order)) in parts.into_iter().enumerate() {
                 held.extend(waits.into_iter().map(Held::Value));
-                let ops = if k + 1 == n { rest_ops.take().unwrap_or_default() } else { Vec::new() };
+                let ops = if k + 1 == n { rest_ops.take().unwrap_or_default() } else { Default::default() };
                 held.push(Held::Run(taken, order, ops));
             }
         }
@@ -833,6 +858,10 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    if crate::backend::metal::backend().is_some_and(|m| m.submissions_stopped()) {
+        return 0x887a0005u32 as i32; // DXGI_ERROR_DEVICE_REMOVED
+    }
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
@@ -937,6 +966,19 @@ extern "system" fn present(
         // And the largest targets Metal drew into since the last capture.
         let mut drawn = std::mem::take(&mut *crate::backend::metal_draw::DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
         drawn.sort_by_key(|&(_, area)| std::cmp::Reverse(area));
+        #[cfg(feature = "diagnostics")]
+        if std::env::var("VICTORY_METAL_SCENE_FRAME").ok().and_then(|v| v.parse().ok()) == Some(frame) {
+            let mut seen = std::collections::HashMap::new();
+            for &(r, _) in &drawn {
+                let Some(t) = m.texture_for(r as This) else { continue };
+                let (w, h, f) = (t.texture.width(), t.texture.height(), t.pixel.0);
+                if w < 480 || h < 240 || t.desc.sample_count > 1 { continue; }
+                let count = seen.entry((w, h, f)).or_insert(0);
+                if *count >= 2 { continue; }
+                *count += 1;
+                m.capture(r as This, &format!("scene{frame:06}-{w}x{h}-fmt{f}-{r:x}"));
+            }
+        }
         for (k, (r, _)) in drawn.into_iter().take(6).enumerate() {
             m.capture(r as This, &format!("frame{frame:06}-rt{k}"));
         }
@@ -962,6 +1004,10 @@ extern "system" fn present(
         && m.present_metal(unsafe { *plane.resources })
     {
         return S_OK;
+    }
+    #[cfg(windows)]
+    if crate::backend::metal::backend().is_some_and(|m| m.submissions_stopped()) {
+        return 0x887a0005u32 as i32; // Do not fall back to D3D12 after a Metal stop.
     }
     #[cfg(windows)]
     if planes > 0

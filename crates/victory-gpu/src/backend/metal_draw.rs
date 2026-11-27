@@ -47,6 +47,7 @@ pub(crate) static DRAWS_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomi
 
 /// A title graphics pipeline made on Metal.
 pub(crate) struct MetalGraphics {
+    pub(crate) cost_ns: std::sync::atomic::AtomicU64,
     /// The title pipeline's shaders, for reports.
     pub(crate) name: String,
     pub(crate) pso: RenderPipeline,
@@ -166,17 +167,26 @@ impl MetalBackend {
             let vs_stage = p.stages.iter().find(|s| s.shader.stage == "vertex").ok_or("no vertex stage for rectangles")?;
             let ps_stage = p.stages.iter().find(|s| s.shader.stage == "pixel");
             let vs_host = &vs_stage.translated().host;
-            let ps_host = ps_stage.map(|s| &s.translated().host);
+            let ps_host = match ps_stage {
+                Some(s) => Some(&s.shader.rect_translated().ok_or("pixel shader does not translate")?.host),
+                None => None,
+            };
             let gs_dxil = victory_shader::emit::rect_list_gs(&vs_host.dxil, ps_host.map(|h| &h.dxil[..]))
                 .map_err(|e| format!("rect_list_gs: {e}"))?;
             let elements = Self::vertex_inputs(input, p, &mut vertex_slots)?;
-            let v = convert_geometry_vertex(&vs_host.dxil, &root_params(vs_host), &static_samplers(vs_host), &elements)
+            let vs_params = root_params(vs_host);
+            let vs_samplers = static_samplers(vs_host);
+            let mut v = convert_geometry_vertex(&vs_host.dxil, &vs_params, &vs_samplers, &elements)
                 .map_err(|e| e.to_string())?;
+            self.bind_static_samplers(&mut v.shader.shader.top_level, vs_params.len(), &vs_samplers)?;
             let g = convert_geometry(&gs_dxil, &[], &[], v.vertex_output_size).map_err(|e| e.to_string())?;
             let olib = self.device.library(&v.shader.shader.metallib).map_err(|e| e.to_string())?;
             let sin = self.device.library(&v.shader.stage_in).map_err(|e| e.to_string())?;
             let mlib = self.device.library(&g.shader.metallib).map_err(|e| e.to_string())?;
-            let f = ps_host.map(|h| convert_cached(h, Stage::Fragment)).transpose()?;
+            let mut f = ps_host.map(|h| convert_cached(h, Stage::Fragment)).transpose()?;
+            if let (Some(h), Some(c)) = (ps_host, &mut f) {
+                self.bind_static_samplers(&mut c.top_level, root_params(h).len(), &static_samplers(h))?;
+            }
             let flib = f.as_ref().map(|c| self.device.library(&c.metallib).map_err(|e| e.to_string())).transpose()?;
             for s in &p.stages {
                 match s.shader.stage {
@@ -205,23 +215,29 @@ impl MetalBackend {
                     other => return Err(format!("{other} stage")),
                 };
                 let host = &s.translated().host;
-                let c = if stage == Stage::Vertex && !input.elements.is_empty() {
+                let params = root_params(host);
+                let samplers = static_samplers(host);
+                let mut c = if stage == Stage::Vertex && !input.elements.is_empty() {
                     let elements = Self::vertex_inputs(input, p, &mut vertex_slots)?;
                     // Kept with this graphics pipeline's layout, never in the
                     // cache for ordinary vertex shaders.
-                    let compiled = convert_vertex_with_stage_in(&host.dxil, &root_params(host), &static_samplers(host), &elements)
+                    let compiled = convert_vertex_with_stage_in(&host.dxil, &params, &samplers, &elements)
                         .map_err(|e| e.to_string())?;
                     stage_in = Some(self.device.library(&compiled.stage_in).map_err(|e| e.to_string())?);
                     compiled.shader
                 } else {
                     convert_cached(host, stage)?
                 };
+                self.bind_static_samplers(&mut c.top_level, params.len(), &samplers)?;
                 let lib = self.device.library(&c.metallib).map_err(|e| e.to_string())?;
                 stages.push((c.top_level.clone(), bind));
                 match bind {
                     STAGE_VERTEX => vertex = Some((lib, c.entry)),
                     STAGE_FRAGMENT => fragment = Some((lib, c.entry)),
                     _ => {
+                        if c.threadgroup.contains(&0) {
+                            tracing::warn!(pipeline = %p.name, threadgroup = ?c.threadgroup, "Metal: mesh shader has zero threadgroup dimension");
+                        }
                         mesh_threads = c.threadgroup.map(|t| u64::from(t.max(1)));
                         mesh = Some((lib, c.entry));
                     }
@@ -299,6 +315,7 @@ impl MetalBackend {
             .ok_or("no depth-stencil state")?;
         let r = &m.raster;
         Ok(MetalGraphics {
+            cost_ns: Default::default(),
             name: p.name.clone(),
             pso,
             dss,
@@ -513,15 +530,18 @@ pub(crate) enum DrawKind {
     Indirect {
         records: Buffer,
         records_offset: u64,
+        records_va: u64,
         stride: u32,
         max: u32,
         count: Option<(Buffer, u64)>,
+        count_va: Option<u64>,
         index: Option<(Buffer, u64, u8, u32)>,
     },
 }
 
 /// One draw as recorded into a title list.
 pub(crate) struct MetalDraw {
+    pub(crate) trace_inputs: Vec<usize>,
     pub(crate) pso: Arc<MetalGraphics>,
     pub(crate) targets: Arc<Targets>,
     pub(crate) stages: Vec<StageBind>,
@@ -662,7 +682,30 @@ pub(crate) fn draw_params(kind: &DrawKind) -> ([u32; 5], u16) {
 /// `VICTORY_METAL_CAPTURE_DIR` (`VICTORY_METAL_CAPTURE_EVERY`, 0: never).
 pub(crate) fn capture_every() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(|| std::env::var("VICTORY_METAL_CAPTURE_START").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+    if start != 0 && crate::frame::current() < start {
+        return 0;
+    }
     *N.get_or_init(|| std::env::var("VICTORY_METAL_CAPTURE_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+pub(crate) fn trace_scene() -> bool {
+    static FRAMES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    FRAMES.get_or_init(|| std::env::var("VICTORY_METAL_TRACE_FRAMES").unwrap_or_default()
+        .split(',').filter_map(|s| s.parse().ok()).collect()).contains(&crate::frame::current())
+}
+
+pub(crate) fn trace_pipeline(name: &str) -> bool {
+    static FILTER: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let filters = FILTER.get_or_init(|| std::env::var("VICTORY_METAL_TRACE_PSO").unwrap_or_default()
+        .split(',').filter(|s| !s.is_empty()).map(str::to_owned).collect());
+    filters.is_empty() || filters.iter().any(|s| name.contains(s))
+}
+
+pub(crate) fn filtered_trace() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_METAL_TRACE_PSO").is_ok_and(|s| !s.is_empty()))
 }
 
 impl MetalBackend {
@@ -701,8 +744,7 @@ impl MetalBackend {
         {
             blit.copy_from_texture_to_buffer(&t.texture, 0, 0, [0, 0, 0], [u64::from(w), u64::from(h), 1], &buffer, 0, row, row * h);
             blit.finish();
-            cb.commit();
-            if cb.wait().is_ok() {
+            if super::metal::submit_checked(&cb, &[], true, "capture readback").is_ok() {
                 // SAFETY: the GPU wrote `bytes` bytes there.
                 let data = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), bytes) };
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();

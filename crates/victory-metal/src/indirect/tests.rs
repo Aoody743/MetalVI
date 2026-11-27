@@ -60,6 +60,28 @@ fn target(device: &Device) -> Texture {
         .unwrap()
 }
 
+#[test]
+#[ignore = "requires Metal"]
+fn bounded_title_mesh_records() {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(4).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    let words = [4u32,1,1, 65536,1,1, 1,4,1, 1,1,2, 65535,1,1];
+    let src = Shared::new(&device, &words);
+    let out = Shared::new(&device, &[0xFEu32;25]);
+    let cb = queue.command_buffer().unwrap();
+    let batch = translator.encode(&device, &cb, &IndirectSource {
+        kind: IndirectKind::TitleMesh1D, records: (&src.0, 0), stride: 12, max_count: 5, count: None,
+    }).unwrap().unwrap();
+    let mut blit = cb.blit_encoder().unwrap();
+    blit.copy_buffer(&batch.output, 0, &out.0, 0, 100);
+    blit.finish();
+    cb.commit();
+    cb.wait().unwrap();
+    assert_eq!(out.words(), [[4,1,1,0,0],[0;5],[0;5],[0;5],[65535,1,1,0,0]].as_flattened());
+}
+
 fn color(texture: &Texture) -> ColorAttachment<'_> {
     ColorAttachment {
         texture,
@@ -615,16 +637,184 @@ fn wine_gpu_readback() {
             .zip(&reference)
             .filter(|(a, b)| a != b)
             .count();
-        assert_eq!(mismatched, 0, "MSC indirect and direct draw pixels differ");
-        println!(
-            "MSC indirect and direct draws matched all {} pixels; centers {:?}",
-            actual.len(),
-            [
-                at(&actual, 8),
-                at(&actual, 24),
-                at(&actual, 40),
-                at(&actual, 56)
-            ]
-        );
+    assert_eq!(mismatched, 0, "MSC indirect and direct draw pixels differ");
+    println!(
+        "MSC indirect and direct draws matched all {} pixels; centers {:?}",
+        actual.len(),
+        [
+            at(&actual, 8),
+            at(&actual, 24),
+            at(&actual, 40),
+            at(&actual, 56)
+        ]
+    );
+    }
+}
+
+#[test]
+fn clamps_oversized_dispatch_groups() {
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    // Record 0: normal; Record 1: X > 65535 -> clamped to 65535;
+    // Record 2: product > 1 << 20 -> zeroed; Record 3: product == 1 << 20 -> preserved.
+    let src = Shared::new(
+        &device,
+        &[
+            4_u32, 3, 2,
+            70_000, 1, 1,
+            2048, 1024, 1,
+            1024, 1024, 1,
+        ],
+    );
+    let readback = Shared::new(&device, &[u32::MAX; 4 * 5]);
+    let cb = queue.command_buffer().unwrap();
+    let batch = translator
+        .encode(
+            &device,
+            &cb,
+            &IndirectSource {
+                kind: IndirectKind::Dispatch,
+                records: (&src.0, 0),
+                stride: 12,
+                max_count: 4,
+                count: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let mut blit = cb.blit_encoder().unwrap();
+    blit.copy_buffer(&batch.output, 0, &readback.0, 0, 4 * RECORD_BYTES);
+    blit.finish();
+    cb.commit();
+    cb.wait().unwrap();
+    let expected = [
+        4, 3, 2, 0, 0,
+        65535, 1, 1, 0, 0,
+        0, 0, 0, 0, 0,
+        1024, 1024, 1, 0, 0,
+    ];
+    assert_eq!(readback.words(), &expected);
+}
+
+// Only translate two constant records and blit 40 bytes. Never execute the
+// translated draws/dispatches, even if the translator itself regresses.
+fn check_work_clamp<const N: usize>(kind: IndirectKind, input: [u32; N], expected: [u32; 10]) {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    let counter = ClampCounter::new(&device).unwrap();
+    let src = Shared::new(&device, &input);
+    let dst = Shared::new(&device, &[u32::MAX; 10]);
+    let cb = queue.command_buffer().unwrap();
+    let source = IndirectSource { kind, records: (&src.0, 0), stride: (N * 2) as u32, max_count: 2, count: None };
+    let batch = translator.encode_bounded(&device, &cb, &source, &counter).unwrap().unwrap();
+    let mut blit = cb.blit_encoder().unwrap();
+    blit.copy_buffer(&batch.output, 0, &dst.0, 0, dst.0.len);
+    blit.finish();
+    cb.commit();
+    cb.wait().unwrap();
+    assert_eq!(dst.words(), expected);
+    assert_eq!(src.words(), input);
+    assert_eq!(unsafe { counter.completed_count() }, 1);
+}
+
+#[test]
+fn counted_dispatch_clamp() {
+    check_work_clamp(IndirectKind::Dispatch, [9, 8, 2, 0, 2, 2, 1, 0], [9, 3, 1, 0, 0, 2, 2, 1, 0, 0]);
+}
+
+#[test]
+fn counted_draw_clamp() {
+    check_work_clamp(IndirectKind::Draw, [300, 4, 7, 9, 3, 1, 0, 2], [128, 4, 7, 9, 0, 3, 1, 0, 2, 0]);
+}
+
+#[test]
+fn counted_index_clamp() {
+    check_work_clamp(IndirectKind::DrawIndexed { index_capacity: 10, index_type: 1 },
+        [18, 2, 3, u32::MAX, 4, 3, 1, 0, 0, 0], [7, 2, 3, u32::MAX, 4, 3, 1, 0, 0, 0]);
+}
+
+#[test]
+fn counted_mesh_clamp() {
+    check_work_clamp(IndirectKind::TitleMesh1D, [48, 1, 1, 4, 1, 1], [32, 1, 1, 0, 0, 4, 1, 1, 0, 0]);
+}
+
+#[test]
+fn counted_rectangle_clamp() {
+    let kind = IndirectKind::Rectangles(crate::msc::GeometryConfig {
+        vertex_output_size: 32, max_input_primitives: 32, max_payload_size: 16256,
+    });
+    check_work_clamp(kind, [300, 4, 7, 9, 3, 1, 0, 2], [1, 4, 1, 0, 0, 1, 1, 1, 0, 0]);
+}
+
+#[test]
+fn translates_and_clamps_indirect_rectangles() {
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    let cfg = crate::msc::GeometryConfig {
+        vertex_output_size: 32,
+        max_input_primitives: 32,
+        max_payload_size: 16256,
+    };
+    let stride = cfg.object_vertex_stride().unwrap();
+    assert_eq!(stride, 255);
+    let src = Shared::new(
+        &device,
+        &[
+            9_u32, 2, 3, 1,
+            2, 5, 0, 0,
+            0x00ff_ffff, 100, 0, 0,
+            65536 * stride, 1, 0, 0,
+        ],
+    );
+    let out_readback = Shared::new(&device, &[u32::MAX; 4 * 5]);
+    let params_readback = Shared::new(&device, &[u32::MAX; 4 * 12]);
+    let cb = queue.command_buffer().unwrap();
+    let batch = translator
+        .encode(
+            &device,
+            &cb,
+            &IndirectSource {
+                kind: IndirectKind::Rectangles(cfg),
+                records: (&src.0, 0),
+                stride: 16,
+                max_count: 4,
+                count: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let mut blit = cb.blit_encoder().unwrap();
+    blit.copy_buffer(&batch.output, 0, &out_readback.0, 0, 4 * RECORD_BYTES);
+    blit.copy_buffer(batch.draw_params.as_ref().unwrap(), 0, &params_readback.0, 0, 4 * 48);
+    blit.finish();
+    cb.commit();
+    cb.wait().unwrap();
+
+    let expected_out = [
+        1, 2, 1, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0,
+    ];
+    assert_eq!(out_readback.words(), &expected_out);
+
+    let params = params_readback.words();
+    assert_eq!(
+        &params[0..12],
+        &[
+            9, 2, 3, 1, 0, 0,
+            0x0303_0000,
+            cfg.max_input_primitives | (stride << 16),
+            cfg.max_input_primitives | (1 << 16),
+            (stride / 3) | (3 << 16),
+            0, 0,
+        ]
+    );
+    for rec in 1..4 {
+        assert_eq!(&params[rec * 12..rec * 12 + 2], &[0, 0]);
     }
 }

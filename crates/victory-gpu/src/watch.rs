@@ -987,32 +987,55 @@ pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
     Remapping(RemapLock::Range { _shards: shards, _gate: gate, at, len })
 }
 
+thread_local! {
+    /// Nesting depth of [`Reading`] guards held by this thread. Used to avoid
+    /// self-deadlock on non-reentrant `std::sync::RwLock::read()` when a
+    /// guarded in-place reader (like `Staging::refresh_now`) synchronously
+    /// calls into another in-place reader (like `metal_texture::fill`).
+    static READING_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// What a read of title memory in place holds ([`title_memory_reading`]).
 pub struct Reading {
     _shards: SmallVec<[RwLockReadGuard<'static, ()>; 4]>,
-    _gate: RwLockReadGuard<'static, ()>,
+    _gate: Option<RwLockReadGuard<'static, ()>>,
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        READING_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
 }
 
 /// For reading title memory in place: until what it returns is dropped,
 /// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
+/// Re-entrant on the same thread when range remapping is off; never hold
+/// across anything that maps title memory.
 pub fn title_memory_reading() -> Reading {
     title_memory_reading_range(0, usize::MAX)
 }
 
 /// As [`title_memory_reading`], for just the supplied address range.
 pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    if !range_remap() && READING_DEPTH.with(|d| d.get() > 0) {
+        READING_DEPTH.with(|d| d.set(d.get() + 1));
+        return Reading { _shards: SmallVec::new(), _gate: None };
+    }
     let gate = MAPPING.read().unwrap_or_else(|e| e.into_inner());
     let mut shards = SmallVec::new();
     if range_remap() {
         shards.extend(mapping_shards(at, len).map(|i| MAP_SHARDS[i].read().unwrap_or_else(|e| e.into_inner())));
     }
-    Reading { _shards: shards, _gate: gate }
+    READING_DEPTH.with(|d| d.set(d.get() + 1));
+    Reading { _shards: shards, _gate: Some(gate) }
 }
 
 /// [`title_memory_reading_range`] only if every lock can be taken without waiting.
 pub(crate) fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    if !range_remap() && READING_DEPTH.with(|d| d.get() > 0) {
+        READING_DEPTH.with(|d| d.set(d.get() + 1));
+        return Some(Reading { _shards: SmallVec::new(), _gate: None });
+    }
     fn ready(lock: &RwLock<()>) -> Option<RwLockReadGuard<'_, ()>> {
         match lock.try_read() {
             Ok(guard) => Some(guard),
@@ -1027,7 +1050,8 @@ pub(crate) fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading>
             shards.push(ready(&MAP_SHARDS[i])?);
         }
     }
-    Some(Reading { _shards: shards, _gate: gate })
+    READING_DEPTH.with(|d| d.set(d.get() + 1));
+    Some(Reading { _shards: shards, _gate: Some(gate) })
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it

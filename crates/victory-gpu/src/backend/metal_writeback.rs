@@ -639,10 +639,10 @@ impl MetalBackend {
     /// can write (UNORDERED) written back into title memory, all their
     /// subresources (F44). Textures the CPU fills are never written back:
     /// that would put a stale copy over the title's data.
-    pub(crate) fn writeback_all(&self, cb: &CommandBuffer) {
+    pub(crate) fn writeback_all(&self, cb: &CommandBuffer) -> Result<()> {
         const UNORDERED: u32 = 4;
         if !writeback_enabled() {
-            return;
+            return Ok(());
         }
         let candidates: Vec<(usize, std::sync::Arc<MetalTexture>)> = self
             .textures
@@ -653,19 +653,18 @@ impl MetalBackend {
             .filter(|(_, t)| t.desc.flags & UNORDERED != 0 && wants_writeback(&t.desc))
             .collect();
         for (key, tex) in candidates {
-            let Some((memory, _)) = crate::resource::texture_memory(key as crate::object::This) else { continue };
+            let (memory, _) = crate::resource::texture_memory(key as crate::object::This)
+                .ok_or_else(|| Error(format!("Metal writeback: missing backing for {key:#x}")))?;
             let subresources: Vec<(u32, u32)> =
                 (0..tex.slices.max(1)).flat_map(|s| (0..tex.mips.max(1)).map(move |m| (s, m))).collect();
             let resource = WritebackResource { texture: &tex, va: memory as u64, subresources: &subresources };
             // SAFETY: the texture is held (Arc) through the submission, which
             // is waited for before the title's fences are signalled; remaps
             // keep wrappers showing their old pages (re-wrapping is off).
-            if let Err(e) = unsafe { self.writeback(cb, &resource) } {
-                static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                    tracing::info!(error = %e, "Metal: a texture write-back left out");
-                }
+            if !unsafe { self.writeback(cb, &resource) }? {
+                return Err(Error(format!("Metal writeback: requested texture {key:#x} was not encoded")));
             }
         }
+        Ok(())
     }
 }

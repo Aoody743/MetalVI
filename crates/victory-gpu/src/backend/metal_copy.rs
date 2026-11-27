@@ -219,6 +219,9 @@ pub fn plan_texture_copy(
     let (Some(sc), Some(dc)) = (mtl_fmt_class(src_mtl_fmt), mtl_fmt_class(dst_mtl_fmt)) else {
         return TexCopyPlan::Unsupported("unknown Metal pixel format");
     };
+    if src_mtl_fmt == 260 && dst_mtl_fmt == 252 && src_samples.max(1) == 1 {
+        return TexCopyPlan::StagingBounce { block_w: 1, block_h: 1, block_bytes: 4 };
+    }
     if sc.family == 8 || dc.family == 8 {
         return TexCopyPlan::Unsupported("mismatched depth/stencil pixel formats");
     }
@@ -501,7 +504,8 @@ pub(crate) fn encode_texture_to_texture(
     dst_level: u32,
     dst_origin: [u64; 3],
     whole_resource: bool,
-    staging: Option<(&victory_metal::Buffer, u64)>,
+    device: &victory_metal::Device,
+    scratch: &mut Option<(victory_metal::Buffer, u64)>,
 ) -> victory_metal::Result<()> {
     let src_fmt = src.pixel_format().0;
     let dst_fmt = dst.pixel_format().0;
@@ -566,31 +570,43 @@ pub(crate) fn encode_texture_to_texture(
             );
             blit.finish();
         }
-        TexCopyPlan::StagingBounce { block_w, block_h, block_bytes } => {
-            let (buf, off) = staging.ok_or_else(|| {
-                victory_metal::Error("BC <-> integer texture copy requires staging buffer".into())
-            })?;
+        TexCopyPlan::StagingBounce { block_bytes, .. } => {
             let sc = mtl_fmt_class(src_fmt).ok_or_else(|| victory_metal::Error("src fmt".into()))?;
             let dc = mtl_fmt_class(dst_fmt).ok_or_else(|| victory_metal::Error("dst fmt".into()))?;
             // Src texel extent in `src_size` is in src texture texels; dst texel extent scales by block ratio.
             let blocks_x = src_size[0].div_ceil(u64::from(sc.block_w));
             let blocks_y = src_size[1].div_ceil(u64::from(sc.block_h));
-            let row_bytes = u32::try_from(blocks_x * u64::from(block_bytes))
+            let row_bytes = u32::try_from((blocks_x * u64::from(block_bytes)).next_multiple_of(256))
                 .map_err(|_| victory_metal::Error("row_bytes overflow".into()))?;
             let img_bytes = u32::try_from(u64::from(row_bytes) * blocks_y)
                 .map_err(|_| victory_metal::Error("img_bytes overflow".into()))?;
-            let dst_size = [
-                blocks_x * u64::from(dc.block_w),
-                blocks_y * u64::from(dc.block_h),
-                src_size[2],
-            ];
-            let _ = (block_w, block_h);
+            let mut dst_size = [blocks_x, blocks_y, src_size[2]];
+            for (axis, (extent, block)) in [(dst.width(), dc.block_w), (dst.height(), dc.block_h)].into_iter().enumerate() {
+                let remaining = (extent >> dst_level).max(1).saturating_sub(dst_origin[axis]);
+                if dst_size[axis] > remaining.div_ceil(u64::from(block)) {
+                    return Err(victory_metal::Error("BC copy outside destination mip".into()));
+                }
+                dst_size[axis] = (dst_size[axis] * u64::from(block)).min(remaining);
+            }
+            let bytes = u64::from(img_bytes).checked_mul(src_size[2])
+                .ok_or_else(|| victory_metal::Error("BC staging size overflow".into()))?;
+            if scratch.as_ref().is_none_or(|(_, capacity)| *capacity < bytes) {
+                *scratch = Some((device.private_buffer(bytes)?, bytes));
+            }
+            let (buf, _) = scratch.as_ref().unwrap();
             let mut blit = cb.blit_encoder()?;
-            blit.copy_from_texture_to_buffer(
-                src, src_slice, src_level, src_origin, src_size, buf, off, row_bytes, img_bytes,
-            );
+            if src_fmt == 260 && dst_fmt == 252 {
+                blit.copy_from_texture_to_buffer_with_options(
+                    src, src_slice, src_level.try_into().map_err(|_| victory_metal::Error("depth mip out of range".into()))?, src_origin, src_size, buf, 0, row_bytes, img_bytes,
+                    victory_metal::blit::BLIT_OPTION_DEPTH,
+                );
+            } else {
+                blit.copy_from_texture_to_buffer(
+                    src, src_slice, src_level, src_origin, src_size, buf, 0, row_bytes, img_bytes,
+                );
+            }
             blit.copy_from_buffer_to_texture(
-                buf, off, row_bytes, img_bytes, dst_size, dst, dst_slice, dst_level, dst_origin,
+                buf, 0, row_bytes, img_bytes, dst_size, dst, dst_slice, dst_level, dst_origin,
             );
             blit.finish();
         }

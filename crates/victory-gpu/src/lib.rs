@@ -65,6 +65,8 @@ mod watch;
 pub use host::on_failure;
 #[cfg(windows)]
 pub use backend::metal_warm;
+#[cfg(windows)]
+pub use backend::metal::set_physical_alias;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn present_count() -> u64 {

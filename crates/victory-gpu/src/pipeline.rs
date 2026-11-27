@@ -65,6 +65,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// The pixel translation behind the Metal rectangle stage (primitive
+    /// id as a flat varying); the plain one when it reads no primitive id.
+    #[cfg(windows)]
+    rect_translated: OnceLock<Option<Translated>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -115,6 +119,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                rect_translated: OnceLock::new(),
             })
         })
         .clone()
@@ -133,6 +139,8 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         translated: OnceLock::new(),
+        #[cfg(windows)]
+        rect_translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -191,6 +199,59 @@ impl Shader {
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// [`Self::translated`] for a pixel shader behind the Metal rectangle
+    /// stage, which reads its primitive id from a flat varying.
+    pub(crate) fn rect_translated(&self) -> Option<&Translated> {
+        let plain = self.translated()?;
+        if self.stage != "pixel" {
+            return Some(plain);
+        }
+        self.rect_translated
+            .get_or_init(|| {
+                let old = victory_shader::emit::set_rect_primitive_varying(true);
+                let done = translate(&self.container);
+                victory_shader::emit::set_rect_primitive_varying(old);
+                match done {
+                    Ok(t) if t.host.dxil != plain.host.dxil => {
+                        tracing::info!(hash = %self.hash, "rectangle pixel shader reads its primitive id as a varying");
+                        Some(t)
+                    }
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(hash = %self.hash, error = %e, "rectangle pixel variant does not translate");
+                        None
+                    }
+                }
+            })
+            .as_ref()
+            .or(Some(plain))
+    }
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// This mesh shader with only the user outputs `keep` names (what the
+    /// pixel shader behind reads), as a shader of its own: for a pipeline
+    /// over Metal's mesh output limit. `None` if it does not translate so.
+    pub(crate) fn pruned_mesh(&self, keep: Vec<(String, u32)>) -> Option<Arc<Shader>> {
+        let old = victory_shader::emit::set_mesh_outputs_keep(Some(keep));
+        let done = translate(&self.container);
+        victory_shader::emit::set_mesh_outputs_keep(old);
+        let t = done.map_err(|e| tracing::warn!(hash = %self.hash, error = %e, "pruned mesh variant does not translate")).ok()?;
+        let translated = OnceLock::new();
+        let _ = translated.set(Some(t));
+        Some(Arc::new(Shader {
+            stage: self.stage,
+            hash: format!("{}p", self.hash),
+            container: self.container.clone(),
+            translated,
+            rect_translated: OnceLock::new(),
+        }))
     }
 }
 

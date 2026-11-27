@@ -222,6 +222,10 @@ impl Device {
 
     /// Creates a Metal-owned shared buffer initialized with a copy of `bytes`.
     pub fn shared_buffer(&self, bytes: &[u8]) -> Result<Buffer> {
+        self.shared_buffer_mapped(bytes).map(|(buffer, _)| buffer)
+    }
+
+    fn shared_buffer_mapped(&self, bytes: &[u8]) -> Result<(Buffer, *mut u8)> {
         let len = bytes.len() as u64;
         let mut info = sys::WMTBufferInfo {
             length: len,
@@ -237,7 +241,7 @@ impl Device {
         }
         // SAFETY: the owned buffer has len bytes and cannot alias the input slice.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), info.memory.ptr.cast(), bytes.len()) };
-        Ok(Buffer { object, gpu_address: info.gpu_address, len })
+        Ok((Buffer { object, gpu_address: info.gpu_address, len }, info.memory.ptr.cast()))
     }
 
     /// A compute pipeline from MSL source (runtime compiled: tests and our
@@ -358,7 +362,7 @@ impl Queue {
         // SAFETY: a live queue.
         let cb = Object::retain(unsafe { sys::MTLCommandQueue_commandBuffer(self.0.handle()) })
             .ok_or(Error("commandBuffer".into()))?;
-        Ok(CommandBuffer(cb))
+        Ok(CommandBuffer(cb, Default::default()))
     }
 }
 
@@ -380,9 +384,27 @@ pub enum Compute<'a> {
     Barrier,
 }
 
-pub struct CommandBuffer(Object);
+#[derive(Clone)]
+pub struct CommandBuffer(Object, std::sync::Arc<std::sync::Mutex<EncodedWork>>);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EncodedWork {
+    pub groups: u64,
+    pub draw_inputs: u64,
+    pub attachment_samples: u64,
+    pub resolve_pixels: u64,
+    pub blit_bytes: u64,
+    pub blit_texels: u64,
+}
+
+fn volume(dims: [u64; 3]) -> u64 {
+    dims.into_iter().fold(1, u64::saturating_mul)
+}
 
 impl CommandBuffer {
+    pub fn encoded_work(&self) -> EncodedWork {
+        *self.1.lock().unwrap_or_else(|e| e.into_inner())
+    }
     pub fn handle(&self) -> obj_handle_t {
         self.0.handle()
     }
@@ -390,6 +412,27 @@ impl CommandBuffer {
     /// Encodes a compute pass: the steps become winemetal's command chain
     /// (built here, read by the unix side during the call).
     pub fn compute(&self, steps: &[Compute<'_>]) -> Result<()> {
+        let mut threads = [1; 3];
+        let mut total = 0u64;
+        for step in steps {
+            let groups = match *step {
+                Compute::Pipeline { threads_per_group, .. } => { threads = threads_per_group; continue; }
+                Compute::Dispatch { groups } => volume(groups),
+                Compute::DispatchThreads { threads: grid } => {
+                    if threads.contains(&0) { u64::MAX } else {
+                        volume(std::array::from_fn(|i| grid[i].div_ceil(threads[i])))
+                    }
+                }
+                // Runtime consumers must use IndirectTranslator::encode_bounded.
+                Compute::DispatchIndirect { .. } => indirect::GROUPS_PER_RECORD.into(),
+                _ => continue,
+            };
+            total = total.saturating_add(groups);
+        }
+        {
+            let mut work = self.1.lock().unwrap_or_else(|e| e.into_inner());
+            work.groups = work.groups.saturating_add(total);
+        }
         let _pool = Pool::new();
         // SAFETY: a live command buffer; the encoder is autoreleased.
         let encoder = unsafe { sys::MTLCommandBuffer_computeCommandEncoder(self.handle(), false) };
@@ -476,6 +519,19 @@ impl CommandBuffer {
     }
 
     /// Waits for the GPU; an error if the command buffer did not complete.
+    /// How long the GPU ran this (completed) command buffer, in nanoseconds
+    /// (`GPUEndTime - GPUStartTime`); 0 if unknown.
+    pub fn gpu_time_ns(&self) -> u64 {
+        // SAFETY: a live command buffer; the properties read its timestamps.
+        let (start, end) = unsafe {
+            (
+                sys::MTLCommandBuffer_property(self.handle(), sys::WMTCommandBufferProperty::WMTCommandBufferPropertyGPUStartTime),
+                sys::MTLCommandBuffer_property(self.handle(), sys::WMTCommandBufferProperty::WMTCommandBufferPropertyGPUEndTime),
+            )
+        };
+        end.saturating_sub(start)
+    }
+
     pub fn wait(&self) -> Result<()> {
         let _pool = Pool::new();
         // SAFETY: a live, committed command buffer.

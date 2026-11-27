@@ -57,6 +57,9 @@ impl MetalBackend {
     /// False if it could not (the caller may present the D3D12 way).
     pub(crate) fn present_metal(&self, resource: This) -> bool {
         static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
+        if self.submissions_stopped() {
+            return false;
+        }
         let Some(source) = self.texture_for(resource) else { return fell_back("no Metal texture for the presented resource") };
         let _pool = victory_metal::Pool::new();
         let mut guard = PRESENTER.lock().unwrap_or_else(|e| e.into_inner());
@@ -100,8 +103,7 @@ impl MetalBackend {
                 match conv.draw(&cb, &source.texture, dxgi, &target, Default::default()) {
                     Ok(()) => {
                         cb.present(&drawable);
-                        cb.commit();
-                        return true;
+                        return super::metal::submit_checked(&cb, &[], true, "present conversion").is_ok();
                     }
                     Err(e) => warn_once("colour conversion refused the source, plain blit instead", &e),
                 }
@@ -158,8 +160,7 @@ impl MetalBackend {
             return fell_back("the blit pass did not encode");
         }
         cb.present(&drawable);
-        cb.commit();
-        true
+        super::metal::submit_checked(&cb, &[], true, "present blit").is_ok()
     }
 }
 
