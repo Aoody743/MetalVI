@@ -100,6 +100,8 @@ mod shader;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(test)]
+mod shader_gaps_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -404,14 +406,16 @@ pub fn emit(
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let st = structure::structure(&p).map_err(|e| if why { eprintln!("WAVE64-FORM structure: {e}") }).ok()?;
+                let io = io::raise(&p, native).map_err(|e| if why { eprintln!("WAVE64-FORM io: {e}") }).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .map_err(|e| if why { eprintln!("WAVE64-FORM resources: {e}") })
+                    .ok()?;
                 Some((p, st, io, res))
             })
         };
         let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
+            ("without early-outs", form(ir::without_early_outs(p, &never_taken(st)))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
         for (name, f) in &forms {
@@ -544,6 +548,14 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Per block: whether no lane reaching it takes its closing branch ([`ir::without_early_outs`]).
+fn never_taken(st: &structure::Structured) -> Vec<bool> {
+    st.exits
+        .iter()
+        .map(|e| matches!(e, structure::LaneExit::Branch { when, .. } if *when == structure::Bool::FALSE))
+        .collect()
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

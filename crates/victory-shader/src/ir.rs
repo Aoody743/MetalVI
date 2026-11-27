@@ -633,7 +633,15 @@ fn loop_beyond(p: &Program, first: usize, stop: Option<usize>) -> bool {
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses. Not where a
 /// loop follows ([`loop_beyond`]). `None` if the program has no such branch.
-pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
+///
+/// `never`: per block, whether the structure of `p` shows that no lane reaching it takes its
+/// closing branch (`when` false: an `s_cbranch_execz` behind `s_and_saveexec` with the launch
+/// mask, which no wave past the early-out has empty). Those go too, where an early-out goes:
+/// the lanes that would have left reach them with EXEC clear and would take them, each on its
+/// own, which makes the scalars set on the path they skip (an immediate sampler) a different
+/// value per lane where the paths join. Leaving them out changes nothing for a wave that has a
+/// lane left; one that has none ended at the early-out on the console. Not over a loop either.
+pub(crate) fn without_early_outs(p: &Program, never: &[bool]) -> Option<Program> {
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
@@ -655,6 +663,18 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     }
     if !any {
         return None;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        if never.get(b).copied().unwrap_or(false)
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !loop_beyond(p, not_taken, Some(taken))
+        {
+            block.insts.pop();
+            block.exit = Exit::Jump(not_taken);
+        }
     }
     for block in &mut blocks {
         block.phis.clear();

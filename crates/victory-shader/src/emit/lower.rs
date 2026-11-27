@@ -6465,6 +6465,32 @@ impl<'a> Lower<'a> {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
             }
+            // A buffer view whose record count (dword 2) the code reads and that no
+            // instruction reads through (a test for a null view, `s_cmp_eq_u32 s2, 0`,
+            // before the program does anything): its kind is the one the table declares
+            // there, the count that of the host view, as for a view the code also reads
+            // ([`Self::descriptor_words`], which gives the address too where it can).
+            if count == 4
+                && inst.write(Reg::S(code + 2)).is_some_and(|v| {
+                    self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.reads.iter().any(|r| r.1 == v))
+                })
+            {
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                if let Some(u) = used
+                    && u.dwords == 4
+                    && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+                {
+                    let uav = u.kind == ResourceType::Uav;
+                    let flag = if uav { 0x1000 } else { 0 };
+                    let props = if u.stride >= 4 && u.stride.is_multiple_of(4) {
+                        (12 | flag, u.stride)
+                    } else {
+                        (11 | flag, 0)
+                    };
+                    return self.descriptor_words(inst, site, code, count, 0, &src, used, props, None, uav);
+                }
+            }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
