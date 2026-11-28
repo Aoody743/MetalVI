@@ -95,7 +95,12 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     if n <= 2000 || n.is_power_of_two() {
         tracing::info!(n, at = format_args!("{start:#x}"), mb = len >> 20, kb = len >> 10, aliased, "Metal: wiring title memory");
     }
-    struct Wiring(#[allow(dead_code)] crate::watch::Reading, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    // Fields drop in order: the timeline's commits resume first.
+    struct Wiring(
+        #[allow(dead_code)] Option<victory_metal::exec::GpuIdle<'static>>,
+        #[allow(dead_code)] crate::watch::Reading,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
     impl std::ops::Drop for Wiring {
         fn drop(&mut self) {
             work::after_wait();
@@ -104,8 +109,9 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     let reading = crate::watch::title_memory_reading_range(start as usize, len as usize);
     work::here("waiting for the GPU to go idle (wiring)");
     let flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let timeline = super::metal_exec::gpu_idle_for_wiring();
     work::here("wiring title memory");
-    Box::new(Wiring(reading, flight))
+    Box::new(Wiring(timeline, reading, flight))
 }
 
 /// Counts mapping changes. Recorded Metal lists can still contain old GPU
@@ -623,6 +629,7 @@ impl MetalBackend {
             // Wires what was added: never while xmem changes mappings.
             let _gate = crate::watch::title_memory_reading();
             let _flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let _timeline = super::metal_exec::gpu_idle_for_wiring();
             chunks.residency().commit();
         }
     }

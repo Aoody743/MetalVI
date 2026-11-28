@@ -52,8 +52,9 @@ pub(crate) fn on() -> bool {
     })
 }
 
+static TIMELINE: OnceLock<Option<Timeline>> = OnceLock::new();
+
 fn timeline() -> Option<&'static Timeline> {
-    static TIMELINE: OnceLock<Option<Timeline>> = OnceLock::new();
     TIMELINE
         .get_or_init(|| {
             let m = super::metal::backend()?;
@@ -99,6 +100,27 @@ fn timeline() -> Option<&'static Timeline> {
             }
         })
         .as_ref()
+}
+
+/// Main's rule (`metal::IN_FLIGHT`): residency-set wiring and commits never
+/// overlap this backend's GPU work. The old path holds `IN_FLIGHT` from
+/// commit to completion; timeline command buffers complete on other
+/// threads, so each wiring (after `IN_FLIGHT`) also pauses the timeline's
+/// commits and waits, bounded, for what it already committed. `None` when
+/// the timeline is off or still starting (nothing of it is in flight then).
+/// Lock order: the mapping gate, `IN_FLIGHT`, then this.
+pub(crate) fn gpu_idle_for_wiring() -> Option<victory_metal::exec::GpuIdle<'static>> {
+    // `get`, not `timeline()`: called while the timeline starts (its first
+    // residency commit), when initializing it again would deadlock.
+    let t = TIMELINE.get()?.as_ref()?;
+    let idle = t.gpu_idle(std::time::Duration::from_secs(2));
+    if !idle.idle() {
+        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            tracing::error!("Metal: the execution timeline did not go idle before wiring (stopped); wiring anyway");
+        }
+    }
+    Some(idle)
 }
 
 /// Whether compute-only parts go straight into timeline command buffers

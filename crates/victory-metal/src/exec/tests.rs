@@ -921,3 +921,72 @@ fn fence_orders_command_buffers() {
         assert_eq!(s.chain_waits_skipped, if fence_chain { 31 } else { 0 });
     }
 }
+
+/// `gpu_idle` returns once every command buffer committed before it has
+/// finished on the GPU, and nothing is committed while its guard is held.
+#[test]
+#[ignore = "requires Metal"]
+fn gpu_idle_waits_and_holds_commits() {
+    let _pool = Pool::new();
+    let g = Gpu::new();
+    g.set(0, 5);
+    let spin = g.spin(1_000_000);
+    let t = g.timeline(cfg(false));
+    t.submit(1, vec![Segment::new("producer", Work::Compute(vec![g.spin_item(&spin, 64, 3), ComputeItem::Barrier, g.add(1, 0, 1)]))]).unwrap();
+    // Until the producer is committed (it may already be done).
+    let start = Instant::now();
+    while t.stats().committed[1] == 0 {
+        assert!(start.elapsed() < SECOND, "producer never committed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let idle = t.gpu_idle(SECOND);
+    assert!(idle.idle());
+    assert_eq!(g.get(1), 6, "the producer finished before gpu_idle returned");
+    // Held: submitted work is not committed.
+    t.submit(0, vec![Segment::new("held back", Work::Compute(vec![g.add(2, 1, 10)]))]).unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(t.stats().committed[0], 0, "committed while the GPU was to stay idle");
+    assert_eq!(g.get(2), 0);
+    drop(idle);
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
+    assert_eq!(g.get(2), 16);
+    // Nothing in flight: idle at once.
+    assert!(t.gpu_idle(SECOND).idle());
+    assert!(t.stopped().is_none());
+}
+
+/// `gpu_idle` with a command buffer that never finishes: bounded, says the
+/// GPU was not idle, and stops the timeline (its waiters are released).
+#[test]
+#[ignore = "requires Metal"]
+fn fault_gpu_idle_bounded() {
+    let _pool = Pool::new();
+    let g = Gpu::new();
+    let never = SharedEvent::new(&g.device).unwrap();
+    let n2 = never.clone();
+    let t = g.timeline(Config { hang_ms: 3000, ..cfg(false) });
+    t.submit(1, vec![Segment::new("stuck", Work::Encode {
+        ring_bytes: 0,
+        groups: 0,
+        encode: Box::new(move |e| {
+            e.cb.encode_wait(&n2, 1);
+            Ok(())
+        }),
+    })])
+    .unwrap();
+    let start = Instant::now();
+    while t.stats().committed[1] == 0 {
+        assert!(start.elapsed() < SECOND, "never committed");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let start = Instant::now();
+    let idle = t.gpu_idle(Duration::from_millis(100));
+    let took = start.elapsed();
+    println!("gpu_idle on a stuck GPU: idle={} after {took:?} stopped={:?}", idle.idle(), t.stopped());
+    assert!(!idle.idle());
+    assert!(took < Duration::from_millis(1000), "gpu_idle took {took:?}");
+    assert!(t.stopped().is_some());
+    drop(idle);
+    drop(t);
+    never.signal(1);
+}

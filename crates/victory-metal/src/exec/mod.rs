@@ -70,6 +70,26 @@ use crate::{CommandBuffer, Device, Error, Pool, Queue, Result};
 pub use barrier::{BarrierPolicy, ComputeItem, Dispatch, Range};
 pub use ring::RingSlice;
 
+/// [`Timeline::gpu_idle`]: while held, nothing is committed.
+pub struct GpuIdle<'a> {
+    inner: &'a Inner,
+    idle: bool,
+}
+
+impl GpuIdle<'_> {
+    /// Whether every command buffer committed before it had finished.
+    pub fn idle(&self) -> bool {
+        self.idle
+    }
+}
+
+impl Drop for GpuIdle<'_> {
+    fn drop(&mut self) {
+        lock(&self.inner.commits).0 -= 1;
+        self.inner.commits_changed.notify_all();
+    }
+}
+
 pub type QueueId = usize;
 /// A title fence (its object's address, or any unique key).
 pub type FenceId = u64;
@@ -392,6 +412,11 @@ struct Inner {
     shutting_down: AtomicBool,
     /// Wakes the encoder thread (after a stop, so waiters are answered).
     wake: Mutex<Option<mpsc::Sender<Msg>>>,
+    /// [`Timeline::gpu_idle`]: how many idle guards are held (no command
+    /// buffer is committed while any is) and the last sequence committed per
+    /// queue. Held by the encoder thread across each commit.
+    commits: Mutex<(u32, Vec<u64>)>,
+    commits_changed: Condvar,
 }
 
 enum Msg {
@@ -626,6 +651,8 @@ impl Timeline {
             pending_changed: Condvar::new(),
             shutting_down: AtomicBool::new(false),
             wake: Mutex::new(None),
+            commits: Mutex::new((0, vec![0; n])),
+            commits_changed: Condvar::new(),
         });
         let (tx, rx) = mpsc::channel();
         *lock(&inner.wake) = Some(tx.clone());
@@ -755,6 +782,31 @@ impl Timeline {
     /// Command buffers in flight per queue.
     pub fn in_flight(&self) -> Vec<u32> {
         self.inner.queues.iter().map(|q| lock(&q.in_flight).0).collect()
+    }
+
+    /// Pauses commits and waits until the GPU has finished every command
+    /// buffer committed so far (each signals its queue's `done` event at its
+    /// end, so this does not depend on the completion threads). Commits
+    /// resume when the guard drops. For work that must never overlap this
+    /// timeline's GPU work (residency-set wiring). Callable from any thread,
+    /// the encoder thread included (a `prepare` hook): nothing it waits for
+    /// needs the encoder. Bounded: past `timeout` the timeline is stopped
+    /// (every event released, so waiters drain) and waited for once more;
+    /// the guard says whether the GPU was idle.
+    pub fn gpu_idle(&self, timeout: Duration) -> GpuIdle<'_> {
+        let targets = {
+            let mut c = lock(&self.inner.commits);
+            c.0 += 1;
+            c.1.clone()
+        };
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX).max(1);
+        let reached = |ms| self.inner.queues.iter().zip(&targets).all(|(qs, &seq)| seq == 0 || qs.done.wait_until_signaled(seq, ms));
+        let mut idle = reached(ms);
+        if !idle {
+            self.inner.fault(format!("the GPU did not go idle within {ms} ms (for work that must not overlap it)"));
+            idle = reached(ms);
+        }
+        GpuIdle { inner: &self.inner, idle }
     }
 
     pub fn stopped(&self) -> Option<String> {
@@ -1127,9 +1179,17 @@ impl Encoder {
             inner.pending_done(n);
             return false;
         }
+        // No commit while a `gpu_idle` guard is held (bounded: a stop ends
+        // the wait, and the command buffer is committed to be completed as
+        // a stopped one).
+        let mut commits = lock(&inner.commits);
+        while commits.0 > 0 && !inner.is_stopped() {
+            commits = inner.commits_changed.wait_timeout(commits, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+        }
         self.seq[q] += 1;
         self.fenced[q] = this_fenced;
         let seq = self.seq[q];
+        commits.1[q] = seq;
         {
             let mut f = lock(&qs.in_flight);
             f.0 += 1;
@@ -1145,6 +1205,7 @@ impl Encoder {
         let flight = Flight { seq, cb: cb.clone(), label, estimate_ns: estimate.min(cfg.in_flight_ns), has_work, done, observers, has_writes, ring: token };
         if cfg.sync {
             cb.commit();
+            drop(commits);
             self.enqueued(&signalled, &tagged);
             inner.complete(q, flight);
         } else {
@@ -1152,12 +1213,15 @@ impl Encoder {
             // never committed.
             let handed = self.completion[q].as_ref().is_some_and(|c| c.send(flight).is_ok());
             if !handed {
+                commits.1[q] = seq - 1;
+                drop(commits);
                 lock(&qs.in_flight).0 -= 1;
                 inner.fault(format!("completion thread of queue {q} is gone"));
                 inner.pending_done(n);
                 return false;
             }
             cb.commit();
+            drop(commits);
             self.enqueued(&signalled, &tagged);
         }
         lock(&inner.stats).encode_ns += started.elapsed().as_nanos() as u64;
