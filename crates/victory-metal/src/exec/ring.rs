@@ -158,6 +158,19 @@ impl RingSlice {
         Some(self.offset + at as u64)
     }
 
+    /// Reserves `len` bytes for the caller to write itself: their CPU
+    /// address and their offset in [`RingSlice::buffer`].
+    pub fn reserve(&mut self, len: usize) -> Option<(*mut u8, u64)> {
+        let at = self.next;
+        let end = at.checked_add(len)?;
+        if end > self.len {
+            return None;
+        }
+        self.next = end.next_multiple_of(ALIGN).min(self.len);
+        // SAFETY: inside this slice.
+        Some((unsafe { self.cpu.add(at) }, self.offset + at as u64))
+    }
+
     /// Ring bytes `put` needs for these sizes (each aligned).
     pub fn need(sizes: impl IntoIterator<Item = usize>) -> usize {
         sizes.into_iter().map(|n| n.next_multiple_of(ALIGN)).sum()

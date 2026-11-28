@@ -108,6 +108,14 @@ fn timeline_compute() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_METAL_EXEC_COMPUTE").as_deref() != Ok("0"))
 }
 
+/// Whether other encodable parts (draws, clears, copies) go into timeline
+/// command buffers too (`VICTORY_METAL_EXEC_DRAW=0`: through
+/// `MetalBackend::run`).
+fn timeline_draw() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_EXEC_DRAW").as_deref() != Ok("0"))
+}
+
 /// The timeline queue for a title queue type (D3D12_COMMAND_LIST_TYPE):
 /// compute (2) runs on the asynchronous compute queue, everything else on
 /// the graphics queue.
@@ -141,6 +149,20 @@ pub(crate) fn execute(kind: u32, lists: &[This]) {
         let mut segs: Vec<Segment> = match mine {
             Some(Owned(ops)) if timeline_compute() && ops.textures.is_empty() && super::metal::exec_compute::compute_only(&ops.commands) => {
                 super::metal::exec_compute::segments(&ops.commands)
+            }
+            // Draws, clears, copies, resolves (and compute with texture
+            // checks): run_batch's encoding into timeline command buffers.
+            Some(Owned(ops)) if timeline_draw() && super::metal::exec_compute::encodable(&ops.commands)
+                && let Some(m) = super::metal::backend() =>
+            {
+                let textures = Owned(ops.textures.clone());
+                let before: Box<dyn FnOnce() + Send> = Box::new(move || {
+                    let textures = textures;
+                    for t in &textures.0 {
+                        t.refresh();
+                    }
+                });
+                super::metal::exec_compute::general_segments(m, &ops.commands, Some(before))
             }
             Some(mine) => vec![Segment::new("title part", Work::Host(Box::new(move || {
                 let mine = mine;
@@ -255,6 +277,7 @@ pub(crate) fn drain(force: bool, why: &'static str) {
             barriers_elided = s.barriers_elided,
             timeline_dispatches = super::metal::exec_compute::ENCODED[0].load(std::sync::atomic::Ordering::Relaxed),
             timeline_indirect = super::metal::exec_compute::ENCODED[1].load(std::sync::atomic::Ordering::Relaxed),
+            timeline_other_ops = super::metal::exec_compute::GENERAL[0].load(std::sync::atomic::Ordering::Relaxed),
             d3d12_prep = ?crate::draw::metal_prep(),
             "Metal: execution timeline"
         );

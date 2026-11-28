@@ -213,6 +213,101 @@ fn indirect(op: Arc<MetalOp>, tables: usize, max: u32) -> Segment {
         })
 }
 
+/// Whether `ops` (not all compute) can be encoded into timeline command
+/// buffers through `MetalBackend::encode_external`: nothing in them is read
+/// by the CPU right after it ran, and no diagnostic needs the old path's
+/// cuts and snapshots.
+pub(crate) fn encodable(ops: &[Arc<MetalOp>]) -> bool {
+    !ops.is_empty()
+        && !super::super::metal_draw::trace_scene()
+        && ops.iter().all(|o| match &**o {
+            MetalOp::BufferCopy { .. } | MetalOp::FloatRowReadback { .. } => false,
+            MetalOp::Dispatch(c) => c.loop_counts.is_none() && !work::trace_indirect_writer(&c.pso.name),
+            MetalOp::DispatchIndirect(c) => !work::trace_indirect(&c.pso.name),
+            MetalOp::Draw(_) | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => true,
+        })
+}
+
+/// Op counts encoded through [`general_segments`]: ops, chunks.
+pub(crate) static GENERAL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The segments that run `ops` ([`encodable`]) through `run_batch`'s
+/// encoding, one command buffer per chunk, cut where the old path cuts: the
+/// estimate window (`work::prefix`) and `VICTORY_METAL_PASS_DISPATCHES`
+/// dispatches per command buffer (1: every op alone).
+/// `before` runs on the encoder thread right before the first chunk is
+/// encoded (the part's deferred texture checks).
+pub(crate) fn general_segments(m: &'static super::MetalBackend, ops: &[Arc<MetalOp>], before: Option<Box<dyn FnOnce() + Send>>) -> Vec<Segment> {
+    let cap = pass_cap();
+    let mut before = before;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        let fit = work::prefix(&ops[i..], if cap == 1 { 1 } else { usize::MAX }).max(1);
+        let mut end = i;
+        let mut dispatches = 0usize;
+        while end < i + fit {
+            let dispatch = matches!(&*ops[end], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_));
+            if dispatch && dispatches >= cap && end > i {
+                break;
+            }
+            dispatches += usize::from(dispatch);
+            end += 1;
+        }
+        let chunk: Vec<Arc<MetalOp>> = ops[i..end].to_vec();
+        i = end;
+        GENERAL[0].fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        GENERAL[1].fetch_add(1, Ordering::Relaxed);
+        let ring_bytes = super::MetalBackend::ring_bytes(&chunk);
+        let estimate = work::reservation(&chunk);
+        let groups = chunk.iter().map(|o| match &**o {
+            MetalOp::Dispatch(c) => c.groups.iter().copied().fold(1u64, u64::saturating_mul),
+            MetalOp::DispatchIndirect(c) => u64::from(c.max).saturating_mul(u64::from(victory_metal::indirect::GROUPS_PER_RECORD)),
+            _ => 0,
+        }).fold(0u64, u64::saturating_add);
+        // What run_batch leaves for after completion, and the command buffer
+        // to check it against.
+        let deferred: Arc<std::sync::Mutex<Option<Sendable<(super::Deferred, victory_metal::CommandBuffer)>>>> = Default::default();
+        let for_encode = deferred.clone();
+        let encoded_ops = Sendable(chunk.clone());
+        let first = before.take();
+        let encode = Box::new(move |e: &mut Encoding<'_>| -> victory_metal::Result<()> {
+            if let Some(f) = first {
+                f();
+            }
+            let ops = &encoded_ops.0;
+            let (cpu, offset) = e.ring.reserve(ring_bytes).ok_or_else(|| Error("ring slice too small for a chunk".into()))?;
+            let mut ext = super::External {
+                cb: e.cb.clone(),
+                ring_buffer: e.ring.buffer.clone(),
+                ring_offset: offset,
+                ring_cpu: cpu,
+                ring_len: ring_bytes,
+                done: None,
+            };
+            if !m.encode_external(ops, &mut ext) {
+                return Err(Error("run_batch refused an externally encoded chunk".into()));
+            }
+            if let Some(d) = ext.done {
+                *for_encode.lock().unwrap_or_else(|p| p.into_inner()) = Some(Sendable((d, e.cb.clone())));
+            }
+            Ok(())
+        });
+        let report_ops = Sendable(chunk.clone());
+        let mut seg = Segment::new("title ops", Work::Encode { ring_bytes, groups, encode })
+            .estimate(estimate)
+            .write(None, move || {
+                let report_ops = report_ops;
+                if let Some(Sendable((d, cb))) = deferred.lock().unwrap_or_else(|p| p.into_inner()).take() {
+                    d.report(&cb, &report_ops.0);
+                }
+            });
+        seg.observe = Some(observer(chunk));
+        out.push(seg);
+    }
+    out
+}
+
 #[cfg(test)]
 #[path = "metal_exec_compute_tests.rs"]
 mod tests;

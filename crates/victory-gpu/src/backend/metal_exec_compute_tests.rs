@@ -347,3 +347,242 @@ fn host_cost_per_op() {
     assert!(game < old / 4.0, "the game thread still pays the old cost");
     }
 }
+
+mod draws {
+    use super::super::*;
+    use crate::backend::metal::{MetalBackend, diag};
+    use crate::backend::metal_draw::{DrawKind, MetalClear, MetalDraw, MetalGraphics, MetalTexCopy, Targets};
+    use crate::backend::metal_texture::MetalTexture;
+    use std::time::Duration;
+    use victory_metal::exec::{Config, Hooks, Timeline};
+    use victory_metal::render::{DepthStencilDesc, RenderPipelineDesc};
+    use victory_metal::sys::{self, WMTPixelFormat as P};
+    use victory_metal::texture::TextureDescriptor;
+
+    /// The depth-replay sequence of `metal_depth_replay_tests` (clears,
+    /// copies, two depth-companion draws, a rectangle clear) on `backend`:
+    /// the ops and the four textures read back afterwards.
+    fn sequence(backend: &MetalBackend) -> (Vec<Arc<MetalOp>>, [Arc<MetalTexture>; 4]) {
+        let make_texture = |key, format| {
+            let texture = backend
+                .device
+                .new_texture(&TextureDescriptor {
+                    pixel_format: P::WMTPixelFormatR32Float,
+                    width: 4,
+                    height: 4,
+                    usage: sys::WMTTextureUsage(1 | 2 | 4 | 0x10),
+                    options: sys::WMTResourceOptions(0x20),
+                    ..Default::default()
+                })
+                .unwrap();
+            // SAFETY: ResourceDesc is an integer-only C record.
+            let mut desc: crate::resource::ResourceDesc = unsafe { std::mem::zeroed() };
+            desc.width = 4;
+            desc.height = 4;
+            desc.dimension = 3;
+            desc.format = format;
+            desc.sample_count = 1;
+            let t = Arc::new(MetalTexture { companion: Default::default(), texture, pixel: P::WMTPixelFormatR32Float, desc, mips: 1, slices: 1 });
+            backend.textures.lock().unwrap().insert(key, Some(t.clone()));
+            t
+        };
+        let original = make_texture(1, 39);
+        let input = make_texture(2, 41);
+        let output = make_texture(3, 41);
+        let cleared = make_texture(4, 41);
+        let input_attachment = backend.attachment(2 as crate::object::This, 41, 0, 0, false).unwrap();
+        let attachment = backend.attachment(1 as crate::object::This, 40, 0, 0, true).unwrap();
+        let lib = backend
+            .device
+            .library_msl("#include <metal_stdlib>\nusing namespace metal;\nvertex float4 vs(uint id [[vertex_id]]) { return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0.5, 1); }\n")
+            .unwrap();
+        let desc = RenderPipelineDesc { depth_format: P::WMTPixelFormatDepth32Float.0, sample_count: 1, ..Default::default() };
+        let pso = backend.device.render_pipeline_desc((&lib, "vs"), None, &desc).unwrap();
+        let dss = backend.device.depth_stencil_state(&DepthStencilDesc { depth_write: true, depth_compare: 1, ..Default::default() }).unwrap();
+        let pso = Arc::new(MetalGraphics {
+            cost_ns: 1.into(),
+            name: "stage 4 synthetic depth draw".into(),
+            pso,
+            dss,
+            depth_write: true,
+            raster: [0; 4],
+            bias: [0.0; 3],
+            stages: Vec::new(),
+            vertex_slots: 0,
+            mesh: false,
+            mesh_threads: [0; 3],
+            geometry: None,
+            colors: [0; 8],
+            depth: desc.depth_format,
+            stencil: 0,
+            samples: 1,
+        });
+        let mut targets = Targets { depth: Some(attachment.clone()), ..Default::default() };
+        targets.finish();
+        let draw = Arc::new(MetalOp::Draw(MetalDraw {
+            trace_inputs: Vec::new(),
+            pso,
+            targets: Arc::new(targets),
+            stages: Vec::new(),
+            vertex: None,
+            viewport: sys::WMTViewport { originX: 0.0, originY: 0.0, width: 4.0, height: 4.0, znear: 0.0, zfar: 1.0 },
+            scissor: sys::WMTScissorRect { x: 0, y: 0, width: 4, height: 4 },
+            blend: [0.0; 4],
+            stencil_ref: 0,
+            primitive: 3,
+            kind: DrawKind::Vertices { count: 3, instances: 1, first: 0, first_instance: 0 },
+        }));
+        let copy = |src: &Arc<MetalTexture>, dst: &Arc<MetalTexture>| {
+            Arc::new(MetalOp::Copy(MetalTexCopy {
+                src: src.clone(),
+                dst: dst.clone(),
+                whole: true,
+                src_slice: 0,
+                src_level: 0,
+                src_origin: [0; 3],
+                size: [4, 4, 1],
+                dst_slice: 0,
+                dst_level: 0,
+                dst_origin: [0; 3],
+            }))
+        };
+        let clear = |target, color, depth, rects| {
+            Arc::new(MetalOp::Clear(MetalClear { target, color, depth, stencil: None, has_stencil: false, rects }))
+        };
+        let ops = vec![
+            clear(attachment.clone(), None, Some(0.125), Vec::new()),
+            copy(&original, &cleared),
+            clear(input_attachment, Some([0.75, 0.0, 0.0, 0.0]), None, Vec::new()),
+            copy(&input, &original),
+            draw.clone(),
+            draw,
+            copy(&original, &output),
+            clear(attachment.clone(), None, Some(0.25), vec![victory_metal::clear_resolve::ClearRect { left: 0, top: 0, right: 2, bottom: 2 }]),
+            copy(&original, &input),
+        ];
+        (ops, [output, original, input, cleared])
+    }
+
+    /// The four textures' 16 floats each, read back on `backend`'s queue.
+    fn read(backend: &MetalBackend, textures: &[Arc<MetalTexture>; 4]) -> Vec<f32> {
+        let (out, cpu) = backend.device.shared_buffer_mapped(&[0u8; 4096]).unwrap();
+        let cb = backend.queue.command_buffer().unwrap();
+        let mut blit = cb.blit_encoder().unwrap();
+        for (k, t) in textures.iter().enumerate() {
+            blit.copy_from_texture_to_buffer(&t.texture, 0, 0, [0; 3], [4, 4, 1], &out, (k * 1024) as u64, 256, 1024);
+        }
+        blit.finish();
+        cb.commit();
+        cb.wait().unwrap();
+        let mut v = Vec::new();
+        for k in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    // SAFETY: inside the 4 KiB buffer, after completion.
+                    v.push(unsafe { cpu.add(k * 1024 + y * 256 + x * 4).cast::<f32>().read_unaligned() });
+                }
+            }
+        }
+        v
+    }
+
+    fn expected() -> Vec<f32> {
+        let mut v = Vec::new();
+        for k in 0..4 {
+            for y in 0..4 {
+                for x in 0..4 {
+                    v.push(match k {
+                        3 => 0.125,
+                        1 | 2 if x < 2 && y < 2 => 0.25,
+                        _ => 0.5,
+                    });
+                }
+            }
+        }
+        v
+    }
+
+    fn timeline(backend: &MetalBackend) -> Timeline {
+        let t = Timeline::new(backend.device.clone(), Config { max_segments_per_cb: 1, ..Config::default() }, Hooks::default()).unwrap();
+        for q in 0..2 {
+            t.queue(q).add_residency_set(backend.chunks().residency());
+        }
+        let rings: Vec<_> = t.ring_buffers().iter().map(|r| r.handle()).collect();
+        backend.chunks().residency().add(&rings);
+        backend.chunks().residency().commit();
+        t
+    }
+
+    /// Clears, copies, depth-companion draws and a rectangle clear encoded by
+    /// run_batch into timeline command buffers give what the old path gives.
+    #[test]
+    #[ignore = "requires Metal"]
+    fn timeline_draws_match_old_path() {
+        let _pool = victory_metal::Pool::new();
+        let old_backend = MetalBackend::new().unwrap();
+        let (ops, textures) = sequence(&old_backend);
+        assert!(old_backend.run(&ops), "old path failed");
+        let old = read(&old_backend, &textures);
+        assert_eq!(old, expected(), "old path");
+
+        let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+        let (ops, textures) = sequence(backend);
+        assert!(encodable(&ops) && !compute_only(&ops));
+        let t = timeline(backend);
+        diag::LAST_GPU_NS.store(u64::MAX, Ordering::Relaxed);
+        let before = GENERAL.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let segs = general_segments(backend, &ops, None);
+        t.submit(0, segs).unwrap();
+        assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
+        assert!(t.stopped().is_none(), "{:?}", t.stopped());
+        let new = read(backend, &textures);
+        assert_eq!(new, old, "timeline path");
+        assert_eq!(diag::LAST_GPU_NS.load(Ordering::Relaxed), u64::MAX, "the old completion path was not used");
+        let after = GENERAL.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let s = t.stats();
+        println!("timeline draws: {} ops in {} chunks, committed {:?}", after[0] - before[0], after[1] - before[1], s.committed);
+        assert_eq!(after[0] - before[0], ops.len() as u64);
+    }
+
+    /// Host cost per op for draws: 64 depth draws with clears between, old
+    /// path vs timeline (game thread, encoder, wall).
+    #[test]
+    #[ignore = "requires Metal"]
+    fn host_cost_per_draw() {
+        let _pool = victory_metal::Pool::new();
+        let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+        let (seq, _) = sequence(backend);
+        // The draw and the full clear, repeated: 64 draws, 16 clears.
+        let mut ops = Vec::new();
+        for _ in 0..16 {
+            ops.push(seq[0].clone());
+            for _ in 0..4 {
+                ops.push(seq[4].clone());
+            }
+        }
+        assert!(backend.run(&ops[..5]));
+        let n = ops.len() as f64;
+        let start = std::time::Instant::now();
+        assert!(backend.run(&ops));
+        let old = start.elapsed().as_secs_f64() * 1e6 / n;
+        let t = timeline(backend);
+        t.submit(0, general_segments(backend, &ops[..5], None)).unwrap();
+        assert!(t.drain(Duration::from_secs(5)).unwrap());
+        let encode_before = t.stats().encode_ns;
+        let start = std::time::Instant::now();
+        let segs = general_segments(backend, &ops, None);
+        t.submit(0, segs).unwrap();
+        let game = start.elapsed().as_secs_f64() * 1e6 / n;
+        assert!(t.drain(Duration::from_secs(5)).unwrap());
+        let wall = start.elapsed().as_secs_f64() * 1e6 / n;
+        let st = t.stats();
+        let encoder = (st.encode_ns - encode_before) as f64 / 1e3 / n;
+        println!(
+            "HOST COST per draw op ({} build): old run() {old:.1} µs; timeline: game thread {game:.1} µs, encoder {encoder:.1} µs, wall {wall:.1} µs; {} command buffers",
+            if cfg!(debug_assertions) { "debug" } else { "release" },
+            st.committed[0]
+        );
+        assert!(t.stopped().is_none());
+        assert!(game < old / 4.0);
+    }
+}
