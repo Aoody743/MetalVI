@@ -91,10 +91,24 @@ pub fn stall_locks() -> Vec<(&'static str, usize)> {
 pub static WRITE_NOTE: std::sync::OnceLock<fn(usize, usize, u8)> = std::sync::OnceLock::new();
 
 pub(crate) fn note_write(at: usize, len: usize, kind: u8) {
+    // And for the texture ownership judge (P5; nothing unless it is on).
+    #[cfg(windows)]
+    {
+        use backend::metal_texown::{Kind, note};
+        note(if kind == 1 { Kind::BottomOfPipe } else { Kind::HostCopy }, at, len);
+    }
     if let Some(note) = WRITE_NOTE.get() {
         note(at, len, kind);
     }
 }
+/// The runtime gave the title fresh memory at `[at, at + len)` (a new
+/// allocation, perhaps where a released resource was): for the texture
+/// ownership judge (P5, `VICTORY_METAL_TEXOWN=shadow`; nothing otherwise).
+#[cfg(windows)]
+pub fn title_memory_allocated(at: usize, len: usize) {
+    backend::metal_texown::note(backend::metal_texown::Kind::Reuse, at, len);
+}
+
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]

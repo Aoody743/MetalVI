@@ -351,6 +351,8 @@ pub(crate) fn ask_once_end() {
 /// stands (the title's buffer copies, done at submission): its pages count
 /// as written after that asking, so the refreshes that follow copy them.
 pub(crate) fn wrote(at: usize, len: usize) {
+    // Our copy landed there (P5 judge; nothing unless it is on).
+    crate::backend::metal_texown::note(crate::backend::metal_texown::Kind::HostCopy, at, len);
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
     if !j.kept || len == 0 {
         return;
@@ -417,6 +419,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
+    crate::backend::metal_texown::note_pages(j.found[..count].iter().map(|&at| at / PAGE), PAGE);
     true
 }
 
@@ -498,9 +501,12 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     j.asked += 1;
     let now = j.asked;
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    let pages = pages.collect::<Vec<_>>();
+    for &page in &pages {
         j.written.insert(page, now);
     }
+    // What the write watch or the guards found written (P5 judge).
+    crate::backend::metal_texown::note_pages(pages, PAGE);
     Some((
         now,
         j.written
@@ -828,6 +834,8 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // The kernel writes there next (P5 judge; nothing unless it is on).
+    crate::backend::metal_texown::note(crate::backend::metal_texown::Kind::Kernel, at, len);
     if has_guards() && !skip_d3d12_host() {
         // The length is the title's (`fread`'s size times count, saturated).
         open(&mut guards(), at, at.saturating_add(len));
@@ -1059,6 +1067,8 @@ pub(crate) fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading>
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
     note_range_changed(at, len);
+    // New pages under it (P5 judge; nothing unless it is on).
+    crate::backend::metal_texown::note(crate::backend::metal_texown::Kind::Remap, at, len);
     if !skip_d3d12_host() {
         // A placed texture there arrives, goes or changes with no descriptor
         // written.

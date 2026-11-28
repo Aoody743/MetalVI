@@ -980,6 +980,15 @@ extern "system" fn copy_texture_region(
             } else {
                 read_back(list, dst, x, y, z, src, source_box)
             };
+            // The GPU writes the title's buffer when the list runs (P5
+            // judge, live for a few frames; nothing unless it is on).
+            if made.is_ok()
+                && crate::backend::metal_texown::on()
+                && let Some(bytes) = dst.footprint.bytes()
+                && let Some(at) = crate::resource::buffer_bytes(dst.resource).map(|(data, _)| data as usize + dst.footprint.offset as usize)
+            {
+                crate::backend::metal_texown::note(crate::backend::metal_texown::Kind::GpuWrite, at, bytes as usize);
+            }
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {

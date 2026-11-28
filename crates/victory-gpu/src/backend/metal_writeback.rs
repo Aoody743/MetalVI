@@ -113,6 +113,9 @@ impl MetalBackend {
             .as_ref()
             .map_err(|e| Error(e.0.clone()))?;
         tiler.encode(&self.device, cb, &tex.texture, &dst, offset, &plan, bytes)?;
+        // The command buffer writes the texture's title memory when it runs
+        // (P5 judge, live for a few frames; nothing unless it is on).
+        super::metal_texown::note(super::metal_texown::Kind::GpuWriteBack, resource.va as usize, layout.size as usize);
         Ok(true)
     }
 }

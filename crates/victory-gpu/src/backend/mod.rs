@@ -49,3 +49,6 @@ pub(crate) mod metal_archive;
 pub mod metal_exec;
 #[cfg(windows)]
 pub mod metal_slot_cache;
+// P5: texture ownership, judge only (VICTORY_METAL_TEXOWN=shadow).
+#[cfg(windows)]
+pub(crate) mod metal_texown;

@@ -76,6 +76,9 @@ struct Last {
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
+    /// What the ownership model's judge saw at the last check (P5,
+    /// `VICTORY_METAL_TEXOWN=shadow`; judge only).
+    texown: crate::backend::metal_texown::Mark,
 }
 
 /// Returns `true` if `memory` differs from `last`, updating `last` to hold `memory`.
@@ -552,8 +555,13 @@ pub(crate) fn host_wrote(resource: usize) -> bool {
 /// The title released a resource.
 pub(crate) fn forget(resource: usize) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(map) = map.as_mut() {
-        map.remove(&resource);
+    if let Some(map) = map.as_mut()
+        && let Some(staging) = map.remove(&resource)
+        && crate::backend::metal_texown::on()
+    {
+        // Its memory may go to another resource now (P5 judge).
+        let (at, len) = staging.memory();
+        crate::backend::metal_texown::note(crate::backend::metal_texown::Kind::Reuse, at, len);
     }
     let mut set = HOST_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(set) = set.as_mut() {
@@ -698,6 +706,14 @@ impl Staging {
         slice * self.mips + mip
     }
 
+    /// Tells the ownership model's judge what this check decided (P5,
+    /// nothing unless `VICTORY_METAL_TEXOWN=shadow`; changes nothing).
+    fn judge(&self, last: &mut Last, source: crate::backend::metal_texown::Source, changed: bool, stamp: crate::backend::metal_texown::Stamp) {
+        if crate::backend::metal_texown::on() {
+            crate::backend::metal_texown::judge(&mut last.texown, self.memory as usize, self.size, source, changed, stamp, &self.layout.desc);
+        }
+    }
+
     /// Detiles the texture memory into the staging buffer if it changed
     /// since the last time (and is mapped at all).
     pub(crate) fn refresh(&self) {
@@ -718,15 +734,19 @@ impl Staging {
     }
 
     fn refresh_timed(&self) -> usize {
+        use crate::backend::metal_texown::{Source, stamp};
         let size = self.size;
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
         if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+            let seen = stamp();
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+                self.judge(last, Source::WriteWatch, false, seen);
                 return 0;
             }
             last.asked = now;
+            self.judge(last, Source::WriteWatch, true, seen);
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
@@ -766,10 +786,14 @@ impl Staging {
             let desc = &self.layout.desc;
             let film = desc.swizzle.0 == 0 && desc.mips == 1;
             if unwritten && !turn && !film && frame >= last.unguarded {
+                self.judge(last, Source::Guard, false, stamp());
                 return 0;
             }
             unseen = unwritten;
         }
+        // The model's clock before the bytes are read (after the asking
+        // above, whose answers are events of its own).
+        let seen = stamp();
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -781,7 +805,7 @@ impl Staging {
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
-                return self.refresh_unlocked(last, size);
+                return self.refresh_unlocked(last, size, seen);
             };
             mapped
         } else {
@@ -807,9 +831,11 @@ impl Staging {
                 drop(_mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
+                    self.judge(last, Source::PartialHash, false, seen);
                     return false;
                 }
                 last.hash = Some(hash);
+                self.judge(last, Source::PartialHash, true, seen);
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -830,14 +856,18 @@ impl Staging {
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if fast_compare {
                     if !take_changed(&mut last.raw, tiled) {
+                        self.judge(last, Source::Compare, false, seen);
                         return size;
                     }
+                    self.judge(last, Source::Compare, true, seen);
                     self.detile(&last.raw);
                 } else {
                     let hash = blake3::hash(tiled);
                     if last.hash == Some(hash) {
+                        self.judge(last, Source::Compare, false, seen);
                         return size;
                     }
+                    self.judge(last, Source::Compare, true, seen);
                     if unseen && last.hash.is_some() {
                         self.unseen_write(last);
                     }
@@ -856,16 +886,20 @@ impl Staging {
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if fast_compare {
             if !take_changed(&mut last.raw, tiled) {
+                self.judge(last, Source::Compare, false, seen);
                 return size;
             }
+            self.judge(last, Source::Compare, true, seen);
             // Detiling only reads our snapshot, not the title mapping.
             drop(_mapped);
             self.detile(&last.raw);
         } else {
             let hash = blake3::hash(tiled);
             if last.hash == Some(hash) {
+                self.judge(last, Source::Compare, false, seen);
                 return size;
             }
+            self.judge(last, Source::Compare, true, seen);
             if unseen && last.hash.is_some() {
                 self.unseen_write(last);
             }
@@ -914,14 +948,16 @@ impl Staging {
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.
-    fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
+    fn refresh_unlocked(&self, last: &mut Last, size: usize, seen: crate::backend::metal_texown::Stamp) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
             let hash = blake3::hash(read);
-            if last.hash != Some(hash) {
+            let changed = last.hash != Some(hash);
+            self.judge(last, crate::backend::metal_texown::Source::Unlocked, changed, seen);
+            if changed {
                 last.hash = Some(hash);
                 self.detile(read);
             }

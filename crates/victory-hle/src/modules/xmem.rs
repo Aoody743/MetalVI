@@ -156,6 +156,7 @@ pub extern "system" fn XMemVirtualAlloc(
     };
     if !at.is_null() {
         victory_gpu::note_memory_changed();
+        victory_gpu::title_memory_allocated(at as usize, size);
         victory_loader::writelog::note(at as usize, size, victory_loader::writelog::Source::XMemVirtualAlloc);
     }
     if base.is_null() {

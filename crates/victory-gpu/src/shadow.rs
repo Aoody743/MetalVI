@@ -2229,6 +2229,12 @@ impl Shadow {
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        // Shaders write these bytes when the list runs (P5 judge, live for
+        // a few frames; nothing unless it is on).
+        if crate::backend::metal_texown::on() {
+            let len = len.min(self.left(address));
+            crate::backend::metal_texown::note(crate::backend::metal_texown::Kind::GpuWrite, address as usize, len as usize);
+        }
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
