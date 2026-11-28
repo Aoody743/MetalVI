@@ -361,6 +361,8 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 mod heap_address;
 #[path = "mask_numbers.rs"]
 mod mask_numbers;
+#[path = "dot8.rs"]
+mod dot8;
 #[path = "mesh_order.rs"]
 pub(super) mod mesh_order;
 pub use mesh_order::{input_reads, set_mesh_output_reads};
@@ -7880,6 +7882,9 @@ impl<'a> Lower<'a> {
         let float = |l: &mut Self, r: V| l.write_f(inst, r, guard);
         let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
         if let Some(r) = self.valu16(inst, name, guard) {
+            return r;
+        }
+        if let Some(r) = self.dot8(inst, name, guard) {
             return r;
         }
         if let Some(op) = name.strip_prefix("v_pk_") {

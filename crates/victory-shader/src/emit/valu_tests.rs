@@ -1806,3 +1806,28 @@ fn normalized_codes_truncate_back_to_themselves() {
     }
 }
 
+
+/// `v_dot4c_i32_i8 v0, v1, v2` (VOP2, op 0x0d) after `v0 = v3`: the input
+/// dword 2 plus the dot product of input dwords 0 and 1 as signed bytes
+/// (the Series S upscaler's network layers, `emit::dot8`).
+#[test]
+fn v_dot4c_i32_i8_sums_signed_byte_products() {
+    let body = [vop1(0x001, 0, vgpr(3)), vop2(0x0d, 0, vgpr(1), 2)];
+    let shader = build_valu_cs(&body);
+    let reference = |a: u32, b: u32, c: u32| -> u32 {
+        (0..4).fold(c, |acc, k| {
+            let x = i32::from((a >> (8 * k)) as u8 as i8);
+            let y = i32::from((b >> (8 * k)) as u8 as i8);
+            acc.wrapping_add((x * y) as u32)
+        })
+    };
+    let cases = [
+        [0x0102_0304, 0x0506_0708, 10, 0],
+        [0xff80_7f01, 0x807f_ff02, 0, 0],
+        [0x8080_8080, 0x8080_8080, 0xffff_ffff, 0],
+        [0x1234_5678, 0x9abc_def0, 0x7fff_0000, 0],
+    ];
+    run_cases_on(&shader, &cases, &[("hardware", false)], |backend, i, [a, b, c, _], got| {
+        assert_eq!(got, reference(a, b, c), "{backend}: case {i}");
+    });
+}

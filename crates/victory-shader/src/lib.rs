@@ -10,6 +10,7 @@ pub mod bvh;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;
+pub mod fspx;
 pub mod gfx10;
 pub mod io;
 pub mod ir;
@@ -23,6 +24,19 @@ pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
+
+/// The native programs of a console container: its `DXIL` part's
+/// ([`native_programs`]), or the precompiled program of an `ACCC` part
+/// ([`fspx`], the Series S upscaler's); empty when it has neither.
+pub fn container_programs(c: &Container) -> Result<Vec<NativeProgram>, ShaderError> {
+    if let Some(dxil) = c.part(FourCC::DXIL) {
+        return native_programs(dxil.data);
+    }
+    match c.part(FourCC::ACCC) {
+        Some(accc) if fspx::is_fspx(accc.data) => Ok(vec![fspx::native_program(accc.data)?]),
+        _ => Ok(Vec::new()),
+    }
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
@@ -44,6 +58,8 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("bvh.rs"),
         include_str!("dxbc.rs"),
         include_str!("dxil.rs"),
+        include_str!("fspx.rs"),
+        include_str!("fspx_tests.rs"),
         include_str!("emit/bitcode.rs"),
         include_str!("emit/bitcode/census.rs"),
         include_str!("emit/bitcode/opt.rs"),
@@ -51,6 +67,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/container.rs"),
         include_str!("emit/cube_lod_tests.rs"),
         include_str!("emit/diff_tests.rs"),
+        include_str!("emit/dot8.rs"),
         include_str!("emit/heap_address.rs"),
         include_str!("emit/host.rs"),
         include_str!("emit/intersect.rs"),

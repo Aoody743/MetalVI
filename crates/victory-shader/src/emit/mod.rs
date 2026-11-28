@@ -325,10 +325,11 @@ pub fn host_form(c: &Container, native: &mut NativeProgram) -> bool {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
-    let dxil = c
-        .part(FourCC::DXIL)
-        .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let mut native = crate::native_programs(dxil.data)?
+    if c.part(FourCC::DXIL).is_none() && c.part(FourCC::ACCC).is_none() {
+        return Err(ShaderError::Malformed("no DXIL part"));
+    }
+    // A DXIL part's programs, or an ACCC part's precompiled one (FSPX).
+    let mut native = crate::container_programs(&c)?
         .into_iter()
         .find(|p| {
             matches!(

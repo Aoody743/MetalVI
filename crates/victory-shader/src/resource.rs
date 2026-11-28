@@ -1171,6 +1171,9 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.loaded(words) {
             return Ok(source);
         }
+        if let Some(source) = self.raw_view(words) {
+            return Ok(source);
+        }
         if let [lo, hi, Term::Const(w2), Term::Const(w3)] = *words {
             let (mut hi, mut bits) = (hi, 0);
             while let Term::Value(v) = hi
@@ -2086,6 +2089,37 @@ impl<'a> Tracer<'a> {
             load,
             first: first as u8,
         })
+    }
+
+    /// A loaded structured-buffer descriptor made a raw one, as the code the
+    /// AMD compiler made for the Series S upscaler (FSPX, [`crate::fspx`])
+    /// does before byte-offset accesses: the stride cleared from dword 1
+    /// (`s_and_b32 0xc000ffff`), the record count multiplied by it (dword
+    /// 2), and dword 3's bounds-check mode set to raw (`s_and_b32
+    /// 0xcfffffff`, `s_or_b32 0x30000000`). The same memory and the same
+    /// byte bounds; host buffer views are raw, so it is the loaded
+    /// descriptor's view.
+    // shortcut: the multiplier of the record count is not checked to be the
+    // stride the code extracted (it only changes the bounds, which the
+    // host view sets).
+    fn raw_view(&self, words: &[Term]) -> Option<Source> {
+        let [w0, Term::Value(w1), Term::Value(w2), Term::Value(w3)] = *words else {
+            return None;
+        };
+        let masked = |v: Value, mask: u32| match self.sop2(v, &["s_and_b32"]) {
+            Some((_, [x, Term::Const(m)] | [Term::Const(m), x])) if m == mask => Some(x),
+            _ => None,
+        };
+        let x1 = masked(w1, 0xc000_ffff)?;
+        let (y3, bits) = self.set_bits(w3)?;
+        if bits != 0x3000_0000 {
+            return None;
+        }
+        let Term::Value(y3) = y3 else { return None };
+        let x3 = masked(y3, 0xcfff_ffff)?;
+        let (_, [a, b]) = self.sop2(w2, &["s_mul_i32"])?;
+        // Either operand may be the loaded record count.
+        [a, b].into_iter().find_map(|x2| self.loaded(&[w0, x1, x2, x3]))
     }
 
     /// A descriptor the code keeps per lane: every dword of `words` is the

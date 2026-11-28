@@ -356,7 +356,7 @@ pub enum RootType {
 }
 
 impl RootType {
-    fn from_raw(raw: u32) -> Self {
+    pub(crate) fn from_raw(raw: u32) -> Self {
         match raw {
             0 => RootType::Constants,
             1 => RootType::Descriptor,

@@ -28,6 +28,8 @@ impl FourCC {
     pub const HASH: FourCC = FourCC(*b"HASH");
     pub const ILDB: FourCC = FourCC(*b"ILDB");
     pub const ILDN: FourCC = FourCC(*b"ILDN");
+    /// Precompiled code and bindings ([`crate::fspx`]) in place of `DXIL`.
+    pub const ACCC: FourCC = FourCC(*b"ACCC");
 }
 
 impl std::fmt::Debug for FourCC {

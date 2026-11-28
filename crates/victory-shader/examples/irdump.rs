@@ -3,14 +3,14 @@
 //!
 //! `cargo run -p victory-shader --example irdump -- <file.cdxil>`
 use victory_shader::structure::LaneExit;
-use victory_shader::{Container, FourCC};
+use victory_shader::Container;
 
 fn main() {
     let path = std::env::args().nth(1).expect("container");
     let bytes = std::fs::read(&path).expect("read");
     let c = Container::parse(&bytes).expect("container");
-    let dxil = c.part(FourCC::DXIL).expect("DXIL part");
-    let native = victory_shader::native_programs(dxil.data)
+    // A DXIL part's programs, or an ACCC part's precompiled one (FSPX).
+    let native = victory_shader::container_programs(&c)
         .expect("native programs")
         .into_iter()
         .find(|p| !p.code.is_empty())
