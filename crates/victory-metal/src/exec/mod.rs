@@ -53,6 +53,10 @@
 //!   waited for on the encoder thread before the next is encoded, waits are
 //!   never put on the GPU, and `submit` returns only when the timelines can
 //!   go no further: the old lockstep behaviour, kept as the reference.
+//! * [`Timeline::drain`] times out on the GPU only: committed command
+//!   buffers that stop completing. Time the encoder thread spends encoding
+//!   (or running host work) is not a hang; only a much longer stretch with
+//!   no progress at all ([`Config::encoder_stall_ms`]) ends a drain.
 
 pub mod barrier;
 pub mod ring;
@@ -130,6 +134,11 @@ pub struct Config {
     /// How long a command buffer may take to complete (wall clock, from
     /// commit) before it counts as hung.
     pub hang_ms: u64,
+    /// [`Timeline::drain`]'s backstop: how long the timeline may make no
+    /// progress at all (no work started or committed, no completion, no host
+    /// work finished) while a drain waits: one piece of work running this
+    /// long counts as stuck. Far longer than any batch takes to encode.
+    pub encoder_stall_ms: u64,
     /// Ring bytes per queue.
     pub ring_bytes: usize,
     /// Segments game threads may queue ahead of the encoder.
@@ -155,6 +164,7 @@ impl Default for Config {
             in_flight_ns: 50_000_000,
             fuse_ns: 250_000_000,
             hang_ms: 2000,
+            encoder_stall_ms: 60_000,
             ring_bytes: 4 << 20,
             max_pending: 4096,
             max_segments_per_cb: 64,
@@ -169,8 +179,9 @@ impl Default for Config {
 impl Config {
     /// `VICTORY_METAL_SYNC`, `VICTORY_METAL_SERIAL`, `VICTORY_METAL_FUSE_MS`
     /// (default 250), `VICTORY_METAL_INFLIGHT` (2), `VICTORY_METAL_INFLIGHT_MS`
-    /// (50), `VICTORY_METAL_HANG_MS` (2000), `VICTORY_METAL_PASS_DISPATCHES`
-    /// (segments per command buffer; 0 = no count limit).
+    /// (50), `VICTORY_METAL_HANG_MS` (2000), `VICTORY_METAL_ENCODER_STALL_MS`
+    /// (60000), `VICTORY_METAL_PASS_DISPATCHES` (segments per command buffer;
+    /// 0 = no count limit).
     pub fn from_env() -> Self {
         let d = Self::default();
         let per_cb = env_u64("VICTORY_METAL_PASS_DISPATCHES", d.max_segments_per_cb as u64);
@@ -182,6 +193,7 @@ impl Config {
             max_in_flight: env_u64("VICTORY_METAL_INFLIGHT", 2).clamp(1, 16) as u32,
             in_flight_ns: env_u64("VICTORY_METAL_INFLIGHT_MS", 50).max(1) * 1_000_000,
             hang_ms: env_u64("VICTORY_METAL_HANG_MS", 2000).max(1),
+            encoder_stall_ms: env_u64("VICTORY_METAL_ENCODER_STALL_MS", 60_000).max(1),
             max_segments_per_cb: if per_cb == 0 { usize::MAX } else { per_cb as usize },
             ..d
         }
@@ -265,13 +277,18 @@ pub struct Segment {
     /// Told the measured GPU time of the segment's command buffer once it
     /// completed (the whole buffer's: exact when it holds one segment).
     pub observe: Option<Box<dyn FnOnce(u64) + Send>>,
+    /// Run on the encoder thread once the segment's waits are met (or on the
+    /// GPU), before its command buffer's `prepare` hook (host work: before
+    /// it runs): the title's deferred texture checks, whose uploads the
+    /// hook then flushes.
+    pub before: Option<Box<dyn FnOnce() + Send>>,
     forced: bool,
     held_counted: bool,
 }
 
 impl Segment {
     pub fn new(label: &'static str, work: Work) -> Self {
-        Self { label, waits: Vec::new(), work, signals: Vec::new(), writes: Vec::new(), estimate_ns: 0, observe: None, forced: false, held_counted: false }
+        Self { label, waits: Vec::new(), work, signals: Vec::new(), writes: Vec::new(), estimate_ns: 0, observe: None, before: None, forced: false, held_counted: false }
     }
     pub fn wait_fence(mut self, fence: FenceId, value: u64) -> Self {
         self.waits.push(Wait::Fence { fence, value });
@@ -389,6 +406,11 @@ struct QueueShared {
     chain: SharedEvent,
     fence: Fence,
     in_flight: Mutex<(u32, u64)>,
+    /// When each command buffer in flight was committed (oldest first; the
+    /// completion thread finishes them in order), and when the last one
+    /// completed: a drain's measure of GPU progress.
+    committed_at: Mutex<VecDeque<Instant>>,
+    done_at: Mutex<Instant>,
     /// Committed command buffers whose bottom-of-pipe writes have not run
     /// yet. While any are, the queue's fence signals are given by the
     /// completion thread after the writes, not encoded on the GPU: a GPU
@@ -417,6 +439,9 @@ struct Inner {
     /// queue. Held by the encoder thread across each commit.
     commits: Mutex<(u32, Vec<u64>)>,
     commits_changed: Condvar,
+    /// The last time anything moved: work started or committed, a
+    /// completion, host work finished ([`Config::encoder_stall_ms`]).
+    progress_at: Mutex<Instant>,
 }
 
 enum Msg {
@@ -488,6 +513,23 @@ impl Inner {
 
     fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    fn progressed(&self) {
+        *lock(&self.progress_at) = Instant::now();
+    }
+
+    /// A queue whose committed work has made no progress for longer than
+    /// `limit`: the oldest command buffer in flight neither completed nor
+    /// was preceded by a completion within it. With how long.
+    fn gpu_stalled(&self, limit: Duration) -> Option<(QueueId, Duration)> {
+        let now = Instant::now();
+        self.queues.iter().enumerate().find_map(|(q, qs)| {
+            let oldest = *lock(&qs.committed_at).front()?;
+            let since = oldest.max(*lock(&qs.done_at));
+            let stalled = now.saturating_duration_since(since);
+            (stalled > limit).then_some((q, stalled))
+        })
     }
 
     fn new_event(&self) -> Result<SharedEvent> {
@@ -596,6 +638,9 @@ impl Inner {
         if flight.has_writes {
             qs.writes_out.fetch_sub(1, Ordering::AcqRel);
         }
+        lock(&qs.committed_at).pop_front();
+        *lock(&qs.done_at) = Instant::now();
+        self.progressed();
         lock(&qs.ring).fifo.give_back(flight.ring);
         {
             let mut f = lock(&qs.in_flight);
@@ -626,6 +671,8 @@ impl Timeline {
                 chain: SharedEvent::new(&device)?,
                 fence: Fence::new(&device)?,
                 in_flight: Mutex::new((0, 0)),
+                committed_at: Mutex::new(VecDeque::new()),
+                done_at: Mutex::new(Instant::now()),
                 writes_out: std::sync::atomic::AtomicU64::new(0),
                 ring: Mutex::new(ring::Ring::new(&device, cfg.ring_bytes)?),
             });
@@ -653,6 +700,7 @@ impl Timeline {
             wake: Mutex::new(None),
             commits: Mutex::new((0, vec![0; n])),
             commits_changed: Condvar::new(),
+            progress_at: Mutex::new(Instant::now()),
         });
         let (tx, rx) = mpsc::channel();
         *lock(&inner.wake) = Some(tx.clone());
@@ -763,14 +811,40 @@ impl Timeline {
         self.send(Msg::Force)
     }
 
-    /// Waits, up to `timeout`, until nothing submitted so far is in flight:
-    /// `Ok(true)` all of it ran; `Ok(false)` what is left is held at waits on
-    /// the CPU (nothing of it is on the GPU). An error: stopped, or timed out
-    /// with work still on the GPU.
-    pub fn drain(&self, timeout: Duration) -> Result<bool> {
+    /// Waits until nothing submitted so far is in flight: `Ok(true)` all of
+    /// it ran; `Ok(false)` what is left is held at waits on the CPU (nothing
+    /// of it is on the GPU). An error: stopped; or a committed command buffer
+    /// made no progress on the GPU for `gpu_timeout` (it neither completed
+    /// nor followed a completion within it: hung); or the timeline made no
+    /// progress at all for [`Config::encoder_stall_ms`]. Time the encoder
+    /// thread spends encoding a large batch or running host work, with
+    /// nothing in flight, is not a hang (run V0 R3 was stopped for a 2.8 s
+    /// batch with `in_flight=[0, 0]`).
+    pub fn drain(&self, gpu_timeout: Duration) -> Result<bool> {
         let (tx, rx) = mpsc::channel();
         self.send(Msg::Drain(tx))?;
-        rx.recv_timeout(timeout).map_err(|_| Error("drain timed out".into()))?
+        let poll = (gpu_timeout / 4).clamp(Duration::from_millis(1), Duration::from_millis(50));
+        let backstop = Duration::from_millis(self.inner.cfg.encoder_stall_ms);
+        loop {
+            match rx.recv_timeout(poll) {
+                Ok(answer) => return answer,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(Error("encoder thread gone".into())),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Some(r) = self.stopped() {
+                return Err(Error(format!("submission stopped: {r}")));
+            }
+            if let Some((q, stalled)) = self.inner.gpu_stalled(gpu_timeout) {
+                return Err(Error(format!(
+                    "drain timed out: queue {q} has committed work that made no GPU progress for {} ms",
+                    stalled.as_millis()
+                )));
+            }
+            let idle = lock(&self.inner.progress_at).elapsed();
+            if idle > backstop {
+                return Err(Error(format!("drain timed out: the timeline made no progress for {} ms", idle.as_millis())));
+            }
+        }
     }
 
     /// Stops all submission now (an outer safety stop) and releases every
@@ -1034,6 +1108,9 @@ impl Encoder {
             }
         };
         let started = Instant::now();
+        // Starting work counts as progress (the backstop measures how long
+        // one piece of work takes, not how long the timeline sat idle).
+        inner.progressed();
         if front_host {
             if in_flight > 0 {
                 return false;
@@ -1089,6 +1166,11 @@ impl Encoder {
                 }
             }
         };
+        for s in &mut segs {
+            if let Some(f) = s.before.take() {
+                f();
+            }
+        }
         if !(inner.hooks.prepare)() {
             lock(&qs.ring).fifo.give_back(token);
             inner.fault(format!("queue {q}: preparing a command buffer failed"));
@@ -1190,6 +1272,7 @@ impl Encoder {
         self.fenced[q] = this_fenced;
         let seq = self.seq[q];
         commits.1[q] = seq;
+        lock(&qs.committed_at).push_back(Instant::now());
         {
             let mut f = lock(&qs.in_flight);
             f.0 += 1;
@@ -1216,6 +1299,7 @@ impl Encoder {
                 commits.1[q] = seq - 1;
                 drop(commits);
                 lock(&qs.in_flight).0 -= 1;
+                lock(&qs.committed_at).pop_back();
                 inner.fault(format!("completion thread of queue {q} is gone"));
                 inner.pending_done(n);
                 return false;
@@ -1225,6 +1309,7 @@ impl Encoder {
             self.enqueued(&signalled, &tagged);
         }
         lock(&inner.stats).encode_ns += started.elapsed().as_nanos() as u64;
+        inner.progressed();
         inner.pending_done(n);
         true
     }
@@ -1261,8 +1346,12 @@ impl Encoder {
         if s.forced && !s.waits.is_empty() {
             lock(&inner.stats).forced += 1;
         }
+        if let Some(f) = s.before {
+            f();
+        }
         let ok = run();
         lock(&inner.stats).host_runs += 1;
+        inner.progressed();
         if !ok {
             inner.fault(format!("queue {q}: host work ({}) failed", s.label));
             inner.pending_done(1);

@@ -19,6 +19,17 @@
 //! `metal_stage`, which still syncs the Metal heaps from the D3D12-era
 //! descriptor mirror and bounds root views by the shadow copies
 //! (`crate::draw::metal_prep` counts those calls).
+//!
+//! [`plan`] cuts one submission part into runs by how each op can run:
+//! dispatches straight into timeline compute command buffers, draws /
+//! clears / copies / resolves through `run_batch`'s encoding
+//! ([`general_segments`]), and only what the CPU must see finished (buffer
+//! copies, read-backs, the ambient stand-in, traced dispatches) through the
+//! old synchronous `MetalBackend::run`. V0 (runs v0-r3/r4) logged
+//! `timeline_dispatches=0`: the title's compute is recorded into the same
+//! submissions as its draws, and every compute part also carried texture
+//! checks, so no part was ever "compute only" and every dispatch went
+//! through `run_batch`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -269,6 +280,134 @@ pub(crate) fn encodable(ops: &[Arc<MetalOp>]) -> bool {
         })
 }
 
+/// How an op runs on the timeline ([`plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Route {
+    /// Straight into timeline compute command buffers ([`segments`]).
+    Compute,
+    /// `run_batch`'s encoding into timeline command buffers
+    /// ([`general_segments`]).
+    Encode,
+    /// The old synchronous `MetalBackend::run`, on the encoder thread, once
+    /// the queue has nothing in flight: the CPU reads or writes what these
+    /// touch right after they ran, or a diagnostic needs the old path.
+    Host,
+}
+
+/// `direct_compute`: dispatches go straight to the timeline
+/// (`VICTORY_METAL_EXEC_COMPUTE`, else with `run_batch`'s encoding);
+/// `encode`: draws and the like go through `run_batch`'s encoding
+/// (`VICTORY_METAL_EXEC_DRAW`, else the old path).
+pub(crate) fn route(op: &MetalOp, direct_compute: bool, encode: bool) -> Route {
+    let r = match op {
+        MetalOp::Dispatch(c) if c.loop_counts.is_none() && !work::trace_indirect_writer(&c.pso.name) => Route::Compute,
+        MetalOp::DispatchIndirect(c) if !work::trace_indirect(&c.pso.name) => Route::Compute,
+        MetalOp::Draw(_) | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::Resolve(_) => Route::Encode,
+        // Buffer copies (the CPU copies after the GPU work before it),
+        // read-backs, the ambient stand-in (its own command buffer, in
+        // "ambient order"), traced dispatches (snapshots).
+        _ => Route::Host,
+    };
+    match r {
+        Route::Compute if !direct_compute => if encode { Route::Encode } else { Route::Host },
+        Route::Encode if !encode => Route::Host,
+        r => r,
+    }
+}
+
+/// `ops` cut into maximal runs of one [`Route`], in order. While a frame
+/// is traced (`VICTORY_METAL_TRACE_FRAMES`) everything runs on the old
+/// path, which takes the snapshots.
+pub(crate) fn pieces(ops: &[Arc<MetalOp>], direct_compute: bool, encode: bool) -> Vec<(Route, std::ops::Range<usize>)> {
+    if super::super::metal_draw::trace_scene() {
+        return if ops.is_empty() { Vec::new() } else { vec![(Route::Host, 0..ops.len())] };
+    }
+    let mut out: Vec<(Route, std::ops::Range<usize>)> = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let r = route(op, direct_compute, encode);
+        match out.last_mut() {
+            Some((last, range)) if *last == r => range.end = i + 1,
+            _ => out.push((r, i..i + 1)),
+        }
+    }
+    out
+}
+
+/// Ops planned by [`plan`], by route: direct compute, `run_batch` encoding,
+/// old path.
+pub(crate) static ROUTED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The timeline segments of one submission part's ops, in order (see the
+/// module notes). `before` (the part's deferred texture checks) runs on the
+/// encoder thread before the first of them; `host` makes the segment that
+/// runs a run of ops on the old path. When dispatches went straight to the
+/// timeline and textures are waiting to be written back (F44), a last
+/// segment writes them back, as `run_batch` does after a batch's dispatches.
+pub(crate) fn plan(
+    m: &'static super::MetalBackend,
+    ops: &[Arc<MetalOp>],
+    direct_compute: bool,
+    encode: bool,
+    before: Option<Box<dyn FnOnce() + Send>>,
+    mut host: impl FnMut(Vec<Arc<MetalOp>>) -> Segment,
+) -> Vec<Segment> {
+    let mut out: Vec<Segment> = Vec::new();
+    let mut direct = false;
+    for (r, range) in pieces(ops, direct_compute, encode) {
+        let run = &ops[range];
+        let k = match r {
+            Route::Compute => 0,
+            Route::Encode => 1,
+            Route::Host => 2,
+        };
+        ROUTED[k].fetch_add(run.len() as u64, Ordering::Relaxed);
+        match r {
+            Route::Compute => {
+                direct = true;
+                out.extend(segments(run));
+            }
+            Route::Encode => out.extend(general_segments(m, run, None)),
+            Route::Host => out.push(host(run.to_vec())),
+        }
+    }
+    if direct && m.writeback_wanted() {
+        out.push(writeback(m));
+    }
+    if let Some(first) = out.first_mut() {
+        first.before = before;
+    }
+    out
+}
+
+/// F44's writeback after dispatches that ran on the timeline. Its command
+/// buffer always holds GPU work (a 4-byte fill of its ring region): one that
+/// held none (nothing left to write back by the time it is encoded) would
+/// read as a GPU fault (no GPU time).
+fn writeback(m: &'static super::MetalBackend) -> Segment {
+    let encode = Box::new(move |e: &mut Encoding<'_>| -> victory_metal::Result<()> {
+        m.writeback_all(e.cb).map_err(|err| Error(format!("writeback: {err}")))?;
+        let (_, offset) = e.ring.reserve(4).ok_or_else(|| Error("ring slice too small for the writeback marker".into()))?;
+        let mut blit = e.cb.blit_encoder()?;
+        blit.fill_buffer(&e.ring.buffer, offset, 4, 0);
+        blit.finish();
+        Ok(())
+    });
+    Segment::new("title writeback", Work::Encode { ring_bytes: victory_metal::exec::ring::ALIGN, groups: 0, encode })
+}
+
+/// Ops per command buffer through [`general_segments`]
+/// (`VICTORY_METAL_EXEC_CHUNK_OPS`, default 256; 0: no count limit). V0 R3
+/// encoded one batch of 4,772 ops for 2.8 s as one unit: no GPU work could
+/// start before the whole batch was encoded. At the measured 70–100 µs of
+/// encoding per op, 256 ops is about 20–25 ms of encoder time.
+fn chunk_ops() -> usize {
+    static CAP: OnceLock<usize> = OnceLock::new();
+    *CAP.get_or_init(|| match std::env::var("VICTORY_METAL_EXEC_CHUNK_OPS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256) {
+        0 => usize::MAX,
+        n => n,
+    })
+}
+
 /// Parts of indirect draws over `RECORD_LIMIT` records translated one
 /// after the other by `run_batch` on the timeline (instead of rejected).
 pub(crate) static DRAW_PARTS: AtomicU64 = AtomicU64::new(0);
@@ -283,16 +422,22 @@ pub(crate) static GENERAL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// The segments that run `ops` ([`encodable`]) through `run_batch`'s
 /// encoding, one command buffer per chunk, cut where the old path cuts: the
 /// estimate window (`work::prefix`) and `VICTORY_METAL_PASS_DISPATCHES`
-/// dispatches per command buffer (1: every op alone).
+/// dispatches per command buffer (1: every op alone); and at most
+/// [`chunk_ops`] ops per chunk, so encoding and GPU work overlap.
 /// `before` runs on the encoder thread right before the first chunk is
 /// encoded (the part's deferred texture checks).
 pub(crate) fn general_segments(m: &'static super::MetalBackend, ops: &[Arc<MetalOp>], before: Option<Box<dyn FnOnce() + Send>>) -> Vec<Segment> {
+    general_segments_capped(m, ops, before, chunk_ops())
+}
+
+/// [`general_segments`] with `max_ops` ops per chunk at most.
+pub(crate) fn general_segments_capped(m: &'static super::MetalBackend, ops: &[Arc<MetalOp>], before: Option<Box<dyn FnOnce() + Send>>, max_ops: usize) -> Vec<Segment> {
     let cap = pass_cap();
     let mut before = before;
     let mut out = Vec::new();
     let mut i = 0;
     while i < ops.len() {
-        let fit = work::prefix(&ops[i..], if cap == 1 { 1 } else { usize::MAX }).max(1);
+        let fit = work::prefix(&ops[i..], if cap == 1 { 1 } else { max_ops.max(1) }).max(1);
         let mut end = i;
         let mut dispatches = 0usize;
         while end < i + fit {

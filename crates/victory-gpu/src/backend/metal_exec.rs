@@ -19,16 +19,21 @@
 //!   nothing in flight may read memory being remapped, and the present reads
 //!   what the frame drew (the present itself is not on the timeline yet).
 //!
-//! * Stage 4 start: a part whose Metal ops are all compute dispatches (and
-//!   need no texture checks) is encoded straight into timeline command
-//!   buffers (`metal::exec_compute`): no `MetalBackend::run`, no submission
+//! * Stage 4: each part's ops are cut by how they can run
+//!   (`metal::exec_compute::plan`): runs of dispatches are encoded straight
+//!   into timeline command buffers (no `MetalBackend::run`, no submission
 //!   lock, no wait per command buffer, concurrent dispatch between title
-//!   barriers, overlap between the queues. `VICTORY_METAL_EXEC_COMPUTE=0`
-//!   sends those parts through `MetalBackend::run` too.
+//!   barriers, overlap between the queues); draws, clears, copies and
+//!   resolves go through `run_batch`'s encoding into timeline command
+//!   buffers, at most `VICTORY_METAL_EXEC_CHUNK_OPS` (256) ops each; only
+//!   buffer copies, read-backs, the ambient stand-in and traced dispatches
+//!   run through `MetalBackend::run` on the encoder thread.
+//!   `VICTORY_METAL_EXEC_COMPUTE=0` sends dispatches through `run_batch`'s
+//!   encoding too, `VICTORY_METAL_EXEC_DRAW=0` sends what would go there
+//!   through `MetalBackend::run`.
 //!
-//! Other parts (draws, clears, copies, texture checks) still run through
-//! `MetalBackend::run` on the encoder thread, one synchronous command buffer
-//! at a time. This module has not been run in the game.
+//! Real title submissions have run on this module in the V0 runs only,
+//! when every dispatch still went through `run_batch` (fixed since).
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -71,6 +76,7 @@ fn timeline() -> Option<&'static Timeline> {
                 // uploads, then residency.
                 prepare: Box::new(|| {
                     let Some(m) = super::metal::backend() else { return false };
+                    m.prewire_pending();
                     super::metal_texture::drain_remap_partial();
                     if !m.flush_uploads() {
                         return false;
@@ -166,31 +172,35 @@ pub(crate) fn execute(kind: u32, lists: &[This]) {
         // The submission's Metal ops run with its last part, after every
         // wait (as `queue.rs` does with cuts).
         let mine = if k + 1 == n { ops.take() } else { None };
-        // Compute only: straight into timeline command buffers. The part's
-        // waits go on its first segment, its writes on its last.
+        // The part's ops cut by how each can run (`exec_compute::plan`):
+        // dispatches straight into timeline command buffers, draws and the
+        // like through run_batch's encoding, the rest on the old path. Its
+        // texture checks run before the first. The part's waits go on its
+        // first segment, its writes on its last.
         let mut segs: Vec<Segment> = match mine {
-            Some(Owned(ops)) if timeline_compute() && ops.textures.is_empty() && super::metal::exec_compute::compute_only(&ops.commands) => {
-                super::metal::exec_compute::segments(&ops.commands)
-            }
-            // Draws, clears, copies, resolves (and compute with texture
-            // checks): run_batch's encoding into timeline command buffers.
-            Some(Owned(ops)) if timeline_draw() && super::metal::exec_compute::encodable(&ops.commands)
-                && let Some(m) = super::metal::backend() =>
-            {
-                let textures = Owned(ops.textures.clone());
-                let before: Box<dyn FnOnce() + Send> = Box::new(move || {
-                    let textures = textures;
-                    for t in &textures.0 {
-                        t.refresh();
-                    }
+            Some(Owned(ops)) if !ops.commands.is_empty() && let Some(m) = super::metal::backend() => {
+                let before: Option<Box<dyn FnOnce() + Send>> = (!ops.textures.is_empty()).then(|| {
+                    let textures = Owned(ops.textures.clone());
+                    Box::new(move || {
+                        let textures = textures;
+                        for t in &textures.0 {
+                            t.refresh();
+                        }
+                    }) as Box<dyn FnOnce() + Send>
                 });
-                super::metal::exec_compute::general_segments(m, &ops.commands, Some(before))
+                let host = |commands: Vec<std::sync::Arc<super::metal::MetalOp>>| {
+                    let mine = Owned(crate::queue::MetalOps { commands, textures: Vec::new() });
+                    Segment::new("title part", Work::Host(Box::new(move || {
+                        let mine = mine;
+                        crate::queue::run_metal_checked(&mine.0)
+                    })))
+                };
+                super::metal::exec_compute::plan(m, &ops.commands, timeline_compute(), timeline_draw(), before, host)
             }
-            Some(mine) => vec![Segment::new("title part", Work::Host(Box::new(move || {
-                let mine = mine;
-                crate::queue::run_metal_checked(&mine.0)
-            })))],
-            None => vec![Segment::new("title part", Work::None)],
+            // Nothing for Metal (or no backend): only its waits and writes.
+            // (An empty part used to be host work: it held its queue until
+            // everything before it had completed, for nothing.)
+            _ => vec![Segment::new("title part", Work::None)],
         };
         let mut seg = segs.pop().expect("at least one segment");
         {
@@ -274,10 +284,12 @@ pub(crate) fn drain(force: bool, why: &'static str) {
                 tracing::info!(why, "Metal: execution timeline holds work at waits (none in flight)");
             }
         }
-        // Stopped, or work still on the GPU after 5 s: hung. What comes next
-        // (a page remap, a present) must not run beside it, so everything
-        // stops; the timeline releases its events so nothing it committed
-        // waits forever.
+        // Stopped, or committed work made no GPU progress for 5 s (hung), or
+        // the timeline made no progress at all for `VICTORY_METAL_ENCODER_
+        // STALL_MS` (default 60 s). Encoder time alone (a big batch, host
+        // work) is not a hang (V0 R3). What comes next (a page remap, a
+        // present) must not run beside a hang, so everything stops; the
+        // timeline releases its events so nothing it committed waits forever.
         Err(e) => {
             tracing::error!(why, error = %e, in_flight = ?t.in_flight(), "Metal safety stop: execution timeline did not drain");
             super::metal::stop_submissions("execution timeline did not drain");
@@ -300,6 +312,7 @@ pub(crate) fn drain(force: bool, why: &'static str) {
             timeline_dispatches = super::metal::exec_compute::ENCODED[0].load(std::sync::atomic::Ordering::Relaxed),
             timeline_indirect = super::metal::exec_compute::ENCODED[1].load(std::sync::atomic::Ordering::Relaxed),
             timeline_other_ops = super::metal::exec_compute::GENERAL[0].load(std::sync::atomic::Ordering::Relaxed),
+            routed = ?super::metal::exec_compute::ROUTED.each_ref().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)),
             d3d12_prep = ?crate::draw::metal_prep(),
             "Metal: execution timeline"
         );

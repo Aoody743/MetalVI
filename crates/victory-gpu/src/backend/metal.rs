@@ -171,7 +171,7 @@ impl MetalBackend {
     /// Wires the queued persistent views whole ([`title_memory_persistent`]),
     /// before a batch encodes: inside the mapping gate and [`IN_FLIGHT`]
     /// (the chunks gate), never while this backend's GPU work runs.
-    fn prewire_pending(&self) {
+    pub(crate) fn prewire_pending(&self) {
         let pending = std::mem::take(&mut *PREWIRE.lock().unwrap_or_else(|e| e.into_inner()));
         if pending.is_empty() {
             return;
@@ -2612,6 +2612,15 @@ impl Census {
     }
 }
 
+/// Whether a cached conversion can be used for `stage`: a mesh stage
+/// needs its threadgroup size, which conversions by older converter
+/// libraries left at zero (150 such `.Mesh.vmsc` in `warm-metal-m4`; the
+/// game converted ~90 of them again in every V0 run, the 15–24 s stall
+/// entering 3D). [`super::metal_warm`] applies the same rule.
+pub(crate) fn cached_usable(stage: victory_metal::msc::Stage, c: &victory_metal::msc::Converted) -> bool {
+    !(stage == victory_metal::msc::Stage::Mesh && c.threadgroup == [0, 0, 0])
+}
+
 /// One stage through Metal Shader Converter, from the disk cache when there.
 pub(crate) fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage) -> Result<victory_metal::msc::Converted, String> {
     let params = root_params(host);
@@ -2620,7 +2629,7 @@ pub(crate) fn convert_cached(host: &HostShader, stage: victory_metal::msc::Stage
     if let Some(path) = &path
         && let Ok(bytes) = crate::read_file(path)
         && let Some(c) = victory_metal::msc::Converted::from_bytes(&bytes)
-        && !(stage == victory_metal::msc::Stage::Mesh && c.threadgroup == [0, 0, 0])
+        && cached_usable(stage, &c)
     {
         return Ok(c);
     }

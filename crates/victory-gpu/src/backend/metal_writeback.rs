@@ -665,6 +665,20 @@ FILL(fill_u, uint)
 }
 
 impl MetalBackend {
+    /// Whether [`Self::writeback_all`] has anything to write back now (the
+    /// execution timeline adds a writeback command buffer only then).
+    pub(crate) fn writeback_wanted(&self) -> bool {
+        const UNORDERED: u32 = 4;
+        writeback_enabled()
+            && self
+                .textures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .flatten()
+                .any(|t| t.desc.flags & UNORDERED != 0 && wants_writeback(&t.desc))
+    }
+
     /// After a submission's dispatches: the whitelisted textures shaders
     /// can write (UNORDERED) written back into title memory, all their
     /// subresources (F44). Textures the CPU fills are never written back:

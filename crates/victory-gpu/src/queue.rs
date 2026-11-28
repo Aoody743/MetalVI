@@ -512,7 +512,7 @@ pub(crate) extern "system" fn create(
     let Some(&desc) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(?desc, "command queue");
+    tracing::info!(?desc, "command queue");
     let queue = Box::new(Queue {
         object: if crate::device::newer() {
             Object::new(&NEWER_FUNCTIONS)
@@ -550,7 +550,12 @@ pub(crate) extern "system" fn create_x(
     let Some(&x) = (unsafe { desc.as_ref() }) else {
         return E_INVALIDARG;
     };
-    tracing::debug!(desc = ?x, "console command queue");
+    // Info (a handful per run): which queues the title makes, and on which
+    // engine or pipe. The execution timeline maps queues by `kind` only
+    // (COMPUTE = 2 to its async compute queue); V0 never committed anything
+    // there, so the title's async compute may come as another kind on a
+    // compute engine.
+    tracing::info!(desc = ?x, "console command queue");
     let desc = QueueDesc {
         kind: x.kind,
         priority: 0,

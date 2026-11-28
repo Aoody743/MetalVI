@@ -224,6 +224,32 @@ fn title_dll(host: &victory_hle::HostPolicy, dll: &str) -> bool {
     !host.allows(dll) && !victory_hle::registry().iter().any(|m| m.serves(dll))
 }
 
+/// `VICTORY_SKIP_TITLE_DLLS=<name>[,<name>...]` (diagnosis, default none):
+/// title DLLs whose `LoadLibrary` by the title fails as if they were absent.
+/// For `amd_fidelityfx_upscaler_xbox.dll` (Series S): its FSR4 shaders are
+/// precompiled ISA without DXIL (`FSPX`), which the translator refuses, so
+/// every FSR4 dispatch is dropped; without the DLL the title may pick
+/// another upscaler. Untested in the game.
+#[cfg(windows)]
+fn skipped_title_dll(file: &str) -> bool {
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        std::env::var("VICTORY_SKIP_TITLE_DLLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let name = file.rsplit(['\\', '/']).next().unwrap_or(file).to_ascii_lowercase();
+    let hit = skip.contains(&name);
+    if hit {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| println!("title dll      {name} skipped (VICTORY_SKIP_TITLE_DLLS): the title's LoadLibrary fails"));
+    }
+    hit
+}
+
 /// Title DLLs the title loads itself (`LoadLibrary`) that nothing imports,
 /// e.g. The title's upscaler behind its FidelityFX loader.
 #[cfg(windows)]
@@ -249,6 +275,11 @@ impl LateDlls {
         show: impl Fn(&str, victory_loader::BindReport),
     ) -> Result<Option<usize>> {
         use victory_hle::runtime::{forget_image, image_named, set_image_path};
+        if skipped_title_dll(file) {
+            // Not a title image then: the title's `LoadLibrary` fails with
+            // ERROR_MOD_NOT_FOUND (the kernel module refuses the name).
+            return Ok(None);
+        }
         // Waits while another thread initialises a DLL; a `DllMain` that
         // loads another DLL re-enters.
         self.lock.hold(|| {
