@@ -139,3 +139,63 @@ fn texture_for_refills_a_dirty_partial_texture_without_deadlock() {
     });
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true), "texture_for deadlocked on a dirty partial texture");
 }
+
+/// Title memory is wired only while no command buffer is in flight
+/// (`IN_FLIGHT`): a span asked for while a long bounded compute buffer runs
+/// waits for it to complete; with none in flight it does not wait.
+#[test]
+fn wiring_waits_for_the_command_buffer_in_flight() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    let _pool = victory_metal::Pool::new();
+    let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+    let alloc = |bytes: usize| {
+        // SAFETY: a fresh allocation of our own, never freed (test).
+        let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!mem.is_null());
+        mem as u64
+    };
+    // Nothing in flight: a span is made at once.
+    let idle = alloc(32 << 20);
+    let t = Instant::now();
+    assert!(backend.chunks().window_buffer(idle + 4096, 4096).is_some());
+    let idle_ms = t.elapsed().as_millis();
+    // A long compute buffer (bounded: a fixed loop, under the 1 s test fuse).
+    let pipeline = backend.device.compute_pipeline_msl(
+        "#include <metal_stdlib>\nkernel void spin(device uint *p [[buffer(0)]], uint id [[thread_position_in_grid]]) {\n uint a = id; for (uint i = 0; i < 6000000u; ++i) { a = a * 1664525u + 1013904223u; } p[id] = a; }",
+        "spin",
+    ).unwrap();
+    let out = backend.device.shared_buffer(&[0u8; 256]).unwrap();
+    let committed: &'static AtomicBool = Box::leak(Box::new(AtomicBool::new(false)));
+    let busy = alloc(32 << 20);
+    let runner = std::thread::spawn(move || {
+        let _pool = victory_metal::Pool::new();
+        let cb = backend.queue.command_buffer().unwrap();
+        cb.compute(&[
+            victory_metal::Compute::Pipeline { pipeline: &pipeline, threads_per_group: [64, 1, 1] },
+            victory_metal::Compute::Buffer { buffer: &out, offset: 0, index: 0 },
+            victory_metal::Compute::Dispatch { groups: [1, 1, 1] },
+        ]).unwrap();
+        committed.store(true, Ordering::SeqCst);
+        submit_checked(&cb, &[], true, "long test buffer").unwrap();
+        (Instant::now(), cb.gpu_time_ns())
+    });
+    while !committed.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // Let the runner take IN_FLIGHT and commit.
+    std::thread::sleep(Duration::from_millis(5));
+    let asked = Instant::now();
+    assert!(backend.chunks().window_buffer(busy + 4096, 4096).is_some());
+    let wired = Instant::now();
+    let (done, gpu_ns) = runner.join().unwrap();
+    let waited_ms = (wired - asked).as_millis();
+    println!("idle span {idle_ms} ms; span during a {} ms buffer waited {waited_ms} ms", gpu_ns / 1_000_000);
+    assert!(gpu_ns > 30_000_000, "the test buffer must run long enough to overlap: {gpu_ns} ns");
+    assert!(idle_ms < 20, "no buffer in flight: no wait ({idle_ms} ms)");
+    // The span was made only after the buffer completed (the runner returns
+    // just after releasing IN_FLIGHT, so allow a little scheduling slack).
+    assert!(wired + Duration::from_millis(5) >= done, "wired {:?} before the buffer completed", done - wired);
+    assert!(u128::from(gpu_ns / 1_000_000) <= waited_ms + 10, "waited {waited_ms} ms for a {} ms buffer", gpu_ns / 1_000_000);
+}
