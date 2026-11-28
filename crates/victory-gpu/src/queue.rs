@@ -819,7 +819,9 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// T8: present-to-present times, p50/p95/max every 64 frames.
+/// T8: present-to-present times, p50/p95/max every 64 frames. `ms` lists
+/// the 64 times in order (whole milliseconds), so `metal_run_report.py`
+/// can take percentiles and stalls over any stretch of frames.
 fn frame_interval(frame: u64) {
     use std::sync::Mutex;
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
@@ -831,6 +833,7 @@ fn frame_interval(frame: u64) {
     let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
     times.push(now.duration_since(before).as_secs_f64() * 1000.0);
     if times.len() >= 64 {
+        let ms = times.iter().map(|t| format!("{t:.0}")).collect::<Vec<_>>().join(",");
         times.sort_by(f64::total_cmp);
         let at = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
         tracing::info!(
@@ -838,6 +841,7 @@ fn frame_interval(frame: u64) {
             p50_ms = format!("{:.1}", at(0.5)),
             p95_ms = format!("{:.1}", at(0.95)),
             max_ms = format!("{:.1}", at(1.0)),
+            ms,
             "T8 present-to-present over the last 64 frames"
         );
         times.clear();
