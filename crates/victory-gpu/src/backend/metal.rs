@@ -836,6 +836,12 @@ impl MetalBackend {
         let bounded = pass_cap > 0 && split_event.is_some();
         let pass_dispatches = if bounded { pass_cap } else { u32::MAX };
         let mut cb_start = 0usize;
+        // Dispatches (direct and indirect) in the current command buffer: a
+        // bounded buffer is cut once it holds `pass_dispatches`. Cutting after
+        // every compute pass instead put each indirect dispatch (a pass of its
+        // own) in a command buffer of its own, waited for: ~30,000 of them in
+        // the loading stretch of stage-r-stall1-20261128-084750.
+        let mut cb_dispatches = 0u32;
         // `VICTORY_METAL_SPLIT=1`: every pass in a command buffer of its own,
         // waited for, so a GPU fault names the pass that made it.
         // `VICTORY_METAL_SPLIT=rects`: split only batches that contain an
@@ -921,7 +927,7 @@ impl MetalBackend {
                     let mut in_pass = 0u32;
                     while let Some(MetalOp::Dispatch(c)) = ops.get(i).map(|o| &**o) {
                         // A pass of at most `pass_dispatches` (see `bounded`).
-                        if i == planned_end || in_pass >= pass_dispatches {
+                        if i == planned_end || cb_dispatches.saturating_add(in_pass) >= pass_dispatches {
                             break;
                         }
                         in_pass += 1;
@@ -941,10 +947,12 @@ impl MetalBackend {
                         steps.push(Compute::Dispatch { groups: c.groups });
                         i += 1;
                     }
+                    cb_dispatches = cb_dispatches.saturating_add(in_pass);
                     ok = encoded("compute pass", cb.compute(&steps), || String::new());
                     depth_sync.colour_may_change();
                 }
                 MetalOp::DispatchIndirect(c) => {
+                    cb_dispatches = cb_dispatches.saturating_add(1);
                     if c.max > 256 {
                         static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         if LARGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -1346,7 +1354,7 @@ impl MetalBackend {
                 Some("estimated time")
             } else if split {
                 Some("diagnostic pass")
-            } else if bounded && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_)) {
+            } else if bounded && cb_dispatches >= pass_dispatches {
                 Some("compute pass")
             } else {
                 None
@@ -1386,9 +1394,12 @@ impl MetalBackend {
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
                 let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                tracing::info!(total, reason, ops = i - cb_start, first = work::kind(&ops[cb_start]), "Metal: command buffer split");
+                tracing::info!(total, reason, ops = i - cb_start, first = work::kind(&ops[cb_start]),
+                    estimated_us = work::reservation(&ops[cb_start..i]) / 1000, next = work::kind(&ops[i]),
+                    next_us = work::reservation(&ops[i..=i]) / 1000, "Metal: command buffer split");
                 cb = next;
                 cb_start = i;
+                cb_dispatches = 0;
             }
         }
         if !ok {
