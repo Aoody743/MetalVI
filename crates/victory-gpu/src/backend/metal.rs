@@ -1009,11 +1009,13 @@ impl MetalBackend {
         let mut depth_sync = super::metal_depth::DepthSync::default();
         let load_depth = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, a: &super::metal_draw::Attachment| {
             a.companion.as_ref().is_none_or(|d| {
+                let _phase = work::within("depth companion load");
                 encoded("depth companion load", sync.load(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
             })
         };
         let store_depth = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, a: &super::metal_draw::Attachment| {
             a.companion.as_ref().is_none_or(|d| {
+                let _phase = work::within("depth companion store");
                 encoded("depth companion store", sync.store(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
             })
         };
@@ -1515,7 +1517,11 @@ impl MetalBackend {
                         });
                         i += 1;
                     }
-                    ok = encoded("render pass", cb.render_pass_with(&pass, &steps), || {
+                    let rendered = {
+                        let _phase = work::within("encode render pass");
+                        cb.render_pass_with(&pass, &steps)
+                    };
+                    ok = encoded("render pass", rendered, || {
                         let colors: Vec<u32> = t.colors.iter().map(|c| c.as_ref().map_or(0, |c| c.pixel)).collect();
                         format!("{}x{} samples {} colors {:?} depth {:?} stencil {}", t.width, t.height, t.samples, colors, t.depth.as_ref().map(|d| d.pixel), t.stencil)
                     });

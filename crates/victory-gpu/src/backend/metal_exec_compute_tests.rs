@@ -723,5 +723,13 @@ mod draws {
         );
         assert!(t.stopped().is_none());
         assert!(game < old / 4.0);
+        // Where run_batch's encoding goes (this thread, old path).
+        crate::backend::metal::work::profile::start();
+        assert!(backend.run(&ops));
+        let phases = crate::backend::metal::work::profile::take();
+        let total: u64 = phases.iter().map(|p| p.1).sum();
+        for (phase, ns, k) in phases.iter().take(10) {
+            println!("PROFILE {phase:?}: {:.1} µs/op ({:.0}%), entered {k}", *ns as f64 / 1e3 / n, *ns as f64 * 100.0 / total.max(1) as f64);
+        }
     }
 }
