@@ -507,7 +507,7 @@ fn fused_capture_and_present() {
     super::fuse::stop();
     let before = super::STOPPED_ENDPOINTS.load(Ordering::Relaxed);
     backend.capture(std::ptr::null(), "fused");
-    assert!(!backend.present_metal(std::ptr::null()));
+    assert!(!backend.present_metal(&[std::ptr::null()]));
     assert_eq!(super::STOPPED_ENDPOINTS.load(Ordering::Relaxed) - before, 2);
 }
 

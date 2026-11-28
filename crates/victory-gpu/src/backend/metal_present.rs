@@ -53,14 +53,22 @@ struct Presenter {
 unsafe impl Send for Presenter {}
 
 impl MetalBackend {
-    /// Shows title texture `resource` (as Metal drew it) in the window.
+    /// Shows the title's present planes (as Metal drew them) in the window:
+    /// `planes[0]` opaque, each later plane blended over it (premultiplied
+    /// alpha). Series S presents its UI as a second plane over a scene plane
+    /// that is black in menus: showing only the first left the window black.
     /// False if it could not (the caller may present the D3D12 way).
-    pub(crate) fn present_metal(&self, resource: This) -> bool {
+    pub(crate) fn present_metal(&self, planes: &[This]) -> bool {
         static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
         if self.stopped_endpoint("present") {
             return false;
         }
+        let Some(&resource) = planes.first() else { return fell_back("no present plane") };
         let Some(source) = self.texture_for(resource) else { return fell_back("no Metal texture for the presented resource") };
+        let overlays: Vec<_> = planes[1..].iter().filter_map(|&r| self.texture_for(r)).collect();
+        if overlays.len() + 1 != planes.len() {
+            fell_back_once("an overlay plane has no Metal texture; shown without it");
+        }
         let _pool = victory_metal::Pool::new();
         let mut guard = PRESENTER.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
@@ -100,7 +108,12 @@ impl MetalBackend {
         if let Some(conv) = p.converter.as_mut() {
             let dxgi = crate::resource::pc_format(source.desc.format);
             if let Ok(cb) = self.queue.command_buffer() {
-                match conv.draw(&cb, &source.texture, dxgi, &target, Default::default()) {
+                let drawn = conv.draw(&cb, &source.texture, dxgi, &target, Default::default()).and_then(|()| {
+                    overlays.iter().try_for_each(|o| {
+                        conv.overlay(&cb, &o.texture, crate::resource::pc_format(o.desc.format), &target, Default::default())
+                    })
+                });
+                match drawn {
                     Ok(()) => {
                         cb.present(&drawable);
                         return super::metal::submit_checked(&cb, &[], true, "present conversion").is_ok();
@@ -194,6 +207,14 @@ fn fell_back(why: &'static str) -> bool {
         tracing::warn!(times = n, "Metal present fell back to the D3D12 picture: {why}");
     }
     false
+}
+
+/// Notes, once, a present shown without part of what the title gave.
+fn fell_back_once(why: &'static str) {
+    static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::warn!("Metal present: {why}");
+    }
 }
 
 /// Logs a present failure the first few times only (presents retry every frame).
