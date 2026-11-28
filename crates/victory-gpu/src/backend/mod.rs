@@ -41,3 +41,5 @@ pub mod metal_warm;
 // Stage 3: the execution timeline behind the title's queues (opt-in).
 #[cfg(windows)]
 pub mod metal_exec;
+#[cfg(windows)]
+pub mod metal_slot_cache;

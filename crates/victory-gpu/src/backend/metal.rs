@@ -87,6 +87,7 @@ pub(crate) fn title_memory_remapped(at: u64, len: u64) {
         tracing::info!(calls = n, at = format_args!("{at:#x}"), len, "Metal: title memory remapped");
     }
     super::metal_texture::note_remap_partial(at, len);
+    super::metal_slot_cache::stale();
     // Counted only, and never waited for: the runtime calls this holding
     // its page table, which span lookups take under `chunks`.
     if let Some(Some(m)) = BACKEND.get()
@@ -414,9 +415,11 @@ pub(crate) fn note_slot_dirty(heap: usize, index: u32, handle: u64) {
         .entry(heap)
         .or_default()
         .insert(index, handle);
+    super::metal_slot_cache::dirty(heap, index);
 }
 
 pub(crate) fn forget_heap(heap: usize) {
+    super::metal_slot_cache::stale();
     if let Some(map) = DIRTY_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         map.remove(&heap);
     }
@@ -426,6 +429,7 @@ pub(crate) fn forget_heap(heap: usize) {
 }
 
 pub(crate) fn forget_resource(resource: usize) {
+    super::metal_slot_cache::stale();
     super::metal_texture::forget_resource_textures(resource);
     let Some(Some(b)) = BACKEND.get() else { return };
     b.textures.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
@@ -1653,6 +1657,23 @@ impl MetalBackend {
 
     /// Mirrors all descriptor slots dirtied since the last sync for `heap`,
     /// returning `(heap_buffer, strides_gpu)`.
+    /// The heap's buffer and strides address when it exists and no slot of
+    /// it waits to be synced ([`sync_heap`] would do nothing but return
+    /// these).
+    pub(crate) fn clean_heap(&self, heap: usize) -> Option<(Buffer, u64)> {
+        let dirty = DIRTY_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|m| m.get(&heap).is_some_and(|s| !s.is_empty()));
+        if dirty {
+            return None;
+        }
+        let heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let h = heaps.get(&heap)?;
+        Some((h.buffer.clone(), h.strides.as_ref().map_or(0, |(b, _)| b.gpu_address)))
+    }
+
     pub(crate) fn sync_heap(&self, heap: usize, count: u32, samplers: bool) -> Option<(Buffer, u64)> {
         super::metal_texture::drain_remap_partial();
         let dirty: Vec<(u32, u64)> = DIRTY_SLOTS
