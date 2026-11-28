@@ -101,6 +101,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(test)]
+mod lds_start_tests;
+#[cfg(test)]
 mod shader_gaps_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;

@@ -16,7 +16,7 @@ const STORE_V0: [u32; 2] = [0x38 << 26 | 0x1C << 18, 0x80 << 24 | 2 << 16];
 
 /// A wave64 compute program of `threads` threads (thread index in v0) with 4 root constants in
 /// s0..s3 and a raw UAV's descriptor loaded into s[8:11] from the table in s4, then `body`.
-fn native(body: &[u32], threads: u32) -> NativeProgram {
+pub(super) fn native(body: &[u32], threads: u32) -> NativeProgram {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
