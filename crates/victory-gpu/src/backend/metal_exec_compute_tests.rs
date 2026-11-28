@@ -348,6 +348,71 @@ fn host_cost_per_op() {
     }
 }
 
+/// An indirect dispatch of 150 records (more than one bounded translation
+/// takes) with a GPU count of 130: split into parts of at most 64 records,
+/// every one of the 130 runs exactly once, none past the count.
+#[test]
+#[ignore = "requires Metal"]
+fn indirect_dispatch_over_the_record_limit_is_split() {
+    let _pool = victory_metal::Pool::new();
+    let s = Setup::new();
+    s.reset();
+    let msl = "#include <metal_stdlib>
+using namespace metal;
+struct Entry { device atomic_uint *va; ulong tex; ulong meta; };
+struct Top { device const Entry *table; uint dst; uint src; uint add; uint pad; };
+kernel void k(constant Top &t [[buffer(2)]], uint3 g [[threadgroup_position_in_grid]]) {
+  atomic_fetch_add_explicit(&t.table->va[t.dst], 1u, memory_order_relaxed);
+  atomic_fetch_add_explicit(&t.table->va[t.dst + 1], g.x, memory_order_relaxed);
+}";
+    let pso = Arc::new(MetalCompute {
+        cost_ns: std::sync::atomic::AtomicU64::new(10_000),
+        name: "counting".into(),
+        pso: s.backend.device.compute_pipeline_msl(msl, "k").unwrap(),
+        threadgroup: [1, 1, 1],
+        top_level: victory_metal::ir::TopLevel::new(Vec::new(), 24),
+    });
+    // Record r dispatches (1 + r % 3) groups.
+    let records: Vec<u8> = (0..150u32).flat_map(|r| [1 + r % 3, 1, 1]).flat_map(u32::to_le_bytes).collect();
+    let records = s.backend.device.shared_buffer(&records).unwrap();
+    let count = s.backend.device.shared_buffer(&130u32.to_le_bytes()).unwrap();
+    s.backend.chunks().residency().add(&[records.handle(), count.handle()]);
+    s.backend.chunks().residency().commit();
+    let (top, tables) = s.top(50, 0, 0);
+    let op = Arc::new(MetalOp::DispatchIndirect(MetalDispatchIndirect {
+        pso,
+        heap: None,
+        sampler_heap: None,
+        top,
+        tables,
+        records,
+        records_offset: 0,
+        stride: 12,
+        max: 150,
+        count: Some((count, 0)),
+        records_va: 0,
+        count_va: None,
+    }));
+    let t = Timeline::new(s.backend.device.clone(), Config { max_segments_per_cb: 1, ..Config::default() }, Hooks::default()).unwrap();
+    for q in 0..2 {
+        t.queue(q).add_residency_set(s.backend.chunks().residency());
+    }
+    let rings: Vec<_> = t.ring_buffers().iter().map(|b| b.handle()).collect();
+    s.backend.chunks().residency().add(&rings);
+    s.backend.chunks().residency().commit();
+    let segs = segments(&[op]);
+    assert_eq!(segs.len(), 3, "150 records: 64 + 64 + 22");
+    t.submit(0, segs).unwrap();
+    assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
+    let w = s.words();
+    let groups: u32 = (0..130u32).map(|r| 1 + r % 3).sum();
+    assert_eq!(w[50], groups, "one add per group of the 130 live records");
+    // Group x indices: record r adds 0 + 1 + ... + (gx - 1).
+    let ids: u32 = (0..130u32).map(|r| (0..1 + r % 3).sum::<u32>()).sum();
+    assert_eq!(w[51], ids);
+    assert_eq!(t.stats().committed[0], 3);
+}
+
 mod draws {
     use super::super::*;
     use crate::backend::metal::{MetalBackend, diag};

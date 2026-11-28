@@ -2,7 +2,7 @@
 using namespace metal;
 
 struct Options {
-    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace;
+    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace, first;
 };
 
 struct Record {
@@ -25,8 +25,11 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
     if (id >= opts.max_count) return;
     Record result = {};
     Record original = {};
-    uint raw_count = opts.has_count ? *count : opts.max_count;
-    uint live = min(opts.max_count, raw_count);
+    // `first`: these records start at that record of the title's list (a
+    // list of more than RECORD_LIMIT records encoded in parts); the count is
+    // the whole list's.
+    uint raw_count = opts.has_count ? *count : opts.first + opts.max_count;
+    uint live = min(opts.max_count, raw_count > opts.first ? raw_count - opts.first : 0u);
     if (id < live) {
         device const uint *args = src + ulong(id) * opts.stride;
         uint words = opts.kind == 0 || opts.kind == 11 ? 4 : (opts.kind == 1 ? 5 : 3);

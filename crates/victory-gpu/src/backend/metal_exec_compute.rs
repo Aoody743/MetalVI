@@ -32,7 +32,8 @@ use super::{MetalCmd, MetalOp, work};
 
 /// Ops encoded through here: direct dispatches, indirect dispatches,
 /// segments made.
-pub(crate) static ENCODED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// (and extra parts of indirect dispatches split at `RECORD_LIMIT`).
+pub(crate) static ENCODED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// Moves Metal ops (and Metal objects without `Send`) to the encoder and
 /// completion threads; each is used by one thread at a time.
@@ -140,7 +141,19 @@ pub(crate) fn segments(ops: &[Arc<MetalOp>]) -> Vec<Segment> {
             }
             MetalOp::DispatchIndirect(c) => {
                 ENCODED[1].fetch_add(1, Ordering::Relaxed);
-                out.push(indirect(ops[i].clone(), c.tables.len(), c.max));
+                // More records than one bounded translation takes: in parts,
+                // each a command buffer of its own (not cut off).
+                let limit = victory_metal::indirect::RECORD_LIMIT;
+                let mut first = 0;
+                loop {
+                    let part = c.max.saturating_sub(first).min(limit);
+                    out.push(indirect(ops[i].clone(), c.tables.len(), first, part));
+                    first += part;
+                    if part == 0 || first >= c.max {
+                        break;
+                    }
+                    ENCODED[3].fetch_add(1, Ordering::Relaxed);
+                }
                 i += 1;
             }
             _ => unreachable!("compute_only checked"),
@@ -150,7 +163,8 @@ pub(crate) fn segments(ops: &[Arc<MetalOp>]) -> Vec<Segment> {
     out
 }
 
-fn indirect(op: Arc<MetalOp>, tables: usize, max: u32) -> Segment {
+/// Records `first..first + max` of an indirect dispatch.
+fn indirect(op: Arc<MetalOp>, tables: usize, first: u32, max: u32) -> Segment {
     static TRANSLATOR: OnceLock<Option<Sendable<IndirectTranslator>>> = OnceLock::new();
     let estimate = work::reservation(std::slice::from_ref(&op));
     let counter: Arc<OnceLock<Sendable<ClampCounter>>> = Arc::new(OnceLock::new());
@@ -171,12 +185,12 @@ fn indirect(op: Arc<MetalOp>, tables: usize, max: u32) -> Segment {
         let top = patched_top(e, &c.top, &c.tables)?;
         let source = IndirectSource {
             kind: IndirectKind::Dispatch,
-            records: (&c.records, c.records_offset),
+            records: (&c.records, c.records_offset + u64::from(first) * u64::from(c.stride)),
             stride: c.stride,
-            max_count: c.max,
+            max_count: max,
             count: c.count.as_ref().map(|(b, o)| (b, *o)),
         };
-        let Some(batch) = tr.0.encode_bounded(e.device, e.cb, &source, counter)? else { return Ok(()) };
+        let Some(batch) = tr.0.encode_bounded_part(e.device, e.cb, &source, counter, first)? else { return Ok(()) };
         let mut steps = Vec::new();
         for r in 0..batch.record_count() {
             let Some(rec) = batch.record(r) else { continue };

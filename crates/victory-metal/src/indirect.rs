@@ -125,7 +125,7 @@ impl IndirectTranslator {
         command: &CommandBuffer,
         source: &IndirectSource<'_>,
     ) -> Result<Option<IndirectBatch>> {
-        self.encode_impl(device, command, source, None, false)
+        self.encode_impl(device, command, source, None, false, 0)
     }
 
     pub fn encode_bounded(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter) -> Result<Option<IndirectBatch>> {
@@ -136,10 +136,21 @@ impl IndirectTranslator {
         if source.max_count > RECORD_LIMIT {
             return Err(Error("indirect record budget exceeded".into()));
         }
-        self.encode_impl(device, command, source, Some(counter), trace)
+        self.encode_impl(device, command, source, Some(counter), trace, 0)
     }
 
-    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>, trace: bool) -> Result<Option<IndirectBatch>> {
+    /// One part of a list of more than [`RECORD_LIMIT`] records: `source`
+    /// names the records from record `first` of the list on (at most
+    /// [`RECORD_LIMIT`] of them), its count (if any) is the whole list's.
+    /// Each part is bounded and clamped like [`Self::encode_bounded`].
+    pub fn encode_bounded_part(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter, first: u32) -> Result<Option<IndirectBatch>> {
+        if source.max_count > RECORD_LIMIT {
+            return Err(Error("indirect record budget exceeded".into()));
+        }
+        self.encode_impl(device, command, source, Some(counter), false, first)
+    }
+
+    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>, trace: bool, first: u32) -> Result<Option<IndirectBatch>> {
         if source.max_count == 0 {
             return Ok(None);
         }
@@ -184,8 +195,9 @@ impl IndirectTranslator {
             if counter.is_some() { record_budget().0 } else { 0 },
             record_budget().1,
             u32::from(trace),
+            first,
         ];
-        let mut options = [0; 40];
+        let mut options = [0; 44];
         for (dst, value) in options.chunks_exact_mut(4).zip(values) {
             dst.copy_from_slice(&value.to_le_bytes());
         }
