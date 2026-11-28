@@ -145,6 +145,22 @@ pub fn title_memory_persistent(at: usize, len: usize) {
     }
 }
 
+/// A section's persistent view at `[at, at+len)` is about to be unmapped
+/// (xmem frees the section). A prewired buffer over it would then show
+/// unmapped memory: warned, counted (not handled yet). Only try-locks
+/// `chunks` (the runtime's free path may hold its own locks).
+pub fn title_memory_persistent_gone(at: usize, len: usize) {
+    PREWIRE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(a, _)| a != at as u64);
+    static GONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let resident = BACKEND.get().and_then(|b| b.as_ref()).and_then(|m| m.chunks.try_lock().ok())
+        .map(|c| c.is_span(at as u64, len as u64));
+    if resident != Some(false) {
+        let n = GONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::warn!(n, at = format_args!("{at:#x}"), mb = len >> 20, resident = ?resident,
+            "Metal: a section freed while its prewired buffer may still be resident");
+    }
+}
+
 impl MetalBackend {
     /// Wires the queued persistent views whole ([`title_memory_persistent`]),
     /// before a batch encodes: inside the mapping gate and [`IN_FLIGHT`]

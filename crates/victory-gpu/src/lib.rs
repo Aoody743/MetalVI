@@ -68,7 +68,7 @@ pub use backend::metal_warm;
 #[cfg(windows)]
 pub use backend::metal::set_physical_alias;
 #[cfg(windows)]
-pub use backend::metal::title_memory_persistent;
+pub use backend::metal::{title_memory_persistent, title_memory_persistent_gone};
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub fn present_count() -> u64 {

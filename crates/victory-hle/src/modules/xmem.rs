@@ -368,6 +368,9 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        if let Some(view) = &self.persistent {
+            victory_gpu::title_memory_persistent_gone(view.at.Value as usize, view.len);
+        }
         drop(self.persistent.take());
         // SAFETY: our handle; title views keep the section alive on their own.
         unsafe { CloseHandle(self.handle) };

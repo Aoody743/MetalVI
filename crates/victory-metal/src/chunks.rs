@@ -398,6 +398,11 @@ impl Chunks {
         None
     }
 
+    /// Whether `[start, start+len)` is a live span exactly (a prewired view).
+    pub fn is_span(&self, start: u64, len: u64) -> bool {
+        start.checked_add(len).is_some_and(|end| self.spans.contains_key(&(start, end)))
+    }
+
     /// Wraps the whole never-remapped range `[start, start+len)` (a persistent
     /// view of a physical-page section) as one span, wired now: every view
     /// inside it then resolves to it and wires nothing more. Not counted
