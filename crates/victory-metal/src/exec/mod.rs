@@ -119,6 +119,10 @@ pub struct Config {
     /// Thread groups per command buffer (a segment over it runs alone).
     pub max_groups_per_cb: u64,
     pub barriers: BarrierPolicy,
+    /// Order consecutive all-compute command buffers of a queue by the
+    /// queue's `MTLFence` (GPU-only) instead of a wait on the chain event
+    /// (`VICTORY_METAL_EVENT_CHAIN=1`: always the event).
+    pub fence_chain: bool,
     pub faults: Faults,
 }
 
@@ -136,6 +140,7 @@ impl Default for Config {
             max_segments_per_cb: 64,
             max_groups_per_cb: 1 << 16,
             barriers: BarrierPolicy::Title,
+            fence_chain: true,
             faults: Faults::default(),
         }
     }
@@ -152,6 +157,7 @@ impl Config {
         Self {
             sync: std::env::var("VICTORY_METAL_SYNC").as_deref() == Ok("1"),
             barriers: BarrierPolicy::from_env(),
+            fence_chain: std::env::var("VICTORY_METAL_EVENT_CHAIN").as_deref() != Ok("1"),
             fuse_ns: env_u64("VICTORY_METAL_FUSE_MS", 250).max(1) * 1_000_000,
             max_in_flight: env_u64("VICTORY_METAL_INFLIGHT", 2).clamp(1, 16) as u32,
             in_flight_ns: env_u64("VICTORY_METAL_INFLIGHT_MS", 50).max(1) * 1_000_000,
@@ -322,6 +328,9 @@ pub struct Stats {
     pub cpu_signals: u64,
     /// `MTLFence` waits between encoders of one command buffer.
     pub encoder_fences: u64,
+    /// Command buffers ordered after the one before them by the queue's
+    /// `MTLFence` instead of a chain event wait.
+    pub chain_waits_skipped: u64,
     /// Times a queue's in-flight budget held its next command buffer back.
     pub budget_stalls: u64,
     /// Times ring space held a command buffer back.
@@ -662,7 +671,7 @@ impl Timeline {
             std::thread::Builder::new()
                 .name("metal-encoder".into())
                 .spawn(move || {
-                    let mut e = Encoder { inner, pending: (0..n).map(|_| VecDeque::new()).collect(), seq: vec![0; n], completion, quiesce: Vec::new(), drains: Vec::new() };
+                    let mut e = Encoder { inner, pending: (0..n).map(|_| VecDeque::new()).collect(), seq: vec![0; n], fenced: vec![false; n], completion, quiesce: Vec::new(), drains: Vec::new() };
                     e.run(rx);
                     drop(e);
                     for j in joins {
@@ -790,6 +799,9 @@ struct Encoder {
     inner: Arc<Inner>,
     pending: Vec<VecDeque<Segment>>,
     seq: Vec<u64>,
+    /// Whether the queue's last command buffer was compute only: its last
+    /// encoder updated the queue's fence, which the next one can wait on.
+    fenced: Vec<bool>,
     completion: Vec<Option<mpsc::Sender<Flight>>>,
     quiesce: Vec<mpsc::Sender<Result<()>>>,
     drains: Vec<mpsc::Sender<Result<bool>>>,
@@ -1033,11 +1045,16 @@ impl Encoder {
         }
         let mut slice = if ring_bytes == 0 { RingSlice::empty(lock(&qs.ring).buffer.clone()) } else { lock(&qs.ring).slice(&token) };
         let _pool = Pool::new();
+        let compute = |s: &Segment| matches!(&s.work, Work::Compute(items) if !items.is_empty());
+        let this_fenced = segs.iter().all(compute);
+        let fence_first = cfg.fence_chain && self.fenced[q] && compute(&segs[0]);
         let encoded = (|| -> Result<Encoded> {
             let cb = qs.queue.command_buffer()?;
             let seq = self.seq[q] + 1;
-            if seq > 1 {
+            if seq > 1 && !fence_first {
                 cb.encode_wait(&qs.chain, seq - 1);
+            } else if seq > 1 {
+                lock(&inner.stats).chain_waits_skipped += 1;
             }
             {
                 let mut st = lock(&inner.stats);
@@ -1063,7 +1080,7 @@ impl Encoder {
                         has_work |= !items.is_empty();
                         // Encoders of one command buffer are ordered by the
                         // queue's fence (untracked memory).
-                        let wait = (encoders > 0).then_some(&qs.fence);
+                        let wait = (encoders > 0 || fence_first).then_some(&qs.fence);
                         let plan = barrier::encode(&cb, &items, cfg.barriers, &mut slice, wait, Some(&qs.fence))?;
                         let mut st = lock(&inner.stats);
                         st.barriers += plan.barriers;
@@ -1111,6 +1128,7 @@ impl Encoder {
             return false;
         }
         self.seq[q] += 1;
+        self.fenced[q] = this_fenced;
         let seq = self.seq[q];
         {
             let mut f = lock(&qs.in_flight);

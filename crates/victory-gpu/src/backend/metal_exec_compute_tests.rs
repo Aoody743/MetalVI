@@ -300,3 +300,50 @@ fn timeline_compute_overlaps() {
         assert!((st.gpu_ns[q] - gpu_before[q]) * 2 < 16 * one, "queue {q}: dispatches did not overlap");
     }
 }
+
+/// Host cost per operation: 256 one-thread dispatches (a title barrier every
+/// fourth), through the old path and as timeline segments. Prints the game
+/// thread's time per op, the encoder thread's, and the wall time.
+#[test]
+#[ignore = "requires Metal"]
+fn host_cost_per_op() {
+    let _pool = victory_metal::Pool::new();
+    let s = Setup::new();
+    let ops: Vec<_> = (0..256u32).map(|i| s.direct(20 + (i % 40), 0, i, i % 4 == 0)).collect();
+    // Warm both paths.
+    assert!(s.backend.run(&ops[..8]));
+    let n = ops.len() as f64;
+    let start = std::time::Instant::now();
+    assert!(s.backend.run(&ops));
+    let old = start.elapsed().as_secs_f64() * 1e6 / n;
+    for max_in_flight in [2, 8] {
+    let t = Timeline::new(s.backend.device.clone(), Config { max_segments_per_cb: 1, max_in_flight, ..Config::default() }, Hooks::default()).unwrap();
+    for q in 0..2 {
+        t.queue(q).add_residency_set(s.backend.chunks().residency());
+    }
+    let rings: Vec<_> = t.ring_buffers().iter().map(|r| r.handle()).collect();
+    s.backend.chunks().residency().add(&rings);
+    s.backend.chunks().residency().commit();
+    t.submit(0, segments(&ops[..8])).unwrap();
+    assert!(t.drain(Duration::from_secs(5)).unwrap());
+
+    let encode_before = t.stats().encode_ns;
+    let gpu_before = t.stats().gpu_ns[0];
+    let start = std::time::Instant::now();
+    let segs = segments(&ops);
+    let built = start.elapsed().as_secs_f64() * 1e6 / n;
+    t.submit(0, segs).unwrap();
+    let game = start.elapsed().as_secs_f64() * 1e6 / n;
+    assert!(t.drain(Duration::from_secs(5)).unwrap());
+    let wall = start.elapsed().as_secs_f64() * 1e6 / n;
+    let st = t.stats();
+    let encoder = (st.encode_ns - encode_before) as f64 / 1e3 / n;
+    let gpu = (st.gpu_ns[0] - gpu_before) as f64 / 1e3 / n;
+    println!(
+        "HOST COST per op ({} build): old run() {old:.1} µs; timeline (in flight {max_in_flight}): game thread {game:.1} µs (segments {built:.1}), encoder {encoder:.1} µs, GPU busy {gpu:.1} µs, wall {wall:.1} µs; {} command buffers",
+        if cfg!(debug_assertions) { "debug" } else { "release" },
+        st.committed[0]
+    );
+    assert!(game < old / 4.0, "the game thread still pays the old cost");
+    }
+}

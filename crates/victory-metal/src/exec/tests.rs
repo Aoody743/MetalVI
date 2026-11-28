@@ -883,3 +883,27 @@ fn fault_hang_releases_waiters() {
 fn fault_outer_stop_releases_waiters() {
     stuck_producer(true);
 }
+
+/// Thirty-two command buffers on one queue, each reading what the one
+/// before it wrote (untracked memory): ordered by the queue's fence (no
+/// chain event waits) and, for comparison, by the chain event.
+#[test]
+#[ignore = "requires Metal"]
+fn fence_orders_command_buffers() {
+    let _pool = Pool::new();
+    let g = Gpu::new();
+    for fence_chain in [true, false] {
+        g.set(100, 5);
+        let t = g.timeline(Config { fence_chain, max_in_flight: 8, max_segments_per_cb: 1, ..cfg(false) });
+        let segs = (0..32u32).map(|i| Segment::new("link", Work::Compute(vec![g.add(101 + i, 100 + i, 1)]))).collect();
+        t.submit(0, segs).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
+        for i in 0..=32u32 {
+            assert_eq!(g.get((100 + i) as usize), 5 + i, "fence_chain {fence_chain}: link {i}");
+        }
+        let s = t.stats();
+        println!("fence_chain {fence_chain}: committed {:?} chain_waits_skipped {} max_in_flight {:?}", s.committed, s.chain_waits_skipped, s.max_in_flight);
+        assert_eq!(s.committed[0], 32);
+        assert_eq!(s.chain_waits_skipped, if fence_chain { 31 } else { 0 });
+    }
+}
