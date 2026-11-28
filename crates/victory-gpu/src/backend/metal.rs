@@ -75,6 +75,16 @@ fn physical_alias(va: u64, len: u64) -> Option<u64> {
     PHYSICAL_ALIAS.get().and_then(|f| f(va, len))
 }
 
+/// Held from a command buffer's commit to its completion, and by every
+/// residency-set wiring and commit: wiring never runs while the GPU executes
+/// work of this backend. A residency-set commit (wiring a 16 MiB span of a
+/// persistent alias view, no remap near) stuck in the kernel
+/// (`IOGPUResourceGroupUpdateResources`) and the game could not exit,
+/// stage-r-budget8k2-20261128-115816; the four such runs all had long
+/// multi-operation command buffers in flight. Lock order: the mapping gate,
+/// then this; never the reverse.
+pub(super) static IN_FLIGHT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Held while title memory is wrapped and wired ([`victory_metal::chunks::Gate`]):
 /// the readers' side of the runtime's mapping gate, which xmem holds as a
 /// writer while it changes mappings. Each wiring is logged first (rate
@@ -85,15 +95,17 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     if n <= 2000 || n.is_power_of_two() {
         tracing::info!(n, at = format_args!("{start:#x}"), mb = len >> 20, kb = len >> 10, aliased, "Metal: wiring title memory");
     }
-    struct Wiring(#[allow(dead_code)] crate::watch::Reading);
+    struct Wiring(#[allow(dead_code)] crate::watch::Reading, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     impl std::ops::Drop for Wiring {
         fn drop(&mut self) {
             work::after_wait();
         }
     }
     let reading = crate::watch::title_memory_reading_range(start as usize, len as usize);
+    work::here("waiting for the GPU to go idle (wiring)");
+    let flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     work::here("wiring title memory");
-    Box::new(Wiring(reading))
+    Box::new(Wiring(reading, flight))
 }
 
 /// Counts mapping changes. Recorded Metal lists can still contain old GPU
@@ -288,6 +300,8 @@ fn complete_checked(
     let command = cb.handle();
     work::report_large(label, encoded);
     let estimated_ns = work::reservation(ops);
+    work::here("waiting for residency changes");
+    let flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
     work::here("commit");
     if !fuse::commit_if_open(cb) {
         return Err(victory_metal::Error("Metal safety stop already tripped".into()));
@@ -295,6 +309,7 @@ fn complete_checked(
     let watch = inflight::watch(ops);
     work::here("waiting for a command buffer");
     let result = cb.wait();
+    drop(flight);
     work::after_wait();
     #[cfg(test)]
     let result = result.and_then(|()| if completion::INJECT_TIMEOUT.swap(false, std::sync::atomic::Ordering::AcqRel) {
@@ -534,6 +549,7 @@ impl MetalBackend {
             let chunks = self.chunks();
             // Wires what was added: never while xmem changes mappings.
             let _gate = crate::watch::title_memory_reading();
+            let _flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
             chunks.residency().commit();
         }
     }

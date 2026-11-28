@@ -81,12 +81,15 @@ pub(super) fn kind(op: &MetalOp) -> &'static str {
 /// (stage-r-m4-trace1200-20261128-042456: 76 slow batches, 75 s encoding and
 /// waiting, 0.26 s GPU). The estimate is twice the longest time seen; the
 /// clamp bounds indirect records and the fuse every measured time.
-/// `VICTORY_METAL_INDIRECT_LEARN=0` restores the old estimates.
+/// Off by default since 2026-11-28 (`VICTORY_METAL_INDIRECT_LEARN=1` turns
+/// it on): with it, command buffers held many operations and ran for tens
+/// of ms, and four runs ended with the game stuck in a residency-set commit
+/// in the kernel (see `IN_FLIGHT` in metal.rs); ~20 runs before had none.
 static SOLO_MAX_NS: std::sync::Mutex<Option<HashMap<usize, u64>>> = std::sync::Mutex::new(None);
 
 fn solo_learn() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_LEARN").as_deref() != Ok("0"))
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_LEARN").as_deref() == Ok("1"))
 }
 
 fn solo_key(op: &MetalOp) -> Option<usize> {
@@ -103,13 +106,12 @@ fn solo_key(op: &MetalOp) -> Option<usize> {
 }
 
 fn solo_estimate(op: &MetalOp) -> Option<u64> {
-    solo_key(op).map(solo_estimate_of)
+    let key = solo_key(op)?;
+    Some(if solo_learn() { solo_estimate_of(key) } else { WINDOW_NS })
 }
 
 fn solo_estimate_of(key: usize) -> u64 {
-    let seen = solo_learn()
-        .then(|| SOLO_MAX_NS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&key).copied())
-        .flatten();
+    let seen = SOLO_MAX_NS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|m| m.get(&key).copied());
     seen.map_or(WINDOW_NS, |ns| ns.saturating_mul(2).max(100_000))
 }
 
@@ -247,12 +249,12 @@ pub(in crate::backend) fn after_wait() {
     phase(lane, if lane == LANE_RUN { "run_batch encode" } else { "" });
 }
 
-/// `VICTORY_METAL_CUT_EVERY_PASS=1`: cut a bounded command buffer after
-/// every compute pass, as before 0056e07 (an A/B switch for the 2026-11-28
-/// freezes).
+/// Cut a bounded command buffer after every compute pass (as before
+/// 0056e07): the default again since 2026-11-28, for the reason given at
+/// `SOLO_MAX_NS`. `VICTORY_METAL_CUT_EVERY_PASS=0` cuts by dispatch count.
 pub(super) fn cut_every_pass() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_METAL_CUT_EVERY_PASS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_CUT_EVERY_PASS").as_deref() != Ok("0"))
 }
 
 /// An over-window operation runs alone. Replan after each completion so
