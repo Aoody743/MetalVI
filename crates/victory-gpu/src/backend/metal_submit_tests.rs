@@ -200,3 +200,26 @@ fn wiring_waits_for_the_command_buffer_in_flight() {
     assert!(wired + Duration::from_millis(5) >= done, "wired {:?} before the buffer completed", done - wired);
     assert!(u128::from(gpu_ns / 1_000_000) <= waited_ms + 10, "waited {waited_ms} ms for a {} ms buffer", gpu_ns / 1_000_000);
 }
+
+/// A section view the runtime reports is wired whole before the next batch;
+/// views inside it later resolve to it and wire nothing (no new span).
+#[test]
+fn a_reported_section_view_is_prewired_and_views_inside_wire_nothing() {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    let _pool = victory_metal::Pool::new();
+    let backend = MetalBackend::new().unwrap();
+    let bytes = 64usize << 20;
+    // SAFETY: a fresh allocation of our own, never freed (test).
+    let at = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+    assert_ne!(at, 0);
+    let before = backend.chunks().stats;
+    super::title_memory_persistent(at, bytes);
+    backend.prewire_pending();
+    let after = backend.chunks().stats;
+    assert_eq!(after.prewired, before.prewired + 1);
+    for (off, len) in [(0usize, 4096u64), (17 << 20, 1 << 20), (bytes - 256, 256)] {
+        let (b, o) = backend.chunks().window_buffer((at + off) as u64, len).expect("inside the section view");
+        assert_eq!((b.len, o), (bytes as u64, off as u64));
+    }
+    assert_eq!(backend.chunks().stats.spans, after.spans, "no span made: nothing wired after the prewire");
+}

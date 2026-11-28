@@ -109,12 +109,22 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
 }
 
 /// Persistent views of physical-page sections the runtime made, to be wired
-/// whole at the next safe point (`VICTORY_METAL_PREWIRE_SECTIONS=1`).
+/// whole at the next safe point. On by default
+/// (`VICTORY_METAL_PREWIRE_SECTIONS=0` turns it off): every stuck exit came
+/// from wiring during play, and this leaves one wiring per section instead
+/// of one per span. Up to `VICTORY_METAL_PREWIRE_CAP_MB` (default 16 GiB;
+/// the kernel's wire limit here is 52 GiB, 17.7 GiB were wired at the last
+/// freeze); sections past it get spans as before.
 static PREWIRE: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 fn prewire_sections() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_METAL_PREWIRE_SECTIONS").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_PREWIRE_SECTIONS").as_deref() != Ok("0"))
+}
+
+fn prewire_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| std::env::var("VICTORY_METAL_PREWIRE_CAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(16384) << 20)
 }
 
 /// The runtime made a physical-page section with a never-remapped view at
@@ -146,6 +156,11 @@ impl MetalBackend {
         }
         let mut chunks = self.chunks();
         for (at, len) in pending {
+            if chunks.stats.prewired_bytes.saturating_add(len) > prewire_cap() {
+                tracing::info!(at = format_args!("{at:#x}"), mb = len >> 20, prewired_mb = chunks.stats.prewired_bytes >> 20,
+                    "Metal: a persistent section view left to spans (prewire cap)");
+                continue;
+            }
             let ok = chunks.prewire(at, len);
             tracing::info!(at = format_args!("{at:#x}"), mb = len >> 20, ok, prewired_mb = chunks.stats.prewired_bytes >> 20, "Metal: a persistent section view wired whole");
         }
