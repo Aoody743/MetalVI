@@ -186,6 +186,75 @@ pub(super) fn gpu_busy(gpu_ns: u64, ops: &[Arc<MetalOp>]) {
     }
 }
 
+/// Host phases by lane, lock-free, for the hang watch: what a thread is
+/// doing (a `&'static str`) and since when (ms after the first phase). Lane 0
+/// is submission (`run`), lane 1 captures and presents.
+pub(super) const LANES: usize = 2;
+pub(super) const LANE_RUN: usize = 0;
+pub(super) const LANE_CAPTURE: usize = 1;
+static PHASE_PTR: [std::sync::atomic::AtomicPtr<u8>; LANES] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; LANES];
+static PHASE_LEN: [AtomicU64; LANES] = [const { AtomicU64::new(0) }; LANES];
+static PHASE_AT: [AtomicU64; LANES] = [const { AtomicU64::new(0) }; LANES];
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn now_ms() -> u64 {
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Marks `lane` as in `phase` (`""`: idle) from now on.
+pub(super) fn phase(lane: usize, phase: &'static str) {
+    PHASE_LEN[lane].store(phase.len() as u64, Ordering::Relaxed);
+    PHASE_PTR[lane].store(phase.as_ptr().cast_mut(), Ordering::Relaxed);
+    PHASE_AT[lane].store(now_ms(), Ordering::Release);
+}
+
+/// The phase `lane` has been in for over `ms`, its age, and when it began.
+pub(super) fn stuck_phase(lane: usize, ms: u64) -> Option<(&'static str, u64, u64)> {
+    let at = PHASE_AT[lane].load(Ordering::Acquire);
+    let (ptr, len) = (PHASE_PTR[lane].load(Ordering::Relaxed), PHASE_LEN[lane].load(Ordering::Relaxed) as usize);
+    if at == 0 || ptr.is_null() || len == 0 { return None; }
+    let age = now_ms().saturating_sub(at);
+    // SAFETY: only `&'static str`s are stored; a torn pair is re-read next second.
+    let phase = std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) }).ok()?;
+    (age > ms && PHASE_AT[lane].load(Ordering::Acquire) == at).then_some((phase, age, at))
+}
+
+thread_local! {
+    static LANE: std::cell::Cell<usize> = const { std::cell::Cell::new(LANE_CAPTURE) };
+}
+
+/// This thread's lane until the guard drops (then idle and back to captures).
+pub(super) fn lane(lane: usize) -> impl Drop {
+    struct Lane(usize);
+    impl Drop for Lane {
+        fn drop(&mut self) {
+            phase(self.0, "");
+            LANE.set(LANE_CAPTURE);
+        }
+    }
+    LANE.set(lane);
+    Lane(lane)
+}
+
+/// Marks this thread's lane as in `p`.
+pub(in crate::backend) fn here(p: &'static str) {
+    phase(LANE.get(), p);
+}
+
+/// After a wait or a capture: idle on the capture lane, encoding on the run lane.
+pub(in crate::backend) fn after_wait() {
+    let lane = LANE.get();
+    phase(lane, if lane == LANE_RUN { "run_batch encode" } else { "" });
+}
+
+/// `VICTORY_METAL_CUT_EVERY_PASS=1`: cut a bounded command buffer after
+/// every compute pass, as before 0056e07 (an A/B switch for the 2026-11-28
+/// freezes).
+pub(super) fn cut_every_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_CUT_EVERY_PASS").as_deref() == Ok("1"))
+}
+
 /// An over-window operation runs alone. Replan after each completion so
 /// observed costs can inform the next boundary.
 pub(super) fn prefix(ops: &[Arc<MetalOp>], max_ops: usize) -> usize {

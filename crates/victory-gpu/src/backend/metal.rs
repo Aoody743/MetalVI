@@ -267,11 +267,14 @@ fn complete_checked(
     let command = cb.handle();
     work::report_large(label, encoded);
     let estimated_ns = work::reservation(ops);
+    work::here("commit");
     if !fuse::commit_if_open(cb) {
         return Err(victory_metal::Error("Metal safety stop already tripped".into()));
     }
     let watch = inflight::watch(ops);
+    work::here("waiting for a command buffer");
     let result = cb.wait();
+    work::after_wait();
     #[cfg(test)]
     let result = result.and_then(|()| if completion::INJECT_TIMEOUT.swap(false, std::sync::atomic::Ordering::AcqRel) {
         Err(victory_metal::Error("injected system timeout after bounded GPU completion".into()))
@@ -534,7 +537,10 @@ impl MetalBackend {
     /// after this returns. False if it failed.
     pub(crate) fn run(&self, ops: &[Arc<MetalOp>]) -> bool {
         static SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        work::here("waiting for the submission lock");
         let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
+        let _lane = work::lane(work::LANE_RUN);
+        work::here("run_batch");
         let ok = self.run_serial(ops);
         if !ok {
             fuse::stop();
@@ -928,7 +934,8 @@ impl MetalBackend {
                     let mut in_pass = 0u32;
                     while let Some(MetalOp::Dispatch(c)) = ops.get(i).map(|o| &**o) {
                         // A pass of at most `pass_dispatches` (see `bounded`).
-                        if i == planned_end || cb_dispatches.saturating_add(in_pass) >= pass_dispatches {
+                        let cap = if work::cut_every_pass() { in_pass } else { cb_dispatches.saturating_add(in_pass) };
+                        if i == planned_end || cap >= pass_dispatches {
                             break;
                         }
                         in_pass += 1;
@@ -1355,7 +1362,9 @@ impl MetalBackend {
                 Some("estimated time")
             } else if split {
                 Some("diagnostic pass")
-            } else if bounded && cb_dispatches >= pass_dispatches {
+            } else if bounded && (cb_dispatches >= pass_dispatches
+                || work::cut_every_pass() && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_)))
+            {
                 Some("compute pass")
             } else {
                 None
@@ -1372,6 +1381,7 @@ impl MetalBackend {
                 let value = SPLIT_VALUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 cb.encode_signal_event(split_event, value);
                 tracing::debug!(batch, command = cb.handle(), first = cb_start, end = i, reason, "Metal: command buffer operations");
+                work::here("bounded pass submit");
                 let result = submit_checked(&cb, &ops[cb_start..i], true, "bounded pass");
                 work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces);
                 if let Err(e) = result {
@@ -1392,8 +1402,10 @@ impl MetalBackend {
                             ?before, ?after, "Metal: indirect writer snapshot");
                     }
                 }
+                work::here("new command buffer");
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
+                work::here("run_batch encode");
                 let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 tracing::info!(total, reason, ops = i - cb_start, first = work::kind(&ops[cb_start]),
                     estimated_us = work::reservation(&ops[cb_start..i]) / 1000, next = work::kind(&ops[i]),
@@ -1414,7 +1426,9 @@ impl MetalBackend {
             }
         }
         let encoded_at = started.elapsed();
+        work::here("residency commit");
         self.commit_residency();
+        work::here("main batch submit");
         let committed_at = started.elapsed();
         tracing::debug!(batch, command = cb.handle(), first = cb_start, end = ops.len(), reason = "batch end", "Metal: command buffer operations");
         let waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
@@ -2272,7 +2286,7 @@ mod depth_replay_tests;
 mod static_sampler_repro_tests;
 
 #[path = "metal_work.rs"]
-mod work;
+pub(super) mod work;
 
 #[path = "metal_completion.rs"]
 mod completion;
@@ -2283,6 +2297,10 @@ pub(crate) mod diag;
 #[cfg(test)]
 #[path = "metal_half_sync_repro_tests.rs"]
 mod half_sync_repro_tests;
+
+#[cfg(test)]
+#[path = "metal_submit_tests.rs"]
+mod submit_tests;
 
 /// Names what a command buffer that does not complete was running: a
 /// GPU-side hang (a shader that never ends) blocks `cb.wait()` with no
@@ -2386,16 +2404,34 @@ mod inflight {
         MONITOR.call_once(|| {
             let _ = std::thread::Builder::new().name("metal-hang-watch".into()).spawn(|| {
                 let mut told = 0;
+                let mut stuck_told = [0u64; super::work::LANES];
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
-                    let now = NOW.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some((serial, started, what, args)) = &*now
-                        && *serial != told
-                        && started.elapsed() > Duration::from_secs(8)
-                    {
-                        told = *serial;
-                        let args = args_now(args);
-                        tracing::warn!(elapsed_s = started.elapsed().as_secs(), ops = %what, indirect = %args, "Metal: a command buffer has not completed (GPU hang?)");
+                    // Host phases first: lock-free, so a thread stuck holding a
+                    // lock (or in a Metal call) cannot keep this quiet.
+                    for (lane, told_at) in stuck_told.iter_mut().enumerate() {
+                        if let Some((phase, since_ms, at)) = super::work::stuck_phase(lane, 8_000)
+                            && *told_at != at
+                        {
+                            *told_at = at;
+                            tracing::warn!(lane, phase, since_ms, "Metal: stuck in a host phase (hang?)");
+                        }
+                    }
+                    // Copy out and unlock before logging or reading title memory
+                    // (`Watch::drop` takes this lock on the submitting thread).
+                    let held = {
+                        let now = NOW.lock().unwrap_or_else(|e| e.into_inner());
+                        match &*now {
+                            Some((serial, started, what, args)) if *serial != told && started.elapsed() > Duration::from_secs(8) =>
+                                Some((*serial, started.elapsed().as_secs(), what.clone(), args.clone())),
+                            _ => None,
+                        }
+                    };
+                    if let Some((serial, elapsed_s, what, args)) = held {
+                        told = serial;
+                        tracing::warn!(elapsed_s, ops = %what, "Metal: a command buffer has not completed (GPU hang?)");
+                        let args = args_now(&args);
+                        tracing::warn!(elapsed_s, indirect = %args, "Metal: the hung command buffer's indirect arguments");
                     }
                 }
             });

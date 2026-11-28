@@ -745,6 +745,7 @@ impl MetalBackend {
             return;
         }
         let (row, bytes) = (row as u32, bytes64 as usize);
+        super::metal::work::here("capture alloc");
         let _pool = victory_metal::Pool::new();
         // SAFETY: a fresh allocation, freed after the GPU is done.
         let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
@@ -752,13 +753,16 @@ impl MetalBackend {
             return;
         }
         // SAFETY: lives until the blit is waited for.
+        super::metal::work::here("capture wrap");
         if let Ok(buffer) = unsafe { self.device.wrap(mem, bytes as u64) }
             && let Ok(cb) = self.queue.command_buffer()
             && let Ok(mut blit) = cb.blit_encoder()
         {
             blit.copy_from_texture_to_buffer(&t.texture, 0, 0, [0, 0, 0], [u64::from(w), u64::from(h), 1], &buffer, 0, row, row * h);
             blit.finish();
+            super::metal::work::here("capture submit");
             if super::metal::submit_checked(&cb, &[], true, "capture readback").is_ok() {
+                super::metal::work::here("capture write");
                 // SAFETY: the GPU wrote `bytes` bytes there.
                 let data = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), bytes) };
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
@@ -791,6 +795,7 @@ impl MetalBackend {
         }
         // SAFETY: ours, the GPU is done.
         unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+        super::metal::work::after_wait();
     }
 }
 
