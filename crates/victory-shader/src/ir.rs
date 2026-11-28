@@ -277,7 +277,7 @@ fn unspill(
     // per instruction the scalar codes it writes.
     let mut stores = [false; 256];
     let mut other = [false; 256];
-    let mut used = [false; 128];
+    let mut used = [false; 256];
     let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
@@ -633,7 +633,15 @@ fn loop_beyond(p: &Program, first: usize, stop: Option<usize>) -> bool {
 /// body is then code every lane runs, which a console wave run as two host
 /// waves needs for the barriers of its exchanges and LDS accesses. Not where a
 /// loop follows ([`loop_beyond`]). `None` if the program has no such branch.
-pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
+///
+/// `never`: per block, whether the structure of `p` shows that no lane reaching it takes its
+/// closing branch (`when` false: an `s_cbranch_execz` behind `s_and_saveexec` with the launch
+/// mask, which no wave past the early-out has empty). Those go too, where an early-out goes:
+/// the lanes that would have left reach them with EXEC clear and would take them, each on its
+/// own, which makes the scalars set on the path they skip (an immediate sampler) a different
+/// value per lane where the paths join. Leaving them out changes nothing for a wave that has a
+/// lane left; one that has none ended at the early-out on the console. Not over a loop either.
+pub(crate) fn without_early_outs(p: &Program, never: &[bool]) -> Option<Program> {
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
             && p.blocks[b].insts.iter().all(|i| matches!(i.fields, crate::gfx10::Fields::Sopp { .. }))
@@ -655,6 +663,18 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     }
     if !any {
         return None;
+    }
+    for (b, block) in blocks.iter_mut().enumerate() {
+        let Exit::Branch { taken, not_taken } = block.exit else {
+            continue;
+        };
+        if never.get(b).copied().unwrap_or(false)
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !loop_beyond(p, not_taken, Some(taken))
+        {
+            block.insts.pop();
+            block.exit = Exit::Jump(not_taken);
+        }
     }
     for block in &mut blocks {
         block.phis.clear();
@@ -1605,6 +1625,23 @@ mod tests {
     fn build_words(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         build(&code, wave64, 256).unwrap()
+    }
+
+    /// Scalar destination codes can name constants rather than registers.
+    /// The parking search must handle them without indexing past its table.
+    #[test]
+    fn scalar_codes_past_the_registers_do_not_panic() {
+        // v_writelane_b32 v1, s0, 0: make the scalar parking search run.
+        const PARK: [u32; 2] = [0xD761_0001, 0x0001_0000];
+        for (words, wave64) in [
+            ([0xD4C5_A8D7, 0x9342_BFA0], true),
+            ([0xD401_53FF, 0x0509_8D04], false),
+            ([0xD4EC_FE8B, 0x1234_5678], false),
+        ] {
+            let words = [&PARK[..], &words[..], &[S_ENDPGM]].concat();
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let _ = build(&code, wave64, 256);
+        }
     }
 
     fn input(p: &Program, reg: Reg) -> Value {

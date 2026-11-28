@@ -2375,6 +2375,10 @@ pub(crate) mod diag;
 mod half_sync_repro_tests;
 
 #[cfg(test)]
+#[path = "metal_append_idiom_repro_tests.rs"]
+mod append_idiom_repro_tests;
+
+#[cfg(test)]
 #[path = "metal_submit_tests.rs"]
 mod submit_tests;
 

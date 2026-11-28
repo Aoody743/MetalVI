@@ -293,6 +293,8 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// With `split_lds`: the program's own start of its LDS is stored ([`Self::lds_start`]).
+    lds_started: bool,
     wave_base: Option<V>,
     /// Per-console-wave bounded LDS atomic barrier (`(base_dword, n_waves)`) so two host
     /// halves of one console wave can meet inside per-wave branches and groups > 64 threads.
@@ -355,6 +357,11 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+#[path = "lds_start.rs"]
+mod lds_start_impl;
+pub(super) use lds_start_impl::lds_start;
+#[cfg(test)]
+pub(super) use lds_start_impl::TEST_LDS_START;
 #[path = "lower_diag.rs"]
 mod diag;
 
@@ -1747,6 +1754,7 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            lds_started: false,
             wave_base: None,
             half_sync_slot,
             wave_scratch_uav,
@@ -2431,6 +2439,7 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        self.lds_start();
         self.init_half_sync();
         self.inputs()?;
         if let Some(mesh) = self.s.mesh {
@@ -6471,6 +6480,32 @@ impl<'a> Lower<'a> {
             if sampler {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
+            }
+            // A buffer view whose record count (dword 2) the code reads and that no
+            // instruction reads through (a test for a null view, `s_cmp_eq_u32 s2, 0`,
+            // before the program does anything): its kind is the one the table declares
+            // there, the count that of the host view, as for a view the code also reads
+            // ([`Self::descriptor_words`], which gives the address too where it can).
+            if count == 4
+                && inst.write(Reg::S(code + 2)).is_some_and(|v| {
+                    self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.reads.iter().any(|r| r.1 == v))
+                })
+            {
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                if let Some(u) = used
+                    && u.dwords == 4
+                    && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)
+                {
+                    let uav = u.kind == ResourceType::Uav;
+                    let flag = if uav { 0x1000 } else { 0 };
+                    let props = if u.stride >= 4 && u.stride.is_multiple_of(4) {
+                        (12 | flag, u.stride)
+                    } else {
+                        (11 | flag, 0)
+                    };
+                    return self.descriptor_words(inst, site, code, count, 0, &src, used, props, None, uav);
+                }
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address

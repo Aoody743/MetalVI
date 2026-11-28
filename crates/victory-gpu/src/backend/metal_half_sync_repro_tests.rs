@@ -412,6 +412,35 @@ const LDS_LOOP: &[u32] = &[
     0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
 ];
 
+/// a1bf269d5b19f025's counting loops (0xe0, 0x2a0, 0x350, 0x4d0): a loop each lane leaves on
+/// its own (`v_cmpx_eq_u32` + `s_andn2_b64` of the lanes left + `s_cbranch_scc1` to a latch
+/// that takes EXEC back to them) with an LDS add inside. Lane t goes round 4 times when
+/// t < s0, else once; then every lane stores what LDS dword 0 summed up.
+const COUNTING_LOOP: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0x7E02_0280, // v_mov_b32 v1, 0
+    0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+    0x7E0A_0284, // v_mov_b32 v5, 4
+    0x0208_0A81, // v_cndmask_b32 v4, 1, v5, vcc
+    0x7E0C_0281, // v_mov_b32 v6, 1
+    0x7E0E_0280, // v_mov_b32 v7, 0
+    0xD834_0000, 0x0000_0707, // ds_write_b32 v7, v7
+    0xBE98_047E, // s_mov_b64 s[24:25], exec
+    0xBE94_047E, // s_mov_b64 s[20:21], exec
+    0xBF82_0001, // s_branch HEADER
+    0x87FE_1416, // LATCH: s_and_b64 exec, s[22:23], s[20:21]
+    0x4A02_0281, // HEADER: v_add_nc_u32 v1, 1, v1
+    0xBE96_047E, // s_mov_b64 s[22:23], exec
+    0xD800_0000, 0x0000_0607, // ds_add_u32 v7, v6
+    0x7DA4_0901, // v_cmpx_eq_u32 exec, v1, v4
+    0x8994_7E14, // s_andn2_b64 s[20:21], s[20:21], exec
+    0xBF85_FFF8, // s_cbranch_scc1 LATCH
+    0xBEFE_0418, // s_mov_b64 exec, s[24:25]
+    0xD8D8_0000, 0x0100_0007, // ds_read_b32 v1, v7
+    0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+];
+
 #[test]
 fn a_per_lane_loop_with_lds_inside_runs_in_both_halves_together() {
     let _pool = victory_metal::Pool::new();
@@ -424,4 +453,53 @@ fn a_per_lane_loop_with_lds_inside_runs_in_both_halves_together() {
         r.out[0], r.out[31], r.out[32], r.out[63], r.timeouts, r.ms);
     assert_eq!(r.timeouts, 0, "half-wave syncs timed out: {:?}", r.sites);
     assert!(r.out.iter().all(|&v| v == 2080), "{:?}", r.out);
+}
+
+fn counting_loop_case(backend: &MetalBackend, shader: &victory_shader::emit::HostShader) -> Vec<(u32, u32, u64)> {
+    let mut bad = Vec::new();
+    for live in [0u32, 10, 31, 32, 33, 40, 64] {
+        let r = run(backend, shader, 64, 2, live);
+        let want = live * 4 + (64 - live);
+        let ok = r.out.iter().all(|&v| v == want);
+        eprintln!("REPRO counting loop, live {live:2}: {} (want {want}, lanes 0/32/63 {}/{}/{}), timeouts {} at {:?}, GPU {:.3} ms",
+            if ok { "right" } else { "WRONG" }, r.out[0], r.out[32], r.out[63], r.timeouts, r.sites, r.ms);
+        if !ok || r.timeouts != 0 {
+            bad.push((live, r.out[0], r.timeouts));
+        }
+    }
+    bad
+}
+
+/// The halves of a console wave go round a different number of times when the lanes that
+/// count longer are all in one half (s0 = 10, 31, 32). The old translation
+/// (`VICTORY_WAVE_LOOP_EXITS=0`) puts a half-wave sync before the LDS add inside the loop: the
+/// halves meet there a different number of times, fall out of step (4 timeouts) and the upper
+/// half reads a sum without the lower half's later adds.
+///
+/// KNOWN WRONG with b3813a9 too, by another way: the loop exit refused, this program (no
+/// cross-lane instruction) is taken by "local waves (idiom)", each host wave a wave of its
+/// own with no meetings at all, which the idiom check calls exact although the console orders
+/// the halves' LDS accesses by running them in one wave: the upper half reads 64 (no timeout).
+/// None of the F85 programs this concerns is taken that way (they hold cross-lane code); the
+/// branch's retired lane-loop regions (942f76f) gave this one LDS meetings and the right sum.
+/// Needs the idiom check to refuse LDS one half writes and the other reads without a barrier.
+#[test]
+#[ignore = "known wrong: local waves (idiom) take an LDS loop without meetings; see the comment"]
+fn a_loop_lanes_leave_on_their_own_keeps_the_halves_in_step() {
+    let _pool = victory_metal::Pool::new();
+    victory_shader::emit::set_host_max_wave(32);
+    let mut native = program_of(COUNTING_LOOP, true);
+    native.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 15, threads: [64, 1, 1] }); // 512 bytes of LDS
+    let shader = victory_shader::emit::translate_native(&native).expect("translate");
+    assert!(shader.root_uavs.contains(&victory_shader::emit::SLOT_DIAG), "no half_sync was emitted");
+    // (the old translation, for the record: run alone, as the tests here are)
+    unsafe { std::env::set_var("VICTORY_WAVE_LOOP_EXITS", "0") };
+    let old = victory_shader::emit::translate_native(&native).expect("translate the old way");
+    unsafe { std::env::remove_var("VICTORY_WAVE_LOOP_EXITS") };
+    let backend = MetalBackend::new().unwrap();
+    let bad_old = counting_loop_case(&backend, &old);
+    eprintln!("REPRO counting loop, old translation: (live, lane 0, timeouts) wrong {bad_old:?}");
+    let bad = counting_loop_case(&backend, &shader);
+    assert!(bad.is_empty(), "(live, lane 0, timeouts): {bad:?}");
+    assert!(!bad_old.is_empty(), "the old translation was expected to fall out of step");
 }
