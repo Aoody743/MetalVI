@@ -171,7 +171,7 @@ impl MetalBackend {
     /// Wires the queued persistent views whole ([`title_memory_persistent`]),
     /// before a batch encodes: inside the mapping gate and [`IN_FLIGHT`]
     /// (the chunks gate), never while this backend's GPU work runs.
-    fn prewire_pending(&self) {
+    pub(crate) fn prewire_pending(&self) {
         let pending = std::mem::take(&mut *PREWIRE.lock().unwrap_or_else(|e| e.into_inner()));
         if pending.is_empty() {
             return;

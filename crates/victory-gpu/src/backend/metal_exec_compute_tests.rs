@@ -734,4 +734,147 @@ mod draws {
             println!("PROFILE {phase:?}: {:.1} µs/op ({:.0}%), entered {k}", *ns as f64 / 1e3 / n, *ns as f64 * 100.0 / total.max(1) as f64);
         }
     }
+
+    /// Compute ops on `backend`: `b[dst] = b[src] + add` in a fresh 64-word
+    /// buffer (as `Setup::direct`), plus the buffer's CPU view.
+    fn compute_ops(backend: &MetalBackend) -> (impl Fn(u32, u32, u32, Option<[(u64, victory_metal::Buffer, u64); 2]>) -> Arc<MetalOp>, victory_metal::Buffer, *mut u32) {
+        use crate::backend::metal::{MetalCmd, MetalCompute};
+        let pso = Arc::new(MetalCompute {
+            cost_ns: std::sync::atomic::AtomicU64::new(10_000),
+            name: "exec plan test".into(),
+            pso: backend.device.compute_pipeline_msl(super::MSL, "k").unwrap(),
+            threadgroup: [1, 1, 1],
+            top_level: victory_metal::ir::TopLevel::new(Vec::new(), 24),
+        });
+        let (mem, cpu) = backend.device.shared_buffer_untracked_mapped(&[0u8; 64 * 4]).unwrap();
+        backend.chunks().residency().add(&[mem.handle()]);
+        backend.chunks().residency().commit();
+        let va = mem.gpu_address;
+        let make = move |dst: u32, src: u32, add: u32, loop_counts: Option<[(u64, victory_metal::Buffer, u64); 2]>| {
+            let mut top = vec![0u8; 8];
+            for v in [dst, src, add, 0] {
+                top.extend_from_slice(&v.to_le_bytes());
+            }
+            Arc::new(MetalOp::Dispatch(MetalCmd {
+                pso: pso.clone(),
+                heap: None,
+                sampler_heap: None,
+                top,
+                groups: [1, 1, 1],
+                tables: vec![(0, DescriptorEntry::buffer(va, 64 * 4))],
+                loop_counts,
+                after_barrier: true,
+            }))
+        };
+        (make, mem, cpu.cast())
+    }
+
+    /// One part mixing dispatches, draws / clears / copies and an op the
+    /// old path must run (a dispatch with loop-count snapshots): `plan`
+    /// sends the dispatches straight to the timeline (V0: none ever went
+    /// there), the draws through run_batch's encoding, the snapshot
+    /// dispatch through the host closure, in order; the texture checks run
+    /// first; results equal the old path.
+    #[test]
+    #[ignore = "requires Metal"]
+    fn plan_routes_a_mixed_part() {
+        let _pool = victory_metal::Pool::new();
+        let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+        let (seq, textures) = sequence(backend);
+        let (dispatch, mem, cpu) = compute_ops(backend);
+        // A dispatch the old path must run (loop-count inputs to snapshot).
+        let snapshot = dispatch(5, 4, 1, Some([(0, mem.clone(), 0), (0, mem.clone(), 4)]));
+        let mut ops = vec![dispatch(1, 0, 1, None), dispatch(2, 1, 1, None)];
+        ops.extend(seq.iter().cloned());
+        ops.push(dispatch(3, 2, 1, None));
+        ops.push(dispatch(4, 3, 1, None));
+        ops.push(snapshot);
+        ops.push(dispatch(6, 5, 1, None));
+        let routes: Vec<_> = pieces(&ops, true, true).into_iter().map(|(r, range)| (r, range.len())).collect();
+        assert_eq!(routes, [(Route::Compute, 2), (Route::Encode, seq.len()), (Route::Compute, 2), (Route::Host, 1), (Route::Compute, 1)]);
+        // Without direct compute the dispatches go with run_batch's encoding.
+        assert_eq!(pieces(&ops, false, true).len(), 3);
+        // SAFETY: inside the buffer; no GPU work in flight.
+        unsafe { cpu.write_volatile(7) };
+        let t = timeline(backend);
+        diag::LAST_GPU_NS.store(u64::MAX, Ordering::Relaxed);
+        let checked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let c2 = checked.clone();
+        let before: Option<Box<dyn FnOnce() + Send>> = Some(Box::new(move || c2.store(true, Ordering::Release)));
+        let hosts = Arc::new(AtomicU64::new(0));
+        let h2 = hosts.clone();
+        let host = move |run: Vec<Arc<MetalOp>>| {
+            let ops = Sendable(run);
+            let h = h2.clone();
+            victory_metal::exec::Segment::new("host", Work::Host(Box::new(move || {
+                let ops = ops;
+                h.fetch_add(1, Ordering::Relaxed);
+                backend.run(&ops.0)
+            })))
+        };
+        let encoded = ENCODED[0].load(Ordering::Relaxed);
+        let routed = ROUTED.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let segs = plan(backend, &ops, true, true, before, host);
+        t.submit(0, segs).unwrap();
+        assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
+        assert!(t.stopped().is_none(), "{:?}", t.stopped());
+        assert!(checked.load(Ordering::Acquire), "the texture checks ran");
+        assert_eq!(hosts.load(Ordering::Relaxed), 1, "one run on the old path");
+        assert_eq!(ENCODED[0].load(Ordering::Relaxed) - encoded, 5, "five dispatches straight to the timeline");
+        let routed: Vec<u64> = ROUTED.iter().zip(routed).map(|(c, b)| c.load(Ordering::Relaxed) - b).collect();
+        assert_eq!(routed, [5, seq.len() as u64, 1]);
+        // SAFETY: read after completion.
+        let words: Vec<u32> = (0..7).map(|i| unsafe { cpu.add(i).read_volatile() }).collect();
+        assert_eq!(words, [7, 8, 9, 10, 11, 12, 13], "every route in order");
+        assert_eq!(read(backend, &textures), expected(), "draws as on the old path");
+        println!("plan: routes {routes:?}, committed {:?}", t.stats().committed);
+    }
+
+    /// V0 R3 encoded one batch of 4,772 ops as one unit (2.8 s). Chunks of
+    /// `run_batch` encoding are now capped in ops: 80 draw-sequence ops at
+    /// a cap of 16 go out in at least 5 command buffers, encoding overlaps
+    /// the GPU, and the result is the old path's.
+    #[test]
+    #[ignore = "requires Metal"]
+    fn long_runs_are_cut_into_chunks() {
+        let _pool = victory_metal::Pool::new();
+        let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+        let (seq, textures) = sequence(backend);
+        let mut ops = Vec::new();
+        for _ in 0..8 {
+            ops.extend(seq.iter().cloned());
+        }
+        ops.truncate(80);
+        while ops.len() < 80 {
+            ops.push(seq[0].clone());
+        }
+        // The same ops on the old path, on a second backend, for the result.
+        let old_backend = MetalBackend::new().unwrap();
+        let (old_seq, old_textures) = sequence(&old_backend);
+        let mut old_ops = Vec::new();
+        for _ in 0..8 {
+            old_ops.extend(old_seq.iter().cloned());
+        }
+        old_ops.truncate(80);
+        while old_ops.len() < 80 {
+            old_ops.push(old_seq[0].clone());
+        }
+        assert!(old_backend.run(&old_ops), "old path failed");
+        let old = read(&old_backend, &old_textures);
+
+        let t = timeline(backend);
+        let before = GENERAL.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let segs = general_segments_capped(backend, &ops, None, 16);
+        let n = segs.len();
+        t.submit(0, segs).unwrap();
+        assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
+        assert!(t.stopped().is_none(), "{:?}", t.stopped());
+        let after = GENERAL.each_ref().map(|c| c.load(Ordering::Relaxed));
+        let st = t.stats();
+        println!("chunks: {} ops in {n} chunks, committed {:?}, max in flight {:?}", after[0] - before[0], st.committed, st.max_in_flight);
+        assert_eq!(after[0] - before[0], 80);
+        assert!(n >= 5, "at most 16 ops a chunk: {n} chunks");
+        assert_eq!(after[1] - before[1], n as u64);
+        assert_eq!(read(backend, &textures), old, "same as the old path");
+    }
 }

@@ -277,13 +277,18 @@ pub struct Segment {
     /// Told the measured GPU time of the segment's command buffer once it
     /// completed (the whole buffer's: exact when it holds one segment).
     pub observe: Option<Box<dyn FnOnce(u64) + Send>>,
+    /// Run on the encoder thread once the segment's waits are met (or on the
+    /// GPU), before its command buffer's `prepare` hook (host work: before
+    /// it runs): the title's deferred texture checks, whose uploads the
+    /// hook then flushes.
+    pub before: Option<Box<dyn FnOnce() + Send>>,
     forced: bool,
     held_counted: bool,
 }
 
 impl Segment {
     pub fn new(label: &'static str, work: Work) -> Self {
-        Self { label, waits: Vec::new(), work, signals: Vec::new(), writes: Vec::new(), estimate_ns: 0, observe: None, forced: false, held_counted: false }
+        Self { label, waits: Vec::new(), work, signals: Vec::new(), writes: Vec::new(), estimate_ns: 0, observe: None, before: None, forced: false, held_counted: false }
     }
     pub fn wait_fence(mut self, fence: FenceId, value: u64) -> Self {
         self.waits.push(Wait::Fence { fence, value });
@@ -1161,6 +1166,11 @@ impl Encoder {
                 }
             }
         };
+        for s in &mut segs {
+            if let Some(f) = s.before.take() {
+                f();
+            }
+        }
         if !(inner.hooks.prepare)() {
             lock(&qs.ring).fifo.give_back(token);
             inner.fault(format!("queue {q}: preparing a command buffer failed"));
@@ -1335,6 +1345,9 @@ impl Encoder {
         let Work::Host(run) = s.work else { unreachable!("host segment") };
         if s.forced && !s.waits.is_empty() {
             lock(&inner.stats).forced += 1;
+        }
+        if let Some(f) = s.before {
+            f();
         }
         let ok = run();
         lock(&inner.stats).host_runs += 1;
