@@ -898,6 +898,28 @@ impl<'a> Lanes<'a> {
             return (m, false);
         }
         let p = self.p;
+        // A pair moved dword by dword (the compiler parks a mask in two `ttmp` registers
+        // with two `s_mov_b32` and takes it back the same way): the mask of the pair moved.
+        if self.p.wave64 && k.0 != k.1 {
+            let copied = |v: Value| {
+                let &(b, i) = self.defs.get(&v)?;
+                let inst = &p.blocks[b].insts[i];
+                match (inst.name(), inst.reads.as_slice(), inst.writes.as_slice()) {
+                    ("s_mov_b32", [(Reg::S(r), from)], [(Reg::S(_), to)]) if *to == v => Some((*r, *from)),
+                    _ => None,
+                }
+            };
+            // (from two registers side by side, low dword first)
+            if let (Some((r_lo, lo)), Some((r_hi, hi))) = (copied(k.0), copied(k.1))
+                && lo != hi
+                && r_lo.checked_add(1) == Some(r_hi)
+            {
+                let m = self.mask((lo, hi));
+                let cache = if m.1 { &mut self.masks } else { &mut self.other };
+                cache.insert(k, m.0);
+                return m;
+            }
+        }
         let (m, derived) = match self.join(k) {
             Some(join) => join,
             None => {

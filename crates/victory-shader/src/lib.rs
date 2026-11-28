@@ -63,6 +63,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/rect.rs"),
         include_str!("emit/sampler.rs"),
         include_str!("emit/shader.rs"),
+        include_str!("emit/shader_gaps_tests.rs"),
         include_str!("emit/threading.rs"),
         include_str!("emit/validator.rs"),
         include_str!("emit/valu_tests.rs"),

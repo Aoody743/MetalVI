@@ -100,6 +100,8 @@ mod shader;
 mod threading;
 #[cfg(windows)]
 pub mod validator;
+#[cfg(test)]
+mod shader_gaps_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -280,6 +282,16 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    static LAST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// The wave size the last program emitted on this thread declared (`None`: none), for
+/// translation surveys: after a successful [`translate`], the size of the shader it returned.
+pub fn last_wave() -> Option<u32> {
+    LAST_WAVE.get()
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -394,14 +406,16 @@ pub fn emit(
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
             p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+                let st = structure::structure(&p).map_err(|e| if why { eprintln!("WAVE64-FORM structure: {e}") }).ok()?;
+                let io = io::raise(&p, native).map_err(|e| if why { eprintln!("WAVE64-FORM io: {e}") }).ok()?;
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .map_err(|e| if why { eprintln!("WAVE64-FORM resources: {e}") })
+                    .ok()?;
                 Some((p, st, io, res))
             })
         };
         let forms = [
-            ("without early-outs", form(ir::without_early_outs(p))),
+            ("without early-outs", form(ir::without_early_outs(p, &never_taken(st)))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
         for (name, f) in &forms {
@@ -536,6 +550,14 @@ pub fn emit(
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
 }
 
+/// Per block: whether no lane reaching it takes its closing branch ([`ir::without_early_outs`]).
+fn never_taken(st: &structure::Structured) -> Vec<bool> {
+    st.exits
+        .iter()
+        .map(|e| matches!(e, structure::LaneExit::Branch { when, .. } if *when == structure::Bool::FALSE))
+        .collect()
+}
+
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
@@ -584,7 +606,9 @@ fn widen(
             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
         if !stuck {
             if why {
-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
+                let mut list: Vec<_> = wide.iter().map(|&b| format!("{b}@{:#x}", p.blocks[b].offset)).collect();
+                list.sort();
+                eprintln!("WAVE64-WIDE {} branches taken wave-wide: {}", wide.len(), list.join(" "));
             }
             return r;
         }
@@ -693,6 +717,7 @@ fn emit_program(
         mesh_stride,
     })?;
     let wave_size = l.wave_size;
+    LAST_WAVE.set(wave_size);
     let shader = HostShader {
         stage: native.stage,
         dxil: l.dxil,
