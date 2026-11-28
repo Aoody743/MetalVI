@@ -17,6 +17,7 @@ use victory_metal::msc::{RootParam, StaticSampler};
 use victory_metal::{Buffer, ComputePipeline, Device, Queue};
 use victory_shader::emit::{HostShader, ROOT_CBV_SPACE, USER_DATA_SPACE};
 
+use super::metal_phase::{self, Phase};
 use crate::pipeline::host::HostPipeline;
 
 /// What `VICTORY_METAL` asks for.
@@ -98,13 +99,13 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     struct Wiring(#[allow(dead_code)] crate::watch::Reading, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
     impl std::ops::Drop for Wiring {
         fn drop(&mut self) {
-            work::after_wait();
+            metal_phase::after_wait();
         }
     }
     let reading = crate::watch::title_memory_reading_range(start as usize, len as usize);
-    work::here("waiting for the GPU to go idle (wiring)");
+    metal_phase::here(Phase::WaitForGpuIdle);
     let flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    work::here("wiring title memory");
+    metal_phase::here(Phase::WireTitleMemory);
     Box::new(Wiring(reading, flight))
 }
 
@@ -381,17 +382,17 @@ fn complete_checked(
     let command = cb.handle();
     work::report_large(label, encoded);
     let estimated_ns = work::reservation(ops);
-    work::here("waiting for residency changes");
+    metal_phase::here(Phase::WaitForResidency);
     let flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    work::here("commit");
+    metal_phase::here(Phase::Commit);
     if !fuse::commit_if_open(cb) {
         return Err(victory_metal::Error("Metal safety stop already tripped".into()));
     }
     let watch = inflight::watch(ops);
-    work::here("waiting for a command buffer");
+    metal_phase::here(Phase::WaitForCommandBuffer);
     let result = cb.wait();
     drop(flight);
-    work::after_wait();
+    metal_phase::after_wait();
     #[cfg(test)]
     let result = result.and_then(|()| if completion::INJECT_TIMEOUT.swap(false, std::sync::atomic::Ordering::AcqRel) {
         Err(victory_metal::Error("injected system timeout after bounded GPU completion".into()))
@@ -663,8 +664,8 @@ impl MetalBackend {
         // No phase while waiting for the lock: the holder's own phases show
         // whether it moves (a waiter behind a long batch is not a hang).
         let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
-        let _lane = work::lane(work::LANE_RUN);
-        work::here("run_batch");
+        let _lane = metal_phase::lane(metal_phase::LANE_RUN);
+        metal_phase::here(Phase::RunBatch);
         let ok = self.run_serial(ops);
         if !ok {
             fuse::stop();
@@ -1042,7 +1043,7 @@ impl MetalBackend {
             match &*ops[i] {
                 MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
                 MetalOp::Dispatch(producer) => {
-                    work::here("encode dispatches");
+                    metal_phase::here(Phase::EncodeDispatches);
                     if pass_cap == 1 && let Some(counts) = &producer.loop_counts {
                         let sources = counts.each_ref().map(|(_, buffer, offset)| (buffer, *offset));
                         match work::snapshot_words::<1>(&self.device, &self.queue, &sources) {
@@ -1104,7 +1105,7 @@ impl MetalBackend {
                     depth_sync.colour_may_change();
                 }
                 MetalOp::DispatchIndirect(c) => {
-                    work::here("encode indirect dispatch");
+                    metal_phase::here(Phase::EncodeIndirectDispatch);
                     cb_dispatches = cb_dispatches.saturating_add(1);
                     if c.max > 256 {
                         static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1186,7 +1187,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::FloatRowReadback { src, dst, offset, width } => {
-                    work::here("encode readback");
+                    metal_phase::here(Phase::EncodeReadback);
                     let bytes = width * 16;
                     let pitch = bytes.next_multiple_of(256);
                     if readback_scratch.as_ref().is_none_or(|b| b.len < u64::from(pitch)) {
@@ -1202,7 +1203,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Copy(c) => {
-                    work::here("encode texture copy");
+                    metal_phase::here(Phase::EncodeTextureCopy);
                     for (level, slice) in copied(&c.src, c.whole, c.src_level, c.src_slice) {
                         if !load_twin(&mut depth_sync, &cb, c.src.twin.as_ref(), level, slice) {
                             return false;
@@ -1235,7 +1236,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Resolve(r) => {
-                    work::here("encode resolve");
+                    metal_phase::here(Phase::EncodeResolve);
                     let result = match CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
                         Ok(cr) => cr.resolve_region(
                             &cb, &r.src, r.src_slice, &r.dst, r.dst_level, r.dst_slice, r.format, r.region,
@@ -1251,7 +1252,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Ambient(a) => {
-                    work::here("encode ambient");
+                    metal_phase::here(Phase::EncodeAmbient);
                     if let Err(error) = a.encode(&self.device, &cb) {
                         static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -1261,7 +1262,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Clear(c) if !c.rects.is_empty() => {
-                    work::here("encode rectangle clear");
+                    metal_phase::here(Phase::EncodeRectangleClear);
                     // Rectangles: F49's quad-per-rectangle clear.
                     if let Ok(cr) = CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
                         if !load_depth(&mut depth_sync, &cb, &c.target)
@@ -1301,7 +1302,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Clear(c) => {
-                    work::here("encode clear");
+                    metal_phase::here(Phase::EncodeClear);
                     let clear = sys::WMTLoadAction::WMTLoadActionClear;
                     let mut pass = RenderPass { width: c.target.width, height: c.target.height, samples: c.target.samples, ..Default::default() };
                     if c.depth.is_none() && !load_depth(&mut depth_sync, &cb, &c.target) {
@@ -1338,7 +1339,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Draw(first) => {
-                    work::here("encode draws");
+                    metal_phase::here(Phase::EncodeDraws);
                     let t = first.targets.clone();
                     if let Some(d) = &t.depth
                         && (!load_depth(&mut depth_sync, &cb, d) || !load_twin(&mut depth_sync, &cb, d.twin.as_ref(), d.level, d.slice))
@@ -1600,7 +1601,7 @@ impl MetalBackend {
                 let value = SPLIT_VALUE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 cb.encode_signal_event(split_event, value);
                 tracing::debug!(batch, command = cb.handle(), first = cb_start, end = i, reason, "Metal: command buffer operations");
-                work::here("bounded pass submit");
+                metal_phase::here(Phase::BoundedPassSubmit);
                 let result = submit_checked(&cb, &ops[cb_start..i], true, "bounded pass");
                 work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces, &ops[cb_start..i]);
                 if let Err(e) = result {
@@ -1621,10 +1622,10 @@ impl MetalBackend {
                             ?before, ?after, "Metal: indirect writer snapshot");
                     }
                 }
-                work::here("new command buffer");
+                metal_phase::here(Phase::NewCommandBuffer);
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
-                work::here("run_batch encode");
+                metal_phase::here(Phase::RunBatchEncode);
                 let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 tracing::info!(total, reason, ops = i - cb_start, first = work::kind(&ops[cb_start]),
                     estimated_us = work::reservation(&ops[cb_start..i]) / 1000, next = work::kind(&ops[i]),
@@ -1639,16 +1640,16 @@ impl MetalBackend {
         }
         // GPU-written ocean textures back into title memory (F44).
         if ops.iter().any(|o| matches!(**o, MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))) {
-            work::here("writeback");
+            metal_phase::here(Phase::Writeback);
             if let Err(e) = self.writeback_all(&cb) {
                 tracing::error!(error = %e, "Metal: writeback failed before commit");
                 return work::reject("writeback unavailable");
             }
         }
         let encoded_at = started.elapsed();
-        work::here("residency commit");
+        metal_phase::here(Phase::ResidencyCommit);
         self.commit_residency();
-        work::here("main batch submit");
+        metal_phase::here(Phase::MainBatchSubmit);
         let committed_at = started.elapsed();
         tracing::debug!(batch, command = cb.handle(), first = cb_start, end = ops.len(), reason = "batch end", "Metal: command buffer operations");
         let waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
@@ -2557,6 +2558,7 @@ mod mesh32k_tests;
 /// error and no log, and the title stops presenting.
 mod inflight {
     use super::MetalOp;
+    use super::metal_phase;
     use std::sync::{Arc, Mutex, Once};
     use std::time::{Duration, Instant};
 
@@ -2655,16 +2657,17 @@ mod inflight {
         MONITOR.call_once(|| {
             let _ = std::thread::Builder::new().name("metal-hang-watch".into()).spawn(|| {
                 let mut told = 0;
-                let mut stuck_told = [0u64; super::work::LANES];
+                let mut stuck_told = [0u64; metal_phase::LANES];
                 loop {
                     std::thread::sleep(Duration::from_secs(1));
                     // Host phases first: lock-free, so a thread stuck holding a
                     // lock (or in a Metal call) cannot keep this quiet.
-                    for (lane, told_at) in stuck_told.iter_mut().enumerate() {
-                        if let Some((phase, since_ms, at)) = super::work::stuck_phase(lane, 8_000)
-                            && *told_at != at
+                    for (lane, told_publication) in stuck_told.iter_mut().enumerate() {
+                        if let Some((phase, since_ms, publication)) =
+                            metal_phase::stuck_phase(lane, 8_000)
+                            && *told_publication != publication
                         {
-                            *told_at = at;
+                            *told_publication = publication;
                             tracing::warn!(lane, phase, since_ms, "Metal: stuck in a host phase (hang?)");
                         }
                     }

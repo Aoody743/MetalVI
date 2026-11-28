@@ -13,6 +13,8 @@ pub mod metal_heap;
 #[cfg(windows)]
 #[allow(dead_code)]
 pub mod metal;
+#[cfg(any(windows, test))]
+mod metal_phase;
 #[cfg(windows)]
 #[allow(dead_code)]
 pub mod metal_texture;
