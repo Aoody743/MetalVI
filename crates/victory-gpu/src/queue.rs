@@ -109,7 +109,7 @@ pub(crate) fn run_metal_checked(ops: &MetalOps) -> bool {
             }
             texture.refresh();
         }
-        return m.run(&ops.commands);
+        return crate::backend::metal::package::run(m, &ops.commands);
     }
     true
 }
@@ -962,6 +962,8 @@ extern "system" fn present(
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    crate::backend::metal::package::frame_presented(frame);
     frame_interval(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();

@@ -54,6 +54,14 @@ unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
+/// The directory's and the faults buffer's (GPU address, bytes), if made
+/// (read only, for the frame package: these addresses are this backend's).
+pub(crate) fn own_ranges() -> Option<[(u64, u64); 2]> {
+    let guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let st = guard.as_ref()?;
+    Some([(st.directory.0.gpu_address, st.directory.0.len), (st.faults.0.gpu_address, st.faults.0.len)])
+}
+
 /// What a dispatch binds.
 pub(crate) struct Ready {
     pub(crate) directory: u64,

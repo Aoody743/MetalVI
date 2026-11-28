@@ -398,6 +398,33 @@ impl Chunks {
         None
     }
 
+    /// Every live wrapper of title memory as (GPU address, bytes, host
+    /// address of its first byte): chunks, page buffers and spans (a span
+    /// made at an [`Alias`] gives the alias's address). Read only; for the
+    /// frame package (T3), which turns GPU addresses back into host ones.
+    pub fn wrapped(&self) -> Vec<(u64, u64, u64)> {
+        let mut out = Vec::with_capacity(self.spans.len() + self.chunks.len());
+        for (&chunk, w) in &self.chunks {
+            let va = self.base + chunk * CHUNK;
+            match w {
+                Wrapped::Whole(b) => out.push((b.gpu_address, b.len, va)),
+                Wrapped::Pages(pages) => out.extend(pages.iter().map(|(&p, b)| (b.gpu_address, b.len, va + p * PAGE))),
+            }
+        }
+        out.extend(self.spans.iter().map(|(&(s, _), b)| (b.gpu_address, b.len, s)));
+        out
+    }
+
+    /// The host address the GPU address `gpu_va` shows, if it lies in a
+    /// wrapper of title memory ([`Chunks::wrapped`]; a linear walk, meant
+    /// for rare diagnostic use).
+    pub fn title_va_of(&self, gpu_va: u64) -> Option<u64> {
+        self.wrapped()
+            .into_iter()
+            .find(|&(g, len, _)| gpu_va >= g && gpu_va - g < len)
+            .map(|(g, _, host)| host + (gpu_va - g))
+    }
+
     /// Whether `[start, start+len)` is a live span exactly (a prewired view).
     pub fn is_span(&self, start: u64, len: u64) -> bool {
         start.checked_add(len).is_some_and(|end| self.spans.contains_key(&(start, end)))
@@ -588,6 +615,29 @@ mod span_tests {
         }
         assert_eq!(n, 2000);
         assert!(chunks.stats.spans <= 16, "spans: {}", chunks.stats.spans);
+    }
+
+    /// `title_va_of` inverts `window`: the GPU address of a view maps back
+    /// to its host address; addresses outside every wrapper map to nothing.
+    #[test]
+    fn title_va_of_inverts_window() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let Ok(device) = Device::first() else { return };
+        let mut chunks = Chunks::sparse(&device).unwrap();
+        let bytes = 4usize << 20;
+        // SAFETY: a fresh allocation of our own, never freed (test).
+        let base = unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        for off in [0u64, 4096, 3 << 20, (4 << 20) - 16] {
+            let gpu = chunks.window(base + off, 16);
+            assert_ne!(gpu, 0);
+            assert_eq!(chunks.title_va_of(gpu), Some(base + off));
+        }
+        let wrapped = chunks.wrapped();
+        assert_eq!(wrapped.len(), 1, "one span over the whole allocation: {wrapped:x?}");
+        let (g, len, _) = wrapped[0];
+        assert_eq!(chunks.title_va_of(g + len), None);
+        assert_eq!(chunks.title_va_of(0x10), None);
     }
 
     static TITLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
