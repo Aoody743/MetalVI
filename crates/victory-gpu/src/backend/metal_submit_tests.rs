@@ -125,6 +125,7 @@ fn texture_for_refills_a_dirty_partial_texture_without_deadlock() {
     const KEY: usize = 0x7e57_0001;
     backend.textures.lock().unwrap().insert(KEY, Some(Arc::new(crate::backend::metal_texture::MetalTexture {
         companion: Default::default(),
+        twin: None,
         texture,
         pixel: victory_metal::sys::WMTPixelFormat::WMTPixelFormatR32Float,
         desc: rdesc,

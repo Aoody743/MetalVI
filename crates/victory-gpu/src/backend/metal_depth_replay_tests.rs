@@ -32,6 +32,7 @@ fn companion_draw_clear_and_copy_replay() {
         desc.sample_count = 1;
         let t = Arc::new(MetalTexture {
             companion: Default::default(),
+            twin: None,
             texture,
             pixel: P::WMTPixelFormatR32Float,
             desc,

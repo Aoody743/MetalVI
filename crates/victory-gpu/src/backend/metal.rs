@@ -999,6 +999,23 @@ impl MetalBackend {
                 encoded("depth companion store", sync.store(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
             })
         };
+        // Twinned depth-stencil textures (`StencilTwin`): given their
+        // twins before a pass or copy reads them, giving them what a pass
+        // or copy wrote after.
+        let load_twin = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, t: Option<&std::sync::Arc<super::metal_depth::StencilTwin>>, level: u16, slice: u16| {
+            t.is_none_or(|t| encoded("stencil twin load", sync.load_twin(&self.device, cb, t, level, slice), || format!("level {level} slice {slice}")))
+        };
+        let store_twin = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, t: Option<&std::sync::Arc<super::metal_depth::StencilTwin>>, level: u16, slice: u16| {
+            t.is_none_or(|t| encoded("stencil twin store", sync.store_twin(&self.device, cb, t, level, slice), || format!("level {level} slice {slice}")))
+        };
+        // Every subresource a copy touches.
+        let copied = |t: &super::metal_texture::MetalTexture, whole: bool, level: u32, slice: u32| -> Vec<(u16, u16)> {
+            if whole {
+                (0..t.mips).flat_map(|l| (0..t.slices.max(1)).map(move |s| (l as u16, s as u16))).collect()
+            } else {
+                vec![(level as u16, slice as u16)]
+            }
+        };
         let mut i = 0;
         let mut planned_end = 0;
         let mut clamp_counter = None;
@@ -1180,6 +1197,11 @@ impl MetalBackend {
                 }
                 MetalOp::Copy(c) => {
                     work::here("encode texture copy");
+                    for (level, slice) in copied(&c.src, c.whole, c.src_level, c.src_slice) {
+                        if !load_twin(&mut depth_sync, &cb, c.src.twin.as_ref(), level, slice) {
+                            return false;
+                        }
+                    }
                     if let Err(e) = super::metal_copy::encode_texture_to_texture(
                         &cb,
                         &c.src.texture,
@@ -1201,6 +1223,9 @@ impl MetalBackend {
                         }
                     }
                     depth_sync.colour_may_change();
+                    for (level, slice) in copied(&c.dst, c.whole, c.dst_level, c.dst_slice) {
+                        ok &= store_twin(&mut depth_sync, &cb, c.dst.twin.as_ref(), level, slice);
+                    }
                     i += 1;
                 }
                 MetalOp::Resolve(r) => {
@@ -1223,7 +1248,9 @@ impl MetalBackend {
                     work::here("encode rectangle clear");
                     // Rectangles: F49's quad-per-rectangle clear.
                     if let Ok(cr) = CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
-                        if !load_depth(&mut depth_sync, &cb, &c.target) {
+                        if !load_depth(&mut depth_sync, &cb, &c.target)
+                            || !load_twin(&mut depth_sync, &cb, c.target.twin.as_ref(), c.target.level, c.target.slice)
+                        {
                             return false;
                         }
                         let target = victory_metal::clear_resolve::ClearTarget {
@@ -1243,6 +1270,9 @@ impl MetalBackend {
                                 if c.depth.is_some() {
                                     ok = store_depth(&mut depth_sync, &cb, &c.target);
                                 }
+                                if ok && (c.depth.is_some() || c.stencil.is_some()) {
+                                    ok = store_twin(&mut depth_sync, &cb, c.target.twin.as_ref(), c.target.level, c.target.slice);
+                                }
                             }
                             Err(e) => {
                                 static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1259,6 +1289,9 @@ impl MetalBackend {
                     let clear = sys::WMTLoadAction::WMTLoadActionClear;
                     let mut pass = RenderPass { width: c.target.width, height: c.target.height, samples: c.target.samples, ..Default::default() };
                     if c.depth.is_none() && !load_depth(&mut depth_sync, &cb, &c.target) {
+                        return false;
+                    }
+                    if !load_twin(&mut depth_sync, &cb, c.target.twin.as_ref(), c.target.level, c.target.slice) {
                         return false;
                     }
                     if let Some(color) = c.color {
@@ -1283,13 +1316,16 @@ impl MetalBackend {
                     if ok && c.depth.is_some() {
                         ok = store_depth(&mut depth_sync, &cb, &c.target);
                     }
+                    if ok && (c.depth.is_some() || c.stencil.is_some()) {
+                        ok = store_twin(&mut depth_sync, &cb, c.target.twin.as_ref(), c.target.level, c.target.slice);
+                    }
                     i += 1;
                 }
                 MetalOp::Draw(first) => {
                     work::here("encode draws");
                     let t = first.targets.clone();
                     if let Some(d) = &t.depth
-                        && !load_depth(&mut depth_sync, &cb, d)
+                        && (!load_depth(&mut depth_sync, &cb, d) || !load_twin(&mut depth_sync, &cb, d.twin.as_ref(), d.level, d.slice))
                     {
                         return false;
                     }
@@ -1503,6 +1539,15 @@ impl MetalBackend {
                             ok = store_depth(&mut depth_sync, &cb, a);
                         } else if let Some(d) = &a.companion {
                             depth_sync.preserve(d, a.level, a.slice);
+                        }
+                        // Stencil writes are not told apart: a pass with
+                        // a stencil attachment may have written it.
+                        if let Some(twin) = &a.twin {
+                            if ok && (depth_written || t.stencil) {
+                                ok = store_twin(&mut depth_sync, &cb, Some(twin), a.level, a.slice);
+                            } else {
+                                depth_sync.preserve_twin(twin, a.level, a.slice);
+                            }
                         }
                     }
                 }
@@ -2436,6 +2481,10 @@ mod depth_replay_tests;
 #[cfg(test)]
 #[path = "metal_static_sampler_repro_tests.rs"]
 mod static_sampler_repro_tests;
+
+#[cfg(test)]
+#[path = "metal_stencil_twin_tests.rs"]
+mod stencil_twin_tests;
 
 #[path = "metal_work.rs"]
 pub(super) mod work;

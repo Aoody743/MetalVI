@@ -55,6 +55,7 @@ fn records_and_replays_clipped_resolve_before_copy() {
             mips,
             slices,
             companion: std::sync::OnceLock::new(),
+            twin: None,
         })
     };
     let src = make(8, 8, 1, 1, 4);
@@ -100,6 +101,7 @@ fn records_and_replays_clipped_resolve_before_copy() {
                 height: 8,
                 samples: 4,
                 companion: None,
+                twin: None,
             },
             color: Some([0.375, 0.0, 0.0, 0.0]),
             depth: None,

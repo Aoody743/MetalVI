@@ -201,6 +201,7 @@ fn attachment(device: &Device, format: Pixel, array: bool) -> Attachment {
         height: 8,
         samples: 1,
         companion: None,
+        twin: None,
     }
 }
 
@@ -360,6 +361,7 @@ fn depth_resource_views_use_only_compatible_formats() {
         mips: 1,
         slices: 1,
         companion: Default::default(),
+        twin: None,
     };
     // Stencil: X32_TYPELESS_G8X24_UINT (22), X24_TYPELESS_G8_UINT (47),
     // R8_UINT (62); depth: R32_FLOAT_X8X24_TYPELESS (21) and the rest.
@@ -414,6 +416,7 @@ fn stand_in_and_packed_texture_views_use_only_compatible_formats() {
         mips: 1,
         slices: 1,
         companion: Default::default(),
+        twin: None,
     };
     assert_eq!(view_format(&t_stand_in, 86), Pixel::WMTPixelFormatRGBA8Unorm);
     assert_eq!(view_format(&t_stand_in, 115), Pixel::WMTPixelFormatRGBA8Unorm);
@@ -463,6 +466,7 @@ fn stand_in_and_packed_texture_views_use_only_compatible_formats() {
         mips: 1,
         slices: 1,
         companion: Default::default(),
+        twin: None,
     };
     assert_eq!(view_format(&t_packed, 86), Pixel::WMTPixelFormatA1BGR5Unorm);
     assert_eq!(view_format(&t_packed, 57), Pixel::WMTPixelFormatA1BGR5Unorm);
@@ -504,7 +508,7 @@ fn depth_and_stencil_views_read_their_planes() {
     desc.height = 4;
     desc.dimension = 3;
     desc.sample_count = 1;
-    let t = MetalTexture { texture: tex, pixel, desc, mips: 1, slices: 1, companion: Default::default() };
+    let t = MetalTexture { texture: tex, pixel, desc, mips: 1, slices: 1, companion: Default::default(), twin: None };
     let depth = device.compute_pipeline_msl(
         "#include <metal_stdlib>\nusing namespace metal;\nkernel void rd(depth2d<float> d [[texture(0)]], device float *o [[buffer(0)]]) { o[0] = d.read(uint2(1, 1)); }",
         "rd").unwrap();
