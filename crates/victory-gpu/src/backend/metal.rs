@@ -355,6 +355,9 @@ pub(crate) enum MetalOp {
     FloatRowReadback { src: victory_metal::texture::Texture, dst: Buffer, offset: u64, width: u32 },
     BufferCopy { dst: usize, src: usize, bytes: usize },
     Resolve(super::metal_draw::MetalResolve),
+    /// The stand-in for the probes' indirect light, after their resolve
+    /// (`VICTORY_AMBIENT=constant:<level>`, [`super::metal_ambient`]).
+    Ambient(super::metal_ambient::MetalAmbient),
 }
 
 /// Serialize every backend command buffer through completion and the fuse.
@@ -768,6 +771,7 @@ impl MetalBackend {
                     MetalOp::Copy(c) => format!("copy {} → {}", c.src.pixel.0, c.dst.pixel.0),
                     MetalOp::FloatRowReadback { width, .. } => format!("readback {width} float pixels"),
                     MetalOp::Resolve(r) => format!("resolve {} mip {} slice {}", r.format.0, r.dst_level, r.dst_slice),
+                    MetalOp::Ambient(a) => format!("ambient {}x{}", a.size[0], a.size[1]),
                     MetalOp::Clear(c) => {
                         let t = &c.target.texture;
                         format!(
@@ -839,7 +843,7 @@ impl MetalBackend {
                         blob += (indices.len() * 4).next_multiple_of(256);
                     }
                 }
-                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) => {}
+                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) | MetalOp::Ambient(_) => {}
             }
         }
         let need = tables + blob.div_ceil(entry) + 256 / entry + 1;
@@ -933,7 +937,7 @@ impl MetalBackend {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((tops, a, u, vt, zt));
                 }
-                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) => {
+                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) | MetalOp::Ambient(_) => {
                     dispatch_tops.push(Vec::new());
                     draw_offsets.push((Vec::new(), 0, 0, 0, 0));
                 }
@@ -1215,6 +1219,16 @@ impl MetalBackend {
                         static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                         if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                             tracing::warn!(%error, format = r.format.0, "Metal: a resolve left out");
+                        }
+                    }
+                    i += 1;
+                }
+                MetalOp::Ambient(a) => {
+                    work::here("encode ambient");
+                    if let Err(error) = a.encode(&self.device, &cb) {
+                        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            tracing::warn!(%error, "Metal: the ambient stand-in left out");
                         }
                     }
                     i += 1;
@@ -1513,6 +1527,13 @@ impl MetalBackend {
                 Some("estimated time")
             } else if split {
                 Some("diagnostic pass")
+            } else if split_event.is_some()
+                && (matches!(*ops[group_start], MetalOp::Ambient(_)) || matches!(ops.get(i).map(|o| &**o), Some(MetalOp::Ambient(_))))
+            {
+                // The stand-in reads nothing but writes the image the resolve
+                // just wrote (reached by address, untracked): a command
+                // buffer of its own, after the resolve's and before the next.
+                Some("ambient order")
             } else if bounded && (cb_dispatches >= pass_dispatches
                 || work::cut_every_pass() && matches!(*ops[group_start], MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_)))
             {
@@ -1603,7 +1624,7 @@ impl MetalBackend {
                         MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_) => dispatches += 1,
                         MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
                         MetalOp::Draw(_) => draws += 1,
-                        MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) => clears += 1,
+                        MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) | MetalOp::Ambient(_) => clears += 1,
                     }
                 }
                 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2437,6 +2458,10 @@ mod depth_replay_tests;
 #[path = "metal_static_sampler_repro_tests.rs"]
 mod static_sampler_repro_tests;
 
+#[cfg(test)]
+#[path = "metal_ambient_tests.rs"]
+mod ambient_tests;
+
 #[path = "metal_work.rs"]
 pub(super) mod work;
 
@@ -2519,6 +2544,7 @@ mod inflight {
                 MetalOp::FloatRowReadback { .. } => "readback".into(),
                 MetalOp::BufferCopy { .. } => "buffer copy".into(),
                 MetalOp::Resolve(_) => "resolve".into(),
+                MetalOp::Ambient(_) => "ambient".into(),
             };
             match names.last_mut() {
                 Some((last, n)) if *last == name => *n += 1,

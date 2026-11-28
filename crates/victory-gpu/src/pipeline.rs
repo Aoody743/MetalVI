@@ -69,6 +69,10 @@ pub(crate) struct Shader {
     /// id as a flat varying); the plain one when it reads no primitive id.
     #[cfg(windows)]
     rect_translated: OnceLock<Option<Translated>>,
+    /// A compute container of the screen probes' resolve, which the Metal
+    /// ambient stand-in follows (`backend::metal_ambient`).
+    #[cfg(windows)]
+    pub(crate) probe_resolve: bool,
 }
 
 impl std::fmt::Debug for Shader {
@@ -121,6 +125,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 translated: OnceLock::new(),
                 #[cfg(windows)]
                 rect_translated: OnceLock::new(),
+                #[cfg(windows)]
+                probe_resolve: stage == "compute" && crate::backend::metal_ambient::is_probe_resolve(bytes),
             })
         })
         .clone()
@@ -141,6 +147,7 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         translated: OnceLock::new(),
         #[cfg(windows)]
         rect_translated: OnceLock::new(),
+        probe_resolve: false,
     });
     let translated = shader.translated().is_some();
     let made = (translated && compute).then(|| make::warm(vec![shader])).flatten();
@@ -251,6 +258,7 @@ impl Shader {
             container: self.container.clone(),
             translated,
             rect_translated: OnceLock::new(),
+            probe_resolve: false,
         }))
     }
 }
