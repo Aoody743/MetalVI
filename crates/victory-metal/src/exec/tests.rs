@@ -851,8 +851,11 @@ fn stuck_producer(stop_from_outside: bool) {
     .unwrap();
     t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 0, 10)])).wait_fence(F1, 1)]).unwrap();
     // The consumer is committed with a GPU wait on the stuck producer's signal.
+    // (Committed, not only encoded: `gpu_fence_waits` counts at encoding, and
+    // a stop between encoding and commit drops the consumer, which then never
+    // finishes: the old flake "consumer still waiting" with committed [0, 2].)
     let start = Instant::now();
-    while t.stats().gpu_fence_waits == 0 {
+    while t.stats().gpu_fence_waits == 0 || t.stats().committed[0] == 0 {
         assert!(start.elapsed() < Duration::from_secs(2), "consumer never committed: {:?}", t.stats());
         std::thread::sleep(Duration::from_millis(5));
     }
