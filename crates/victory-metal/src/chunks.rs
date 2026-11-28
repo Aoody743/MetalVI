@@ -109,8 +109,11 @@ pub type Alias = fn(u64, u64) -> Option<u64>;
 /// addresses. The mapping is never remapped or unmapped; after the title
 /// remaps part of the range, the same call gives another mapping (xmem's
 /// `physical_mirror`). A span over the title addresses there would keep
-/// the old pages (`stale_uses`, 2026-11-28).
-pub type Mirror = fn(u64, u64) -> Option<u64>;
+/// the old pages (`stale_uses`, 2026-11-28). Gives (the address of `va`,
+/// the mapping's first byte, its length): the span is made over the
+/// mapping exactly (rounded out to 16 MiB, spans over mirrors also wired
+/// their neighbours: 4.4 GB of spans in 240 s, v0b-x1).
+pub type Mirror = fn(u64, u64) -> Option<(u64, u64, u64)>;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Stats {
@@ -281,14 +284,14 @@ impl Chunks {
     }
 
     /// `[va, va+len)` where spans are made for it: its [`Alias`], else its
-    /// [`Mirror`], else itself; and whether it is a mirror.
-    fn home(&self, va: u64, len: u64) -> (u64, bool) {
+    /// [`Mirror`], else itself; and the mirror's whole range, if a mirror.
+    fn home(&self, va: u64, len: u64) -> (u64, Option<(u64, u64)>) {
         if let Some(at) = self.alias.and_then(|f| f(va, len)) {
-            return (at, false);
+            return (at, None);
         }
         match self.mirror.and_then(|f| f(va, len)) {
-            Some(at) => (at, true),
-            None => (va, false),
+            Some((at, start, bytes)) if start <= at && at + len <= start + bytes => (at, Some((start, start + bytes))),
+            _ => (va, None),
         }
     }
 
@@ -396,7 +399,11 @@ impl Chunks {
         let aliased = home != va;
         let va = home;
         let end = va.checked_add(len)?;
-        for (start, end) in Self::span_ranges(va, end) {
+        let ranges = match mirrored {
+            Some(range) => vec![range],
+            None => Self::span_ranges(va, end),
+        };
+        for (start, end) in ranges {
             if self.stats.span_bytes.saturating_add(end - start) > self.span_cap {
                 self.stats.capped += 1;
                 return None;
@@ -413,7 +420,7 @@ impl Chunks {
                     if !aliased {
                         self.stats.direct_spans += 1;
                     }
-                    if mirrored {
+                    if mirrored.is_some() {
                         self.stats.mirror_spans += 1;
                     }
                     self.stats.span_bytes += end - start;
@@ -781,10 +788,11 @@ mod span_tests {
 
     /// The title range at `TITLE` (pages `SHOWN`) in a contiguous mapping
     /// of the same pages, one per page list (xmem's `physical_mirror`).
-    fn mirror(va: u64, len: u64) -> Option<u64> {
+    fn mirror(va: u64, len: u64) -> Option<(u64, u64, u64)> {
         use std::sync::atomic::Ordering::SeqCst;
         let title = TITLE.load(SeqCst);
         let shown = SHOWN.lock().unwrap().clone();
+        let shown_len = shown.len() as u64 * PAGE;
         if va < title || va + len > title + shown.len() as u64 * PAGE {
             return None;
         }
@@ -797,7 +805,7 @@ mod span_tests {
                 at
             }
         };
-        Some(at + (va - title))
+        Some((at + (va - title), at, shown_len))
     }
 
     /// A title range over pages of a section that do not follow on: the
@@ -839,6 +847,7 @@ mod span_tests {
         assert_eq!(read, want, "the GPU reads what the title shows across its views");
         assert!(read[..(PAGE - 0x800) as usize].iter().all(|&b| b == 0xA7));
         assert_eq!((chunks.stats.spans, chunks.stats.mirror_spans, chunks.stats.direct_spans), (1, 1, 0));
+        assert_eq!((old.len, old_off), (3 * PAGE, 0x800), "a span over the mirror exactly");
         // A view inside the same pages: the same span, nothing more wired.
         let (again, _) = chunks.window_buffer(title + PAGE, 4096).expect("mirrored");
         assert_eq!(again.gpu_address, old.gpu_address);

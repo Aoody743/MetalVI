@@ -529,6 +529,7 @@ const MIRROR_MAX_PIECES: usize = 1024;
 /// buffers over them for the process's life.
 struct Mirror {
     at: usize,
+    len: usize,
     owners: Vec<std::sync::Weak<Section>>,
 }
 
@@ -560,7 +561,7 @@ static MIRROR_COUNTS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 /// `None` when the range is in one view (or none), crosses a gap, or is
 /// larger than [`MIRROR_MAX_BYTES`]. Takes [`ALIASES`] (read), then
 /// [`MIRRORS`]; never the page table's lock.
-pub fn physical_mirror(va: u64, len: u64) -> Option<u64> {
+pub fn physical_mirror(va: u64, len: u64) -> Option<(u64, u64, u64)> {
     let (va, len) = (usize::try_from(va).ok()?, usize::try_from(len).ok()?);
     let end = va.checked_add(len)?;
     if len == 0 || mirror_cap() == 0 {
@@ -614,7 +615,7 @@ pub fn physical_mirror(va: u64, len: u64) -> Option<u64> {
         if m.owners.len() == owners.len()
             && m.owners.iter().zip(&owners).all(|(a, b)| a.ptr_eq(b) && a.strong_count() > 0)
         {
-            return Some((m.at + (va - start)) as u64);
+            return Some(((m.at + (va - start)) as u64, m.at as u64, m.len as u64));
         }
         // Left mapped: a buffer may still be over it.
         mirrors.remove(&runs);
@@ -638,8 +639,8 @@ pub fn physical_mirror(va: u64, len: u64) -> Option<u64> {
     if n <= 16 || n.is_power_of_two() {
         tracing::info!(n, at = format_args!("{at:#x}"), kb = total >> 10, pieces = runs.len(), "xmem: a mirror of discontiguous physical views");
     }
-    mirrors.insert(runs, Mirror { at, owners });
-    Some((at + (va - start)) as u64)
+    mirrors.insert(runs, Mirror { at, len: total, owners });
+    Some(((at + (va - start)) as u64, at as u64, total as u64))
 }
 
 /// Maps `runs` (slices of `sections`, one each) one after another in a new
@@ -1930,7 +1931,8 @@ mod tests {
         }
         let (va, len) = (at(0) + 0x100, 2 * PAGE as u64 + 0x200);
         assert_eq!(physical_alias(va, len), None);
-        let mirror = physical_mirror(va, len).expect("a mirror");
+        let (mirror, mirror_start, mirror_len) = physical_mirror(va, len).expect("a mirror");
+        assert_eq!((mirror - mirror_start, mirror_len), (0x100, 3 * PAGE as u64), "the views that hold the range, whole");
         assert!(mirror >= 1 << 40, "above the title's address space: {mirror:#x}");
         let bytes = |at: u64, len: u64| {
             // SAFETY: a mirror stays mapped for the process's life.
@@ -1939,9 +1941,9 @@ mod tests {
         let shown = bytes(mirror, len);
         assert_eq!(shown, bytes(va, len), "the mirror shows what the title range shows");
         // Made once: the same pages, the same mirror (at their offset).
-        assert_eq!(physical_mirror(va, len), Some(mirror));
+        assert_eq!(physical_mirror(va, len), Some((mirror, mirror_start, mirror_len)));
         assert_eq!(physical_mirror(va + 0x1000, 0x100), None, "inside one view: the alias's case");
-        assert_eq!(physical_mirror(at(0) + 0x2000, PAGE as u64), Some(mirror - 0x100 + 0x2000));
+        assert_eq!(physical_mirror(at(0) + 0x2000, PAGE as u64).map(|m| m.0), Some(mirror - 0x100 + 0x2000));
         // Writes through the mirror land in the pages.
         // SAFETY: the mirror is mapped read-write.
         unsafe { (mirror as *mut u8).add(PAGE).write(0x5a) };
@@ -1951,7 +1953,7 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(at(1) as *mut c_void, 1, [pages[5]].as_ptr()), at(1) as *mut c_void);
         // SAFETY: mapped read-write.
         unsafe { std::ptr::write_bytes(at(1) as *mut u8, 0x55, PAGE) };
-        let again = physical_mirror(va, len).expect("a new mirror");
+        let (again, _, _) = physical_mirror(va, len).expect("a new mirror");
         assert_ne!(again, mirror);
         assert_eq!(bytes(again, len), bytes(va, len));
         assert!(bytes(again + PAGE as u64 - 0x100, 16).iter().all(|&b| b == 0x55));
