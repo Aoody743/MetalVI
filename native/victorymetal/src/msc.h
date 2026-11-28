@@ -21,6 +21,7 @@
 #define VM_UNIX_RENDER_PIPELINE_STAGE_IN 150
 #define MSC_UNIX_COMPILE_GEOMETRY 151
 #define VM_UNIX_RENDER_PIPELINE_GEOMETRY 152
+#define VM_UNIX_ARCHIVE_ADD_FAILURES 153
 
 /* One root parameter of the root signature victory builds per pipeline
  * (pipeline/host.rs): 32-bit constants or a root descriptor. Heaps are
@@ -62,7 +63,8 @@ struct msc_compile_params {
   uint32_t num_samplers;
   const struct msc_static_sampler *samplers;
   uint32_t stage;
-  uint32_t reserved;
+  /* MSC_FLAG_* (was reserved: older callers pass 0 = default behaviour). */
+  uint32_t flags;
   /* out: metallib bytes (unix malloc, give back with MSC_Free) */
   void *metallib;
   uint64_t metallib_len;
@@ -78,6 +80,14 @@ struct msc_compile_params {
   int32_t ret;
   char error[1024];
 };
+
+/* msc_compile_params.flags: compile without IRCompatibilityFlagBoundsCheck
+ * (only for pipelines on the verified allow-list; the default keeps it). */
+#define MSC_FLAG_NO_BOUNDS_CHECK 1u
+
+/* MSC_Features() bits: what this build of the unix side honours. */
+#define MSC_FEATURE_FLAGS 1u          /* msc_compile_params.flags is read */
+#define MSC_FEATURE_ARCHIVE_STATS 2u  /* VM_ArchiveAddFailures exists */
 
 struct msc_free_params {
   void *ptr;
@@ -106,6 +116,10 @@ struct msc_geometry_params {
 
 /* gpuResourceID of a texture or sampler state (argument-buffer capable),
  * for descriptor entries; 0 for anything else. */
+struct vm_archive_stats_params {
+  uint64_t add_failures;
+};
+
 struct vm_resource_id_params {
   uint64_t handle;
   uint64_t ret;
@@ -116,5 +130,9 @@ WINEMETAL_API int MSC_Compile(struct msc_compile_params *params);
 WINEMETAL_API int MSC_CompileStageIn(struct msc_stage_in_params *params);
 WINEMETAL_API int MSC_CompileGeometry(struct msc_geometry_params *params);
 WINEMETAL_API void MSC_Free(void *ptr);
+WINEMETAL_API uint32_t MSC_Features(void);
+/* How many MTLBinaryArchive add*PipelineFunctions calls failed (pipeline
+ * creation itself succeeded); the first few are also printed to stderr. */
+WINEMETAL_API uint64_t VM_ArchiveAddFailures(void);
 
 #endif

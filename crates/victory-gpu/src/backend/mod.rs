@@ -41,3 +41,6 @@ pub mod metal_warm;
 // Lead B: the probes' indirect light without rays (VICTORY_AMBIENT).
 #[cfg(windows)]
 pub mod metal_ambient;
+// P8: pipeline binary archive (VICTORY_METAL_ARCHIVE).
+#[cfg(windows)]
+pub(crate) mod metal_archive;

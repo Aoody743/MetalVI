@@ -12,6 +12,7 @@
 
 #![cfg(windows)]
 
+pub mod archive;
 pub mod blit;
 pub mod chunks;
 pub mod clear_resolve;
@@ -281,10 +282,16 @@ impl Device {
         // SAFETY: all-zero is the default for the info struct (as the C smoke test does).
         let mut info: sys::WMTComputePipelineInfo = unsafe { std::mem::zeroed() };
         info.compute_function = function.handle();
-        let mut err = 0;
-        // SAFETY: info is valid for the call.
-        let pso = Object::adopt(unsafe { sys::MTLDevice_newComputePipelineState(self.handle(), &info, &mut err) })
-            .ok_or_else(|| error_text(err, "newComputePipelineState"))?;
+        let make = |l: archive::Lookup, err: &mut obj_handle_t| {
+            let mut info = info;
+            info.binary_archives_for_lookup = sys::WMTConstMemoryPointer { ptr: l.archives.cast() };
+            info.num_binary_archives_for_lookup = l.count;
+            info.binary_archive_for_serialization = l.serialize;
+            info.fail_on_binary_archive_miss = l.fail_on_miss;
+            // SAFETY: info (and the archive list it points to) is valid for the call.
+            unsafe { sys::MTLDevice_newComputePipelineState(self.handle(), &info, err) }
+        };
+        let pso = archive::create(&make, "newComputePipelineState")?;
         Ok(ComputePipeline(pso))
     }
 

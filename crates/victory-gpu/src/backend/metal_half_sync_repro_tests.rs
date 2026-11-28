@@ -503,3 +503,36 @@ fn a_loop_lanes_leave_on_their_own_keeps_the_halves_in_step() {
     assert!(bad.is_empty(), "(live, lane 0, timeouts): {bad:?}");
     assert!(!bad_old.is_empty(), "the old translation was expected to fall out of step");
 }
+
+/// P7: the program converted without bounds checks (`BoundsPolicy::None`) gives the
+/// console's answers, as the checked conversion does; the two metallibs differ (the flag
+/// reached MSC). Needs a victorymetal with `MSC_Features` (PSO-PERF-HANDOFF.md).
+#[test]
+#[ignore = "needs victorymetal built from pso-perf (MSC_FLAG_NO_BOUNDS_CHECK)"]
+fn without_bounds_checks_the_answers_stay() {
+    use victory_metal::msc::{BoundsPolicy, Stage, bounds_policy_supported, convert, set_bounds_policy};
+    let _pool = victory_metal::Pool::new();
+    assert!(bounds_policy_supported(), "this victorymetal ignores MSC_FLAG_NO_BOUNDS_CHECK");
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program()).expect("translate");
+    let backend = MetalBackend::new().unwrap();
+    let mut libs = Vec::new();
+    for policy in [BoundsPolicy::All, BoundsPolicy::None] {
+        set_bounds_policy(Some(policy.clone()));
+        let conv = convert(&shader.dxil, Stage::Compute, &root_params(&shader), &static_samplers(&shader)).unwrap();
+        libs.push(conv.metallib);
+        let mut ms = Vec::new();
+        for live in [0u32, 10, 33, 64] {
+            let r = run(&backend, &shader, 64, 1, live);
+            let want = 64u32.saturating_sub(live);
+            for (t, &got) in r.out.iter().enumerate() {
+                assert_eq!(got, if (t as u32) < live { want } else { 0 }, "{policy:?} live {live} lane {t}");
+            }
+            ms.push(r.ms);
+        }
+        eprintln!("BOUNDS {policy:?}: correct; GPU ms per run {ms:.3?}");
+    }
+    set_bounds_policy(None);
+    assert_ne!(libs[0], libs[1], "the unchecked conversion is the checked one");
+    eprintln!("BOUNDS metallib bytes checked {} unchecked {}", libs[0].len(), libs[1].len());
+}

@@ -85,7 +85,8 @@ struct CompileParams {
     num_samplers: u32,
     samplers: *const StaticSampler,
     stage: u32,
-    reserved: u32,
+    /// msc.h MSC_FLAG_* (an older unix side ignores it: bounds checks stay).
+    flags: u32,
     metallib: *mut c_void,
     metallib_len: u64,
     threadgroup: [u32; 3],
@@ -319,6 +320,107 @@ impl Converted {
     }
 }
 
+/// msc.h `MSC_FLAG_NO_BOUNDS_CHECK`.
+const MSC_FLAG_NO_BOUNDS_CHECK: u32 = 1;
+
+/// The hash a bounds-check allow-list names a shader by: BLAKE3 of the DXIL
+/// container, lowercase hex (lines may give any prefix of 16+ digits).
+pub fn dxil_hash(dxil: &[u8]) -> String {
+    blake3::hash(dxil).to_hex().to_string()
+}
+
+/// Which pipelines are compiled without `IRCompatibilityFlagBoundsCheck`
+/// (PLAN-NATIVE-METAL P7, G.2 "V level"). Bounds checks are what keeps a
+/// stray write inside a view under zero copy, so the default keeps them for
+/// every shader.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BoundsPolicy {
+    /// Every shader bounds checked (the default).
+    #[default]
+    All,
+    /// `VICTORY_METAL_BOUNDS_CHECK=0`: none (measurement only).
+    None,
+    /// `VICTORY_METAL_BOUNDS_ALLOW=<file>`: shaders whose DXIL hash (a line
+    /// of the file, `#` comments) is listed go without; all others keep them.
+    AllowList(Vec<String>),
+}
+
+impl BoundsPolicy {
+    /// From `VICTORY_METAL_BOUNDS_CHECK` and `VICTORY_METAL_BOUNDS_ALLOW`.
+    pub fn from_env() -> Self {
+        if std::env::var("VICTORY_METAL_BOUNDS_CHECK").is_ok_and(|v| v.trim() == "0") {
+            return Self::None;
+        }
+        match std::env::var_os("VICTORY_METAL_BOUNDS_ALLOW").filter(|v| !v.is_empty()) {
+            Some(path) => match std::fs::read_to_string(&path) {
+                Ok(text) => Self::parse_list(&text),
+                // An unreadable list keeps every check (fail safe).
+                Err(_) => Self::All,
+            },
+            None => Self::All,
+        }
+    }
+
+    /// An allow-list file's text: one hash (prefix) per line, `#` comments.
+    pub fn parse_list(text: &str) -> Self {
+        let list: Vec<String> = text
+            .lines()
+            .map(|l| l.split('#').next().unwrap_or("").trim().to_ascii_lowercase())
+            .filter(|l| l.len() >= 16 && l.len() <= 64 && l.bytes().all(|b| b.is_ascii_hexdigit()))
+            .collect();
+        if list.is_empty() { Self::All } else { Self::AllowList(list) }
+    }
+
+    /// Whether `dxil` keeps its bounds checks under this policy.
+    pub fn bounds_check(&self, dxil: &[u8]) -> bool {
+        match self {
+            Self::All => true,
+            Self::None => false,
+            Self::AllowList(list) => {
+                let h = dxil_hash(dxil);
+                !list.iter().any(|p| h.starts_with(p.as_str()))
+            }
+        }
+    }
+}
+
+static BOUNDS: std::sync::RwLock<Option<BoundsPolicy>> = std::sync::RwLock::new(None);
+
+/// The policy in force (read from the environment on first use).
+pub fn bounds_policy() -> BoundsPolicy {
+    let known = BOUNDS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(p) = known {
+        return p;
+    }
+    let mut slot = BOUNDS.write().unwrap_or_else(|e| e.into_inner());
+    slot.get_or_insert_with(BoundsPolicy::from_env).clone()
+}
+
+/// Replaces the policy (tests; `None` re-reads the environment next time).
+pub fn set_bounds_policy(policy: Option<BoundsPolicy>) {
+    *BOUNDS.write().unwrap_or_else(|e| e.into_inner()) = policy;
+}
+
+/// Whether `dxil` is converted with bounds checks (see [`BoundsPolicy`]).
+/// Callers that cache converted shaders must key on this.
+pub fn bounds_check(dxil: &[u8]) -> bool {
+    // The read guard ends with this statement: `bounds_policy` may take the write lock
+    // (a guard held by a `match` scrutinee would live through its arms and deadlock).
+    let known = BOUNDS.read().unwrap_or_else(|e| e.into_inner()).as_ref().map(|p| p.bounds_check(dxil));
+    known.unwrap_or_else(|| bounds_policy().bounds_check(dxil))
+}
+
+/// Whether the installed victorymetal honours [`BoundsPolicy`] (an older
+/// build ignores the flag and keeps every check).
+pub fn bounds_policy_supported() -> bool {
+    let f = sys::symbol(b"MSC_Features\0");
+    if f.is_null() {
+        return false;
+    }
+    // SAFETY: msc.h's signature.
+    unsafe { core::mem::transmute::<*const c_void, unsafe extern "C" fn() -> u32>(f)() & 1 != 0 }
+}
+
 /// Converts one DXIL container (as victory-shader emits it) for `stage`.
 pub fn convert(dxil: &[u8], stage: Stage, params: &[RootParam], samplers: &[StaticSampler]) -> Result<Converted> {
     convert_impl(dxil, stage, params, samplers, &[], false).map(|(shader, _, _)| shader)
@@ -425,7 +527,7 @@ fn convert_impl(
         num_samplers: samplers.len() as u32,
         samplers: samplers.as_ptr(),
         stage: stage as u32,
-        reserved: 0,
+        flags: if bounds_check(dxil) { 0 } else { MSC_FLAG_NO_BOUNDS_CHECK },
         metallib: core::ptr::null_mut(),
         metallib_len: 0,
         threadgroup: [0; 3],
@@ -550,6 +652,19 @@ mod tests {
 
     fn u64_at(bytes: &[u8], at: usize) -> u64 {
         u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn bounds_policy_lists() {
+        let a = b"shader a";
+        let b = b"shader b";
+        let ha = dxil_hash(a);
+        assert_eq!(BoundsPolicy::parse_list("# nothing\n\nxyz\n"), BoundsPolicy::All);
+        let p = BoundsPolicy::parse_list(&format!("# verified\n{}  # by prefix\n", &ha[..20].to_uppercase()));
+        assert!(!p.bounds_check(a));
+        assert!(p.bounds_check(b));
+        assert!(BoundsPolicy::All.bounds_check(a));
+        assert!(!BoundsPolicy::None.bounds_check(b));
     }
 
     #[test]

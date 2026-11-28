@@ -12,6 +12,8 @@
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
+#include "../msc.h"
+#include <stdio.h>
 
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
@@ -24,6 +26,25 @@ execute_on_main(dispatch_block_t block) {
   } else {
     dispatch_sync(dispatch_get_main_queue(), block);
   }
+}
+
+/* MTLBinaryArchive add failures (pipeline creation itself succeeded): the
+ * count goes to VM_ArchiveAddFailures, the first few to stderr. */
+static _Atomic uint64_t archive_add_failures;
+
+static void
+archive_add_failed(NSError *err, const char *kind) {
+  uint64_t n = atomic_fetch_add(&archive_add_failures, 1) + 1;
+  if (n <= 8)
+    fprintf(stderr, "victorymetal: binary archive add (%s) failed: %s\n", kind,
+            err ? [[err localizedDescription] UTF8String] : "unknown");
+}
+
+static NTSTATUS
+_VM_ArchiveAddFailures(void *obj) {
+  struct vm_archive_stats_params *params = obj;
+  params->add_failures = atomic_load(&archive_add_failures);
+  return STATUS_SUCCESS;
 }
 
 static NTSTATUS
@@ -391,8 +412,10 @@ _MTLDevice_newComputePipelineState(void *obj) {
       (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
   params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
-    [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
-                                                                                                      error:&err];
+    NSError *add_err = NULL;
+    if (![(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
+                                                                                                          error:&add_err])
+      archive_add_failed(add_err, "compute");
   }
   [descriptor release];
   return STATUS_SUCCESS;
@@ -591,8 +614,10 @@ new_render_pipeline(struct unixcall_mtldevice_newrenderpso *params, id<MTLLibrar
                                                                                                 error:&err];
   params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
-    [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
-                                                                                                     error:&err];
+    NSError *add_err = NULL;
+    if (![(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
+                                                                                                         error:&add_err])
+      archive_add_failed(add_err, "render");
   }
   [descriptor release];
   return STATUS_SUCCESS;
@@ -680,9 +705,11 @@ new_mesh_render_pipeline(struct unixcall_mtldevice_newmeshrenderpso *params,
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
     if (!err && info->binary_archive_for_serialization) {
-      [(id<MTLBinaryArchive>)info->binary_archive_for_serialization
-          addMeshRenderPipelineFunctionsWithDescriptor:descriptor
-                                                 error:&err];
+      NSError *add_err = NULL;
+      if (![(id<MTLBinaryArchive>)info->binary_archive_for_serialization
+              addMeshRenderPipelineFunctionsWithDescriptor:descriptor
+                                                     error:&add_err])
+        archive_add_failed(add_err, "mesh");
     }
   }
 #endif
@@ -3445,6 +3472,7 @@ const void *__wine_unix_call_funcs[] = {
     &_VM_NewRenderPipelineStageIn,
     &_MSC_CompileGeometry,
     &_VM_NewGeometryPipeline,
+    &_VM_ArchiveAddFailures,
 };
 
 #ifndef DXMT_NATIVE
@@ -3602,5 +3630,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_VM_NewRenderPipelineStageIn,
     &_MSC_CompileGeometry,
     &_VM_NewGeometryPipeline,
+    &_VM_ArchiveAddFailures,
 };
 #endif
