@@ -205,7 +205,7 @@ fn fence_order(sync: bool) {
     // been given the signal: it must hold, then run after.
     t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 1, 10)])).wait_fence(F1, 1).write(None, logger(&log, 0, 2))]).unwrap();
     t.submit(1, vec![Segment::new("producer", Work::Compute(vec![g.add(1, 0, 1)])).signal(F1, 1).write(None, logger(&log, 1, 1))]).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(2), 12);
     assert_eq!(*lock(&log), [(1, 1), (0, 2)]);
     assert_eq!(t.fence_value(F1), 1);
@@ -241,7 +241,7 @@ fn gpu_fence_wait_after_committed_signal() {
     // The producer spins (~2 ms) first so the consumer is encoded while it runs.
     t.submit(1, vec![Segment::new("producer", Work::Compute(vec![g.spin_item(&spin, 64, 3), ComputeItem::Barrier, g.spin_item(&spin, 64, 4), ComputeItem::Barrier, g.add(1, 0, 1)])).signal(F1, 1)]).unwrap();
     t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 1, 10)])).wait_fence(F1, 1)]).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(2), 16);
     let s = t.stats();
     println!("stats: gpu_fence_waits={} cpu_held={} cpu_signals={}", s.gpu_fence_waits, s.cpu_held, s.cpu_signals);
@@ -270,7 +270,7 @@ fn tag_order(sync: bool, ge: bool) -> Stats {
     t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 1, 10)]))
         .wait_tag(0x7a9, 5, ge, Arc::new(move || m.load(Ordering::Acquire) >= 5))
         .write(None, logger(&log, 0, 2))]).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(2), 12);
     assert_eq!(*lock(&log), [(1, 1), (0, 2)]);
     assert!(t.stopped().is_none());
@@ -305,10 +305,10 @@ fn cpu_signal_releases_held_segment() {
     g.set(0, 4);
     let t = g.timeline(cfg(false));
     t.submit(0, vec![Segment::new("waits", Work::Compute(vec![g.add(1, 0, 1)])).wait_fence(F0, 3)]).unwrap();
-    assert!(t.drain(SECOND).is_err(), "held at a wait nothing in flight meets");
+    assert!(!t.drain(SECOND).unwrap(), "held at a wait nothing in flight meets");
     assert_eq!(t.stats().committed[0], 0);
     t.cpu_signal(F0, 3).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(1), 5);
     assert_eq!(t.stats().cpu_held, 1);
 }
@@ -322,7 +322,7 @@ fn force_runs_held_segment() {
     let t = g.timeline(cfg(false));
     t.submit(0, vec![Segment::new("waits", Work::Compute(vec![g.add(1, 0, 1)])).wait_fence(F0, 9)]).unwrap();
     t.force().unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(1), 5);
     assert_eq!(t.stats().forced, 1);
 }
@@ -367,7 +367,7 @@ fn chained_workload(sync: bool) -> (Vec<u32>, Vec<(usize, u32)>, [u64; 2], Stats
         }
         t.submit(1, vec![comp]).unwrap();
     }
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert!(t.stopped().is_none());
     let words = g.words(512);
     let fences = [t.fence_value(F0), t.fence_value(F1)];
@@ -420,7 +420,7 @@ fn cpu_and_gpu_overlap() {
     let run = |sync: bool| -> (Duration, Duration, u64) {
         let t = g.timeline(Config { sync, max_in_flight: 2, ..Config::default() });
         t.submit(0, vec![Segment::new("warm", Work::Compute(vec![g.spin_item(&spin, 0, 1)]))]).unwrap();
-        t.drain(SECOND).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
         let gpu_before = t.stats().gpu_ns[0];
         let start = Instant::now();
         let mut in_submit = Duration::ZERO;
@@ -430,7 +430,7 @@ fn cpu_and_gpu_overlap() {
             t.submit(0, vec![Segment::new("spin", Work::Compute(vec![g.spin_item(&spin, (i % 4) * 64, i)])).write(None, || {})]).unwrap();
             in_submit += s.elapsed();
         }
-        t.drain(SECOND).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
         let wall = start.elapsed();
         assert!(t.stopped().is_none());
         (wall, in_submit, t.stats().gpu_ns[0] - gpu_before)
@@ -461,7 +461,7 @@ fn two_queues_overlap() {
             let work = |dst: u32| Work::Compute(vec![g.spin_item(&spin, dst, round), ComputeItem::Barrier, g.spin_item(&spin, dst, round + 1)]);
             t.submit(0, vec![Segment::new("gfx", work(0))]).unwrap();
             t.submit(1, vec![Segment::new("compute", work(64))]).unwrap();
-            t.drain(SECOND).unwrap();
+            assert!(t.drain(SECOND).unwrap(), "everything ran");
             let s = t.stats();
             let last = |q: usize| s.intervals.iter().rev().find(|i| i.queue == q).cloned().unwrap();
             let (a, b) = (last(0), last(1));
@@ -493,10 +493,10 @@ fn concurrent_dispatches_overlap() {
         let t = g.timeline(Config { barriers: policy, ..cfg(false) });
         let items: Vec<_> = (0..16u32).map(|i| g.spin_item(&spin, 1024 + i * 32, i)).collect();
         t.submit(0, vec![Segment::new("warm", Work::Compute(items.clone()))]).unwrap();
-        t.drain(SECOND).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
         let before = t.stats().gpu_ns[0];
         t.submit(0, vec![Segment::new("dispatches", Work::Compute(items))]).unwrap();
-        t.drain(SECOND).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
         for i in 0..16u32 {
             assert_eq!(g.get((1024 + i * 32 + 1) as usize), lcg(i + 1, MUL, spin.iterations));
         }
@@ -548,7 +548,7 @@ fn hazards_across_barriers() {
         for items in [raw, war, waw] {
             t.submit(0, vec![Segment::new("hazard", Work::Compute(items)).write(None, || {})]).unwrap();
         }
-        t.drain(SECOND).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
         assert_eq!((g.get(1), g.get(2)), (11, 12), "{policy:?} RAW");
         assert_eq!((g.get(6), g.get(5)), (7, 120), "{policy:?} WAR");
         assert_eq!(g.get(8), 22, "{policy:?} WAW");
@@ -572,7 +572,7 @@ fn encoders_ordered_by_fence() {
         Segment::new("second", Work::Compute(vec![g.add(21, 20, 5)])).write(None, || {}),
     ])
     .unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(21), 11);
     let s = t.stats();
     assert_eq!(s.committed[0], 1);
@@ -591,7 +591,7 @@ fn ring_regions_come_back_on_completion() {
     let t = g.timeline(Config { ring_bytes: 512, max_in_flight: 4, ..cfg(false) });
     let segs = (0..64u32).map(|i| Segment::new("ring", Work::Compute(vec![g.ring_add(600 + i, 0, i)])).write(None, || {})).collect();
     t.submit(0, segs).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     for i in 0..64u32 {
         assert_eq!(g.get((600 + i) as usize), 1000 + i);
     }
@@ -614,7 +614,7 @@ fn in_flight_budget_blocks_the_encoder_only() {
         t.submit(0, vec![Segment::new("spin", Work::Compute(vec![g.spin_item(&spin, 0, i)])).write(None, || {})]).unwrap();
     }
     let submitted = start.elapsed();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     let all = start.elapsed();
     let s = t.stats();
     println!("budget: 10 submits in {submitted:?}, all done in {all:?}; max_in_flight={:?} budget_stalls={}", s.max_in_flight, s.budget_stalls);
@@ -651,7 +651,7 @@ fn fault_completion_thread_exits() {
     let t = g.timeline(c);
     let log: Log = Default::default();
     t.submit(0, vec![Segment::new("one", Work::Compute(vec![g.add(1, 0, 1)])).write(None, logger(&log, 0, 1))]).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     t.submit(0, vec![Segment::new("two", Work::Compute(vec![g.add(2, 0, 1)])).write(None, logger(&log, 0, 2))]).unwrap();
     assert!(t.drain(SECOND).is_err());
     let why = t.stopped().unwrap();
@@ -716,7 +716,7 @@ fn fault_outer_stop() {
     let hooks = Hooks { stopped: Box::new(move || t2.load(Ordering::Acquire)), ..Hooks::default() };
     let t = Timeline::new(g.device.clone(), cfg(false), hooks).unwrap();
     t.submit(0, vec![Segment::new("one", Work::Compute(vec![g.add(1, 0, 1)]))]).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     tripped.store(true, Ordering::Release);
     t.submit(0, vec![Segment::new("two", Work::Compute(vec![g.add(2, 0, 1)]))]).unwrap();
     assert!(t.drain(SECOND).is_err());
@@ -775,7 +775,7 @@ fn host_segments_run_in_order() {
         .signal(F0, 1),
     ])
     .unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(3), 102);
     assert_eq!(*lock(&log), [(0, 1), (0, 2)]);
     assert_eq!(t.fence_value(F0), 1);
@@ -802,9 +802,84 @@ fn host_segment_waits_on_the_cpu() {
         true
     })))
     .wait_tag(0x7a9, 5, true, Arc::new(move || m.load(Ordering::Acquire) >= 5))]).unwrap();
-    t.drain(SECOND).unwrap();
+    assert!(t.drain(SECOND).unwrap(), "everything ran");
     assert_eq!(g.get(3), 102);
     let s = t.stats();
     assert_eq!(s.gpu_tag_waits, 0);
     assert_eq!(s.cpu_held, 1, "{s:?}");
+}
+
+/// A producer that never completes (it waits on an event outside the
+/// timeline) and whose fence another queue's committed command buffer waits
+/// for on the GPU: when the hang is found, the timeline releases its events,
+/// the waiting command buffer finishes, and every completion thread gets
+/// past its command buffers within the timeout. Nothing waits forever.
+fn stuck_producer(stop_from_outside: bool) {
+    let _pool = Pool::new();
+    let g = Gpu::new();
+    g.set(0, 1);
+    let never = SharedEvent::new(&g.device).unwrap();
+    let n2 = never.clone();
+    let hang_ms = if stop_from_outside { 3000 } else { 300 };
+    let t = g.timeline(Config { hang_ms, ..cfg(false) });
+    t.submit(1, vec![
+        Segment::new("stuck producer", Work::Encode {
+            ring_bytes: 0,
+            groups: 0,
+            encode: Box::new(move |e| {
+                e.cb.encode_wait(&n2, 1);
+                Ok(())
+            }),
+        })
+        .signal(F1, 1),
+        Segment::new("behind it", Work::Compute(vec![g.add(5, 0, 1)])),
+    ])
+    .unwrap();
+    t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 0, 10)])).wait_fence(F1, 1)]).unwrap();
+    // The consumer is committed with a GPU wait on the stuck producer's signal.
+    let start = Instant::now();
+    while t.stats().gpu_fence_waits == 0 {
+        assert!(start.elapsed() < Duration::from_secs(2), "consumer never committed: {:?}", t.stats());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let start = Instant::now();
+    if stop_from_outside {
+        t.stop("test");
+    }
+    // The consumer's command buffer finishes (released, not timed out).
+    while !t.stats().intervals.iter().any(|i| i.queue == 0) {
+        assert!(start.elapsed() < Duration::from_secs(2), "consumer still waiting: {:?}", t.stats());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let released_after = start.elapsed();
+    // Every completion thread got past its command buffers.
+    while t.in_flight() != [0, 0] {
+        assert!(start.elapsed() < Duration::from_millis(hang_ms * 3 + 1000), "completion threads stuck: {:?}", t.in_flight());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let s = t.stats();
+    println!("stuck producer (outer stop {stop_from_outside}): consumer done {released_after:?} after; released={} stopped={:?}", s.released, t.stopped());
+    assert_eq!(s.released, 1);
+    assert!(t.stopped().is_some());
+    if stop_from_outside {
+        assert!(released_after < Duration::from_millis(1000), "released by the stop, not by a timeout");
+    }
+    assert!(t.drain(SECOND).is_err());
+    // Dropping the timeline is bounded even with the producer still stuck.
+    let start = Instant::now();
+    drop(t);
+    assert!(start.elapsed() < Duration::from_secs(2), "drop took {:?}", start.elapsed());
+    never.signal(1);
+}
+
+#[test]
+#[ignore = "requires Metal"]
+fn fault_hang_releases_waiters() {
+    stuck_producer(false);
+}
+
+#[test]
+#[ignore = "requires Metal"]
+fn fault_outer_stop_releases_waiters() {
+    stuck_producer(true);
 }

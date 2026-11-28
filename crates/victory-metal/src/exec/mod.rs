@@ -14,9 +14,19 @@
 //! ```
 //!
 //! * Each queue is an `MTLCommandQueue`. Its command buffers are chained by a
-//!   GPU-only [`Event`] (memory reached by address is not tracked by Metal),
-//!   and each ends by signalling the queue's `done` [`SharedEvent`] to its
-//!   sequence number, which the completion thread waits on with a timeout.
+//!   [`SharedEvent`] (memory reached by address is not tracked by Metal; a
+//!   shared event, not a GPU-only one, so the CPU can release it), and each
+//!   ends by signalling the queue's `done` [`SharedEvent`] to its sequence
+//!   number, which the completion thread waits on with a timeout.
+//! * **No GPU wait is left without a signal.** Every event a committed
+//!   command buffer waits on (fence, tag, chain) is one the timeline owns. On
+//!   any stop (GPU error, fuse, hang timeout, lost completion thread, outer
+//!   stop) the timeline sets all of them to their maximum, so command
+//!   buffers already committed behind a failed producer drain instead of
+//!   waiting forever. `done` events are not released: a completion thread
+//!   whose wait timed out never calls `waitUntilCompleted`, so it cannot
+//!   block on a command buffer that never finishes. Every CPU-side wait
+//!   ([`Timeline::drain`], completion) has a timeout.
 //! * A title fence is a [`SharedEvent`] whose value is the fence value. A
 //!   signal is encoded at the end of the command buffer; a wait at the start
 //!   of the next one, **but only for a value whose signal is already
@@ -54,7 +64,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::events::{Event, Fence, SharedEvent};
+use crate::events::{Fence, SharedEvent};
 use crate::{CommandBuffer, Device, Error, Pool, Queue, Result};
 
 pub use barrier::{BarrierPolicy, ComputeItem, Dispatch, Range};
@@ -320,6 +330,8 @@ pub struct Stats {
     pub host_runs: u64,
     /// Segments dropped after a stop.
     pub discarded: u64,
+    /// Times every event was released after a stop.
+    pub released: u64,
     /// Encoder thread time spent encoding and committing.
     pub encode_ns: u64,
     /// GPU time of completed command buffers, per queue.
@@ -345,7 +357,7 @@ struct TagState {
 struct QueueShared {
     queue: Queue,
     done: SharedEvent,
-    chain: Event,
+    chain: SharedEvent,
     fence: Fence,
     in_flight: Mutex<(u32, u64)>,
     /// Committed command buffers whose bottom-of-pipe writes have not run
@@ -380,7 +392,7 @@ enum Msg {
     /// Answer once nothing more can be encoded now (sync submit).
     Quiesce(mpsc::Sender<Result<()>>),
     /// Answer once everything submitted has completed.
-    Drain(mpsc::Sender<Result<()>>),
+    Drain(mpsc::Sender<Result<bool>>),
     Shutdown,
 }
 
@@ -417,11 +429,27 @@ impl Inner {
             return;
         }
         *lock(&self.reason) = Some(reason.clone());
+        self.release();
         (self.hooks.stop)(&reason);
         self.pending_changed.notify_all();
         if let Some(w) = lock(&self.wake).as_ref() {
             let _ = w.send(Msg::Progress);
         }
+    }
+
+    /// Sets every fence, tag and chain event to its maximum: command buffers
+    /// already committed that wait on one of them can then finish.
+    fn release(&self) {
+        for f in lock(&self.fences).values() {
+            f.event.signal(u64::MAX);
+        }
+        for t in lock(&self.tags).values() {
+            t.event.signal(u64::MAX);
+        }
+        for q in &self.queues {
+            q.chain.signal(u64::MAX);
+        }
+        lock(&self.stats).released += 1;
     }
 
     fn is_stopped(&self) -> bool {
@@ -471,10 +499,17 @@ impl Inner {
         let mut measured = 0;
         let ok = (|| -> std::result::Result<(), String> {
             if !qs.done.wait_until_signaled(flight.seq, self.cfg.hang_ms) {
-                return Err(format!(
+                let reason = format!(
                     "queue {q} command buffer {} ({}) did not complete within {} ms",
                     flight.seq, flight.label, self.cfg.hang_ms
-                ));
+                );
+                // Stop and release every event first: if this command buffer
+                // waits behind another that failed, it can finish now. Then
+                // one more bounded wait.
+                self.fault(reason.clone());
+                if !qs.done.wait_until_signaled(flight.seq, self.cfg.hang_ms) {
+                    return Err(reason);
+                }
             }
             flight.cb.wait().map_err(|e| format!("queue {q} command buffer {} ({}) failed: {e}", flight.seq, flight.label))?;
             let gpu = flight.cb.gpu_time_ns();
@@ -554,7 +589,7 @@ impl Timeline {
             queues.push(QueueShared {
                 queue,
                 done,
-                chain: Event::new(&device)?,
+                chain: SharedEvent::new(&device)?,
                 fence: Fence::new(&device)?,
                 in_flight: Mutex::new((0, 0)),
                 writes_out: std::sync::atomic::AtomicU64::new(0),
@@ -692,12 +727,25 @@ impl Timeline {
         self.send(Msg::Force)
     }
 
-    /// Waits until everything submitted so far has completed (or held work
-    /// can go no further: then an error), up to `timeout`.
-    pub fn drain(&self, timeout: Duration) -> Result<()> {
+    /// Waits, up to `timeout`, until nothing submitted so far is in flight:
+    /// `Ok(true)` all of it ran; `Ok(false)` what is left is held at waits on
+    /// the CPU (nothing of it is on the GPU). An error: stopped, or timed out
+    /// with work still on the GPU.
+    pub fn drain(&self, timeout: Duration) -> Result<bool> {
         let (tx, rx) = mpsc::channel();
         self.send(Msg::Drain(tx))?;
         rx.recv_timeout(timeout).map_err(|_| Error("drain timed out".into()))?
+    }
+
+    /// Stops all submission now (an outer safety stop) and releases every
+    /// event committed work may wait on.
+    pub fn stop(&self, reason: &str) {
+        self.inner.fault(format!("stopped: {reason}"));
+    }
+
+    /// Command buffers in flight per queue.
+    pub fn in_flight(&self) -> Vec<u32> {
+        self.inner.queues.iter().map(|q| lock(&q.in_flight).0).collect()
     }
 
     pub fn stopped(&self) -> Option<String> {
@@ -744,7 +792,7 @@ struct Encoder {
     seq: Vec<u64>,
     completion: Vec<Option<mpsc::Sender<Flight>>>,
     quiesce: Vec<mpsc::Sender<Result<()>>>,
-    drains: Vec<mpsc::Sender<Result<()>>>,
+    drains: Vec<mpsc::Sender<Result<bool>>>,
 }
 
 /// How a segment's waits stand.
@@ -814,13 +862,7 @@ impl Encoder {
             && self.pending.iter().all(|q| q.front().is_none_or(|s| matches!(self.ready(s), Ready::Held)));
         if stopped || self.idle() || held {
             for tx in self.drains.drain(..) {
-                let _ = tx.send(if stopped {
-                    Err(err())
-                } else if held {
-                    Err(Error("held at waits nothing in flight will meet".into()))
-                } else {
-                    Ok(())
-                });
+                let _ = tx.send(if stopped { Err(err()) } else { Ok(!held) });
             }
         }
     }

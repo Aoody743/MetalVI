@@ -221,10 +221,23 @@ pub(crate) fn drain(force: bool, why: &'static str) {
     if force {
         let _ = t.force();
     }
-    if let Err(e) = t.drain(Duration::from_secs(5)) {
-        static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
-            tracing::warn!(why, error = %e, "Metal: execution timeline did not drain");
+    match t.drain(Duration::from_secs(5)) {
+        Ok(true) => {}
+        // Left at waits on the CPU: none of it is on the GPU.
+        Ok(false) => {
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                tracing::info!(why, "Metal: execution timeline holds work at waits (none in flight)");
+            }
+        }
+        // Stopped, or work still on the GPU after 5 s: hung. What comes next
+        // (a page remap, a present) must not run beside it, so everything
+        // stops; the timeline releases its events so nothing it committed
+        // waits forever.
+        Err(e) => {
+            tracing::error!(why, error = %e, in_flight = ?t.in_flight(), "Metal safety stop: execution timeline did not drain");
+            super::metal::stop_submissions("execution timeline did not drain");
+            t.stop(why);
         }
     }
     static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

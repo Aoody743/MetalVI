@@ -148,7 +148,7 @@ fn timeline_compute_matches_old_path() {
     let segs = segments(&ops);
     assert_eq!(segs.len(), 3, "4 dispatches | indirect | 2 dispatches");
     t.submit(0, segs).unwrap();
-    t.drain(Duration::from_secs(5)).unwrap();
+    assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
     assert!(t.stopped().is_none());
     let new = s.words();
     assert_eq!(new, old, "timeline path");
@@ -191,7 +191,7 @@ fn timeline_compute_on_two_queues() {
     let compute: Vec<_> = (0..8).map(|i| s.direct(40 + i, 0, 100 + i, true)).collect();
     t.submit(0, segments(&gfx)).unwrap();
     t.submit(1, segments(&compute)).unwrap();
-    t.drain(Duration::from_secs(5)).unwrap();
+    assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
     let w = s.words();
     for i in 0..8u32 {
         assert_eq!(w[(20 + i) as usize], 7 + i);
@@ -274,14 +274,14 @@ fn timeline_compute_overlaps() {
     // Warm the timeline's queues.
     t.submit(0, segments(&[spin_op(&s, &pso, 5)])).unwrap();
     t.submit(1, segments(&[spin_op(&s, &pso, 6)])).unwrap();
-    t.drain(Duration::from_secs(5)).unwrap();
+    assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
     s.reset();
     let gpu_before = t.stats().gpu_ns.clone();
     let start = std::time::Instant::now();
     t.submit(0, segments(&a)).unwrap();
     t.submit(1, segments(&b)).unwrap();
     let submitted = start.elapsed();
-    t.drain(Duration::from_secs(5)).unwrap();
+    assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
     let new = start.elapsed();
     assert_eq!(s.words(), old_words, "same results");
     let st = t.stats();
