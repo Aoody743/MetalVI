@@ -60,6 +60,7 @@ pub fn sources() -> &'static [&'static str] {
         include_str!("emit/lower_image.rs"),
         include_str!("emit/lower_tests.rs"),
         include_str!("emit/mask_numbers.rs"),
+        include_str!("emit/mesh_order.rs"),
         include_str!("emit/mod.rs"),
         include_str!("emit/own_bits.rs"),
         include_str!("emit/quad_edge_tests.rs"),

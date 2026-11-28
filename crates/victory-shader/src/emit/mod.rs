@@ -122,6 +122,7 @@ pub use sampler::StaticSampler;
 pub use lower::{
     RECT_PRIMITIVE_VARYING, host_attribute_at_vertex, host_has_image_atomic64, host_max_wave, rect_primitive_varying,
     set_host_attribute_at_vertex, set_host_f64, set_rect_primitive_varying, set_mesh_outputs_keep, mesh_outputs_keep_active,
+    input_reads, set_mesh_output_reads,
     set_host_image_atomic64, set_host_max_wave,
 };
 pub use rect::rect_list_gs;

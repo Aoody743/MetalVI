@@ -361,6 +361,9 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 mod heap_address;
 #[path = "mask_numbers.rs"]
 mod mask_numbers;
+#[path = "mesh_order.rs"]
+pub(super) mod mesh_order;
+pub use mesh_order::{input_reads, set_mesh_output_reads};
 #[path = "lds_start.rs"]
 mod lds_start_impl;
 pub(super) use lds_start_impl::lds_start;
@@ -1640,6 +1643,7 @@ impl<'a> Lower<'a> {
                 let read = |e: &SigElement| e.kind != 0 || keep.iter().any(|(n, i)| n.eq_ignore_ascii_case(&e.name) && *i == e.index);
                 s.outputs.retain(read);
                 s.prims.retain(read);
+                s.renumber_outputs = mesh_order::fit(&mut s.outputs, ms.max_vertices);
             }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);

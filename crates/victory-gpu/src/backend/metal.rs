@@ -2548,6 +2548,10 @@ mod msc_check_tests;
 #[path = "metal_archive_tests.rs"]
 mod archive_tests;
 
+#[cfg(test)]
+#[path = "metal_mesh32k_tests.rs"]
+mod mesh32k_tests;
+
 /// Names what a command buffer that does not complete was running: a
 /// GPU-side hang (a shader that never ends) blocks `cb.wait()` with no
 /// error and no log, and the title stops presenting.
