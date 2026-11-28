@@ -101,3 +101,42 @@ fn a_host_phase_older_than_the_limit_is_stuck() {
     work::phase(work::LANE_CAPTURE, "");
     assert!(work::stuck_phase(work::LANE_CAPTURE, 0).is_none());
 }
+
+/// A dirty partly filled texture: `texture_for` refills it and returns, it
+/// does not deadlock on the textures lock it still held (2026-11-28 freezes).
+#[test]
+fn texture_for_refills_a_dirty_partial_texture_without_deadlock() {
+    let _pool = victory_metal::Pool::new();
+    let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+    let texture = backend.device.new_texture(&victory_metal::texture::TextureDescriptor {
+        pixel_format: victory_metal::sys::WMTPixelFormat::WMTPixelFormatR32Float,
+        width: 4,
+        height: 4,
+        usage: victory_metal::sys::WMTTextureUsage(1 | 2 | 4 | 0x10),
+        options: victory_metal::sys::WMTResourceOptions(0x20),
+        ..Default::default()
+    }).unwrap();
+    // SAFETY: ResourceDesc is an integer-only C record.
+    let mut rdesc: crate::resource::ResourceDesc = unsafe { std::mem::zeroed() };
+    rdesc.width = 4;
+    rdesc.height = 4;
+    rdesc.dimension = 3;
+    rdesc.sample_count = 1;
+    const KEY: usize = 0x7e57_0001;
+    backend.textures.lock().unwrap().insert(KEY, Some(Arc::new(crate::backend::metal_texture::MetalTexture {
+        companion: Default::default(),
+        texture,
+        pixel: victory_metal::sys::WMTPixelFormat::WMTPixelFormatR32Float,
+        desc: rdesc,
+        mips: 1,
+        slices: 1,
+    })));
+    let memory = Box::leak(vec![0u8; 4096].into_boxed_slice());
+    MetalBackend::mark_partial_dirty_for_test(KEY, memory.as_ptr() as u64);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _pool = victory_metal::Pool::new();
+        let _ = tx.send(backend.texture_for(KEY as crate::object::This).is_some());
+    });
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(10)), Ok(true), "texture_for deadlocked on a dirty partial texture");
+}
