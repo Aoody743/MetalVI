@@ -1028,6 +1028,15 @@ impl MetalBackend {
                                 .collect(),
                             _ => Vec::new(),
                         };
+                        {
+                            // Once per pipeline: whether its dispatches can be cut.
+                            static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+                            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+                            if seen.get_or_insert_with(Default::default).insert(c.pso.name.clone()) {
+                                tracing::info!(pipeline = %c.pso.name, segmented = !seg_tops.is_empty(), group_base = c.group_base_at.is_some(),
+                                    "Metal: an indirect dispatch pipeline (segments need a group base)");
+                            }
+                        }
                         let source = IndirectSource { dispatch_segments: segments.filter(|_| !seg_tops.is_empty()),
                             kind: IndirectKind::Dispatch,
                             records: (&c.records, c.records_offset),
