@@ -29,6 +29,7 @@ use victory_metal::sys;
 use victory_metal::texture::Texture;
 
 use super::metal::{MetalBackend, convert_cached, render_desc, root_params, static_samplers};
+use super::metal_phase::{self, Phase};
 use super::metal_render_map as map;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -749,7 +750,7 @@ impl MetalBackend {
             return;
         }
         let (row, bytes) = (row as u32, bytes64 as usize);
-        super::metal::work::here("capture alloc");
+        metal_phase::here(Phase::CaptureAlloc);
         let _pool = victory_metal::Pool::new();
         // Metal's own shared memory, read after the wait: a no-copy wrap of
         // a fresh 33 MB allocation was wired for every readback (see
@@ -760,9 +761,9 @@ impl MetalBackend {
         {
             blit.copy_from_texture_to_buffer(&t.texture, 0, 0, [0, 0, 0], [u64::from(w), u64::from(h), 1], &buffer, 0, row, row * h);
             blit.finish();
-            super::metal::work::here("capture submit");
+            metal_phase::here(Phase::CaptureSubmit);
             if super::metal::submit_checked(&cb, &[], true, "capture readback").is_ok() {
-                super::metal::work::here("capture write");
+                metal_phase::here(Phase::CaptureWrite);
                 // SAFETY: the GPU wrote `bytes` bytes there.
                 let data = unsafe { std::slice::from_raw_parts(mem.cast_const(), bytes) };
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
@@ -794,7 +795,7 @@ impl MetalBackend {
             }
         }
         drop(buffer);
-        super::metal::work::after_wait();
+        metal_phase::after_wait();
     }
 }
 

@@ -1,6 +1,6 @@
-//! Command-buffer cutting and the hang watch's host phases (2026-11-28
-//! freezes): run on the Metal path under F85 Wine, with Metal API
-//! validation and `VICTORY_METAL_PASS_DISPATCHES` > 1.
+//! Command-buffer cutting and submission (2026-11-28 freezes): run on the
+//! Metal path under F85 Wine, with Metal API validation and
+//! `VICTORY_METAL_PASS_DISPATCHES` > 1.
 use super::*;
 use victory_metal::ir::ResourceType;
 use victory_metal::msc::RootParam;
@@ -85,22 +85,6 @@ fn direct_and_indirect_dispatches_sharing_buffers_run_in_order() {
         println!("round {round}: {splits} splits");
         assert_eq!(got, expected, "round {round}: dispatches ran out of order or were lost");
     }
-    // Nothing left in a host phase once the batch is done.
-    assert!(work::stuck_phase(work::LANE_RUN, 0).is_none());
-}
-
-/// The hang watch's host phases: a phase older than the limit is reported
-/// once per start, idle is never reported.
-#[test]
-fn a_host_phase_older_than_the_limit_is_stuck() {
-    work::phase(work::LANE_CAPTURE, "test phase");
-    assert!(work::stuck_phase(work::LANE_CAPTURE, 60_000).is_none());
-    std::thread::sleep(std::time::Duration::from_millis(30));
-    let (phase, age, _) = work::stuck_phase(work::LANE_CAPTURE, 10).unwrap();
-    assert_eq!(phase, "test phase");
-    assert!(age >= 10);
-    work::phase(work::LANE_CAPTURE, "");
-    assert!(work::stuck_phase(work::LANE_CAPTURE, 0).is_none());
 }
 
 /// A dirty partly filled texture: `texture_for` refills it and returns, it
