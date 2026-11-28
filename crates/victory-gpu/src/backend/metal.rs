@@ -112,7 +112,7 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
 /// whole at the next safe point. On by default
 /// (`VICTORY_METAL_PREWIRE_SECTIONS=0` turns it off): every stuck exit came
 /// from wiring during play, and this leaves one wiring per section instead
-/// of one per span. Up to `VICTORY_METAL_PREWIRE_CAP_MB` (default 16 GiB;
+/// of one per span. Up to `VICTORY_METAL_PREWIRE_CAP_MB` (default 32 GiB, the user's choice;
 /// the kernel's wire limit here is 52 GiB, 17.7 GiB were wired at the last
 /// freeze); sections past it get spans as before.
 static PREWIRE: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
@@ -124,7 +124,7 @@ fn prewire_sections() -> bool {
 
 fn prewire_cap() -> u64 {
     static CAP: OnceLock<u64> = OnceLock::new();
-    *CAP.get_or_init(|| std::env::var("VICTORY_METAL_PREWIRE_CAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(16384) << 20)
+    *CAP.get_or_init(|| std::env::var("VICTORY_METAL_PREWIRE_CAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(32768) << 20)
 }
 
 /// The runtime made a physical-page section with a never-remapped view at
