@@ -107,6 +107,9 @@ pub struct Stats {
     /// Spans at title addresses (no persistent alias): these pages can be
     /// remapped under them.
     pub direct_spans: u64,
+    /// Whole persistent views wired ahead ([`Chunks::prewire`]) and their bytes.
+    pub prewired: u64,
+    pub prewired_bytes: u64,
     pub refused: u64,
     /// Bytes under live span buffers (they overlap chunks and each other).
     pub span_bytes: u64,
@@ -395,6 +398,34 @@ impl Chunks {
         None
     }
 
+    /// Wraps the whole never-remapped range `[start, start+len)` (a persistent
+    /// view of a physical-page section) as one span, wired now: every view
+    /// inside it then resolves to it and wires nothing more. Not counted
+    /// against [`Chunks::span_cap`].
+    pub fn prewire(&mut self, start: u64, len: u64) -> bool {
+        let Some(end) = start.checked_add(len) else { return false };
+        if len == 0 || self.spans.contains_key(&(start, end)) {
+            return false;
+        }
+        let _gate = self.gate.map(|g| g(start, len, true));
+        // SAFETY: a mapping nobody remaps while its section lives.
+        match unsafe { self.device.wrap(start as *mut c_void, len) } {
+            Ok(b) => {
+                self.residency.add(&[b.handle()]);
+                self.residency.commit();
+                self.spans.insert((start, end), b);
+                self.longest_span = self.longest_span.max(len);
+                self.stats.prewired += 1;
+                self.stats.prewired_bytes += len;
+                true
+            }
+            Err(_) => {
+                self.stats.refused += 1;
+                false
+            }
+        }
+    }
+
     /// Wraps every chunk touching `[at, at+len)` that is not wrapped yet.
     pub fn wrap(&mut self, at: u64, len: u64) {
         let _gate = self.gate.map(|g| g(at, len, false));
@@ -679,5 +710,35 @@ mod span_tests {
         chunks.wrap(base, 4 << 20);
         assert_eq!(CALLS.lock().unwrap().len(), before + 1, "a chunk wrap takes the gate");
         assert_eq!(HELD.load(std::sync::atomic::Ordering::SeqCst), 0, "released after the commit");
+    }
+
+    /// A range wired whole ahead resolves every view inside it to the one
+    /// buffer, and making them wires nothing more (no gate call).
+    #[test]
+    fn views_in_a_prewired_range_wire_nothing_more() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        static GATES: AtomicU32 = AtomicU32::new(0);
+        fn gate(_: u64, _: u64, _: bool) -> Box<dyn core::any::Any> {
+            GATES.fetch_add(1, Ordering::SeqCst);
+            Box::new(())
+        }
+        let Ok(device) = Device::first() else { return };
+        let mut chunks = Chunks::sparse(&device).unwrap();
+        chunks.gate = Some(gate);
+        let bytes = 48u64 << 20;
+        // SAFETY: a fresh allocation of our own, never freed (test).
+        let base = unsafe { VirtualAlloc(core::ptr::null(), bytes as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        assert!(chunks.prewire(base, bytes));
+        assert!(!chunks.prewire(base, bytes), "wired once");
+        assert_eq!(GATES.load(Ordering::SeqCst), 1);
+        assert_eq!((chunks.stats.prewired, chunks.stats.prewired_bytes), (1, bytes));
+        for (off, len) in [(0u64, 256u64), (4096, 4096), (20 << 20, 1 << 20), (bytes - 4096, 4096)] {
+            let (b, at) = chunks.window_buffer(base + off, len).expect("inside");
+            assert_eq!((b.len, at), (bytes, off), "the prewired buffer");
+        }
+        assert_eq!(GATES.load(Ordering::SeqCst), 1, "no more wiring");
+        assert_eq!(chunks.stats.spans, 0);
     }
 }

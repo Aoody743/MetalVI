@@ -108,6 +108,50 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     Box::new(Wiring(reading, flight))
 }
 
+/// Persistent views of physical-page sections the runtime made, to be wired
+/// whole at the next safe point (`VICTORY_METAL_PREWIRE_SECTIONS=1`).
+static PREWIRE: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn prewire_sections() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_PREWIRE_SECTIONS").as_deref() == Ok("1"))
+}
+
+/// The runtime made a physical-page section with a never-remapped view at
+/// `[at, at+len)` (xmem). Logged (count and total: how much wiring every
+/// section whole would pin); queued for [`MetalBackend::prewire_pending`]
+/// when `VICTORY_METAL_PREWIRE_SECTIONS=1`. Runs in the runtime's
+/// allocation path: it only records.
+pub fn title_memory_persistent(at: usize, len: usize) {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let total = BYTES.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed) + len as u64;
+    if n <= 64 || n.is_power_of_two() {
+        tracing::info!(n, at = format_args!("{at:#x}"), mb = len >> 20, total_mb = total >> 20, "Metal: a persistent section view");
+    }
+    if prewire_sections() {
+        PREWIRE.lock().unwrap_or_else(|e| e.into_inner()).push((at as u64, len as u64));
+    }
+}
+
+impl MetalBackend {
+    /// Wires the queued persistent views whole ([`title_memory_persistent`]),
+    /// before a batch encodes: inside the mapping gate and [`IN_FLIGHT`]
+    /// (the chunks gate), never while this backend's GPU work runs.
+    fn prewire_pending(&self) {
+        let pending = std::mem::take(&mut *PREWIRE.lock().unwrap_or_else(|e| e.into_inner()));
+        if pending.is_empty() {
+            return;
+        }
+        let mut chunks = self.chunks();
+        for (at, len) in pending {
+            let ok = chunks.prewire(at, len);
+            tracing::info!(at = format_args!("{at:#x}"), mb = len >> 20, ok, prewired_mb = chunks.stats.prewired_bytes >> 20, "Metal: a persistent section view wired whole");
+        }
+    }
+}
+
 /// Counts mapping changes. Recorded Metal lists can still contain old GPU
 /// addresses, so the post-map notification cannot safely re-wrap memory.
 pub(crate) fn title_memory_remapped(at: u64, len: u64) {
@@ -735,6 +779,7 @@ impl MetalBackend {
         let batch = BATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         work::trace_ops(batch, ops);
         let started = std::time::Instant::now();
+        self.prewire_pending();
         super::metal_texture::drain_remap_partial();
         if !self.flush_uploads() {
             return false;

@@ -561,6 +561,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
     let section = Arc::new(Section::new(handle, size));
+    // Its never-remapped view, which the GPU side may wire whole ahead.
+    if let Some(view) = &section.persistent {
+        victory_gpu::title_memory_persistent(view.at.Value as usize, view.len);
+    }
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
