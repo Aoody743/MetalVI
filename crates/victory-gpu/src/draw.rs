@@ -454,8 +454,8 @@ static DISPATCHED: AtomicU64 = AtomicU64::new(0);
 /// bounds from the shadow copies.
 static METAL_PREP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
-/// [`METAL_PREP`]: (heap syncs, slot refreshes, shadow bounds, syncs and
-/// refreshes skipped as clean by `metal_slot_cache`) so far.
+/// [`METAL_PREP`]: (heap syncs, slot refreshes, shadow bounds, syncs,
+/// refreshes and bounds skipped as clean by `metal_slot_cache`) so far.
 pub(crate) fn metal_prep() -> [u64; 4] {
     METAL_PREP.each_ref().map(|c| c.load(Ordering::Relaxed))
 }
@@ -2736,8 +2736,15 @@ impl State {
                 let extent = if va == 0 {
                     0
                 } else {
-                    METAL_PREP[2].fetch_add(1, Ordering::Relaxed);
-                    match crate::shadow::buffer_extent(va) {
+                    let found = if cache {
+                        let (found, looked) = crate::backend::metal_slot_cache::root_extent(va);
+                        METAL_PREP[if looked { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
+                        found
+                    } else {
+                        METAL_PREP[2].fetch_add(1, Ordering::Relaxed);
+                        crate::shadow::buffer_extent(va)
+                    };
+                    match found {
                         Some((_, end)) => end - va,
                         None => victory_metal::chunks::committed_extent(va, 4 << 20),
                     }

@@ -65,6 +65,35 @@ pub(crate) fn mark(heap: usize, index: u32, handle: u64, generation: u64) {
     m.insert((heap, index), (handle, generation));
 }
 
+/// [`crate::shadow::buffer_extent`] for a root view's address, remembered
+/// per recording thread until a title buffer is registered or released
+/// (`shadow::buffers_version`): the record step no longer takes the title
+/// buffer table's lock per root view in the steady state. `None` (the
+/// address is in no title buffer) is not remembered, so the caller's
+/// fallback runs every time, as before. The bool is whether it was looked up.
+pub(crate) fn root_extent(va: u64) -> (Option<(u64, u64)>, bool) {
+    use std::cell::RefCell;
+    thread_local! {
+        static EXTENTS: RefCell<HashMap<u64, (u64, (u64, u64))>> = RefCell::new(HashMap::new());
+    }
+    let version = crate::shadow::buffers_version();
+    if let Some(hit) = EXTENTS.with_borrow(|m| m.get(&va).copied())
+        && hit.0 == version
+    {
+        return (Some(hit.1), false);
+    }
+    let found = crate::shadow::buffer_extent(va);
+    if let Some(extent) = found {
+        EXTENTS.with_borrow_mut(|m| {
+            if m.len() >= MOST {
+                m.clear();
+            }
+            m.insert(va, (version, extent));
+        });
+    }
+    (found, true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -88,5 +117,21 @@ mod tests {
         stale();
         mark(heap, 4, 0xcc, before);
         assert!(!is_clean(heap, 4, 0xcc));
+    }
+
+    #[test]
+    fn root_extents_follow_title_buffers() {
+        let (resource, start) = (0x7a_0001usize, 0x7a51_0000_0000u64);
+        assert_eq!(root_extent(start + 8).0, None);
+        crate::shadow::register(resource, start, 0x1000);
+        assert_eq!(root_extent(start + 8), (Some((start, start + 0x1000)), true));
+        // Remembered: no lookup the second time.
+        assert_eq!(root_extent(start + 8), (Some((start, start + 0x1000)), false));
+        // Released and registered again with another size: looked up anew.
+        crate::shadow::unregister(resource, start);
+        assert_eq!(root_extent(start + 8).0, None);
+        crate::shadow::register(resource, start, 0x2000);
+        assert_eq!(root_extent(start + 8), (Some((start, start + 0x2000)), true));
+        crate::shadow::unregister(resource, start);
     }
 }

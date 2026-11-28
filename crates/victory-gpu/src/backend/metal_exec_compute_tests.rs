@@ -609,6 +609,80 @@ mod draws {
         assert_eq!(after[0] - before[0], ops.len() as u64);
     }
 
+    /// An indirect draw of 150 records (more than one bounded translation
+    /// takes) with a GPU count of 130, on the timeline: drawn in parts of at
+    /// most 64 records, every one of the 130 live records exactly once.
+    #[test]
+    #[ignore = "requires Metal"]
+    fn indirect_draw_over_the_record_limit_is_split() {
+        let _pool = victory_metal::Pool::new();
+        let backend: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().unwrap()));
+        let (seq, _) = sequence(backend);
+        let MetalOp::Draw(depth) = &*seq[4] else { panic!("the sequence's draw") };
+        // Every vertex invocation counts itself.
+        let lib = backend
+            .device
+            .library_msl(
+                "#include <metal_stdlib>\nusing namespace metal;\n\
+                 vertex float4 vs(uint id [[vertex_id]], device atomic_uint *n [[buffer(0)]]) {\n\
+                 atomic_fetch_add_explicit(n, 1u, memory_order_relaxed);\n\
+                 return float4(id == 1 ? 3 : -1, id == 2 ? 3 : -1, 0.5, 1); }\n",
+            )
+            .unwrap();
+        let desc = RenderPipelineDesc { depth_format: P::WMTPixelFormatDepth32Float.0, sample_count: 1, ..Default::default() };
+        let pso = Arc::new(MetalGraphics {
+            cost_ns: 1.into(),
+            name: "stage 4 synthetic indirect draw".into(),
+            pso: backend.device.render_pipeline_desc((&lib, "vs"), None, &desc).unwrap(),
+            dss: backend.device.depth_stencil_state(&DepthStencilDesc { depth_write: false, depth_compare: 7, ..Default::default() }).unwrap(),
+            depth_write: false,
+            raster: [0; 4],
+            bias: [0.0; 3],
+            stages: Vec::new(),
+            vertex_slots: 0,
+            mesh: false,
+            mesh_threads: [0; 3],
+            geometry: None,
+            colors: [0; 8],
+            depth: desc.depth_format,
+            stencil: 0,
+            samples: 1,
+        });
+        // Record r: 3 vertices, 1 + r % 2 instances.
+        let records: Vec<u8> = (0..150u32).flat_map(|r| [3, 1 + r % 2, 0, 0]).flat_map(u32::to_le_bytes).collect();
+        let records = backend.device.shared_buffer(&records).unwrap();
+        let count = backend.device.shared_buffer(&130u32.to_le_bytes()).unwrap();
+        let (counter, cpu) = backend.device.shared_buffer_mapped(&[0u8; 16]).unwrap();
+        backend.chunks().residency().add(&[records.handle(), count.handle(), counter.handle()]);
+        backend.chunks().residency().commit();
+        let draw = Arc::new(MetalOp::Draw(MetalDraw {
+            trace_inputs: Vec::new(),
+            pso,
+            targets: depth.targets.clone(),
+            stages: vec![crate::backend::metal_draw::StageBind { bind: 0, top: Vec::new(), tables: Vec::new(), heap: Some(counter), sampler_heap: None }],
+            vertex: None,
+            viewport: depth.viewport,
+            scissor: depth.scissor,
+            blend: [0.0; 4],
+            stencil_ref: 0,
+            primitive: 3,
+            kind: DrawKind::Indirect { records, records_offset: 0, records_va: 0, stride: 16, max: 150, count: Some((count, 0)), count_va: None, index: None },
+        }));
+        let ops = vec![draw];
+        assert!(encodable(&ops) && !compute_only(&ops));
+        let t = timeline(backend);
+        let before = DRAW_PARTS.load(Ordering::Relaxed);
+        t.submit(0, general_segments(backend, &ops, None)).unwrap();
+        assert!(t.drain(Duration::from_secs(5)).unwrap(), "everything ran");
+        assert!(t.stopped().is_none(), "{:?}", t.stopped());
+        // SAFETY: inside the 16-byte buffer, after completion.
+        let n = unsafe { cpu.cast::<u32>().read_volatile() };
+        let expected: u32 = (0..130u32).map(|r| 3 * (1 + r % 2)).sum();
+        println!("indirect draw parts: {} vertex invocations {n} (expected {expected})", DRAW_PARTS.load(Ordering::Relaxed) - before);
+        assert_eq!(DRAW_PARTS.load(Ordering::Relaxed) - before, 3, "150 records: 64 + 64 + 22");
+        assert_eq!(n, expected, "each of the 130 live records drawn once");
+    }
+
     /// Host cost per op for draws: 64 depth draws with clears between, old
     /// path vs timeline (game thread, encoder, wall).
     #[test]

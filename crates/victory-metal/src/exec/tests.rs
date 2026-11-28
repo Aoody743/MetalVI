@@ -235,19 +235,31 @@ fn two_queues_fence_order_sync() {
 fn gpu_fence_wait_after_committed_signal() {
     let _pool = Pool::new();
     let g = Gpu::new();
-    g.set(0, 5);
     let spin = g.spin(1_000_000);
-    let t = g.timeline(cfg(false));
-    // The producer spins (~2 ms) first so the consumer is encoded while it runs.
-    t.submit(1, vec![Segment::new("producer", Work::Compute(vec![g.spin_item(&spin, 64, 3), ComputeItem::Barrier, g.spin_item(&spin, 64, 4), ComputeItem::Barrier, g.add(1, 0, 1)])).signal(F1, 1)]).unwrap();
-    t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 1, 10)])).wait_fence(F1, 1)]).unwrap();
-    assert!(t.drain(SECOND).unwrap(), "everything ran");
-    assert_eq!(g.get(2), 16);
-    let s = t.stats();
-    println!("stats: gpu_fence_waits={} cpu_held={} cpu_signals={}", s.gpu_fence_waits, s.cpu_held, s.cpu_signals);
-    assert_eq!(s.cpu_signals, 0);
-    assert_eq!(s.gpu_fence_waits, 1, "{s:?}");
-    assert!(t.stopped().is_none());
+    // The producer spins (~2 ms) first so the consumer is encoded while it
+    // runs. On a loaded machine the encoder can lose that race (the
+    // producer done before the consumer is looked at: no wait needed at
+    // all), so a few rounds, each checked for order, one needing a GPU wait.
+    let mut waits = Vec::new();
+    for _ in 0..5 {
+        g.set(0, 5);
+        g.set(1, 0);
+        g.set(2, 0);
+        let t = g.timeline(cfg(false));
+        t.submit(1, vec![Segment::new("producer", Work::Compute(vec![g.spin_item(&spin, 64, 3), ComputeItem::Barrier, g.spin_item(&spin, 64, 4), ComputeItem::Barrier, g.add(1, 0, 1)])).signal(F1, 1)]).unwrap();
+        t.submit(0, vec![Segment::new("consumer", Work::Compute(vec![g.add(2, 1, 10)])).wait_fence(F1, 1)]).unwrap();
+        assert!(t.drain(SECOND).unwrap(), "everything ran");
+        assert_eq!(g.get(2), 16);
+        let s = t.stats();
+        println!("stats: gpu_fence_waits={} cpu_held={} cpu_signals={}", s.gpu_fence_waits, s.cpu_held, s.cpu_signals);
+        assert_eq!(s.cpu_signals, 0);
+        assert!(t.stopped().is_none());
+        waits.push(s.gpu_fence_waits);
+        if s.gpu_fence_waits == 1 {
+            return;
+        }
+    }
+    panic!("no round needed a GPU wait: {waits:?}");
 }
 
 fn tag_order(sync: bool, ge: bool) -> Stats {

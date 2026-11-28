@@ -1267,14 +1267,14 @@ impl MetalBackend {
                     }
                     // Indirect records of this run of draws, translated on
                     // the GPU before its render pass opens (F42).
-                    let mut batches: Vec<Option<victory_metal::indirect::IndirectBatch>> = Vec::new();
+                    let mut batches: Vec<Vec<victory_metal::indirect::IndirectBatch>> = Vec::new();
                     {
                         let mut j = i;
                         while let Some(MetalOp::Draw(d)) = ops.get(j).map(|o| &**o) {
                             if j == planned_end || !d.targets.same(&t) {
                                 break;
                             }
-                            let mut batch = None;
+                            let mut batch = Vec::new();
                             if let DrawKind::Indirect { records, records_offset, stride, max, count, index, .. } = &d.kind {
                                 let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok())
                                     else { return work::reject("indirect translator unavailable") };
@@ -1305,16 +1305,43 @@ impl MetalBackend {
                                     clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
                                 }
                                 let Some(counter) = clamp_counter.as_ref() else { return work::reject("indirect counter unavailable") };
-                                match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&d.pso.name)) {
-                                    Ok(mut b) => {
-                                        if let Some(trace) = b.as_mut().and_then(|batch| batch.take_trace()) {
-                                            indirect_traces.push((j, d.pso.name.clone(), trace));
+                                let limit = victory_metal::indirect::RECORD_LIMIT;
+                                if external && *max > limit {
+                                    // Stage 4 (timeline only): more records
+                                    // than one bounded translation takes, in
+                                    // parts of `limit` drawn one after the
+                                    // other (not rejected); the count, if
+                                    // any, is the whole list's.
+                                    let mut first = 0;
+                                    while first < *max {
+                                        let part = (*max - first).min(limit);
+                                        let source = IndirectSource {
+                                            records: (records, *records_offset + u64::from(first) * u64::from(*stride)),
+                                            max_count: part,
+                                            ..source
+                                        };
+                                        match tr.encode_bounded_part(&self.device, &cb, &source, counter, first) {
+                                            Ok(b) => batch.extend(b),
+                                            Err(e) => {
+                                                tracing::error!(error = %e, "Metal: indirect draw translation failed");
+                                                return work::reject("indirect draw translation");
+                                            }
                                         }
-                                        batch = b;
+                                        first += part;
                                     }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "Metal: indirect draw translation failed");
-                                        return work::reject("indirect draw translation");
+                                    exec_compute::note_draw_parts(max.div_ceil(limit));
+                                } else {
+                                    match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&d.pso.name)) {
+                                        Ok(mut b) => {
+                                            if let Some(trace) = b.as_mut().and_then(|batch| batch.take_trace()) {
+                                                indirect_traces.push((j, d.pso.name.clone(), trace));
+                                            }
+                                            batch.extend(b);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Metal: indirect draw translation failed");
+                                            return work::reject("indirect draw translation");
+                                        }
                                     }
                                 }
                             }
@@ -1409,7 +1436,7 @@ impl MetalBackend {
                             DrawKind::Indirect { index, .. } => {
                                 // One Metal indirect draw per record, with
                                 // its MSC draw arguments.
-                                if let Some(batch) = batches.get(i - group_first).and_then(Option::as_ref) {
+                                for batch in batches.get(i - group_first).into_iter().flatten() {
                                     for r in 0..batch.record_count() {
                                         let Some(rec) = batch.record(r) else { continue };
                                         if g.mesh && g.geometry.is_none() {

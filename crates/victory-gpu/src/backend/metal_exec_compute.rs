@@ -242,6 +242,14 @@ pub(crate) fn encodable(ops: &[Arc<MetalOp>]) -> bool {
         })
 }
 
+/// Parts of indirect draws over `RECORD_LIMIT` records translated one
+/// after the other by `run_batch` on the timeline (instead of rejected).
+pub(crate) static DRAW_PARTS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn note_draw_parts(n: u32) {
+    DRAW_PARTS.fetch_add(u64::from(n), Ordering::Relaxed);
+}
+
 /// Op counts encoded through [`general_segments`]: ops, chunks.
 pub(crate) static GENERAL: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
