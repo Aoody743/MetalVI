@@ -71,6 +71,9 @@ fn build() -> &'static [u8; 32] {
             u32::from(victory_shader::emit::host_has_image_atomic64()),
             // And whether per-vertex attribute reads use the table (F41).
             u32::from(victory_shader::emit::host_attribute_at_vertex()),
+            // And whether wave sums of doubles stay doubles: `warm --metal`
+            // once cached them with doubles for a run without (MSC aborts).
+            u32::from(victory_shader::emit::host_has_f64()),
         ] {
             hash.update(&n.to_le_bytes());
         }

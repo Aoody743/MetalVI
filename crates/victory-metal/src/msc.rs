@@ -500,6 +500,36 @@ fn encode_vertex_inputs<T>(inputs: &[VertexInput<'_>], use_elements: impl FnOnce
     use_elements(&elements)
 }
 
+/// The feature flags (`SFI0`) of a DXIL container, if it has them.
+fn feature_flags(container: &[u8]) -> Option<u64> {
+    let u32_at = |at: usize| container.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+    if container.get(..4)? != b"DXBC" {
+        return None;
+    }
+    (0..u32_at(28)? as usize).find_map(|i| {
+        let at = u32_at(32 + 4 * i)? as usize;
+        (container.get(at..at + 4)? == b"SFI0")
+            .then(|| container.get(at + 8..at + 16).map(|b| u64::from_le_bytes(b.try_into().unwrap())))
+            .flatten()
+    })
+}
+
+/// Why DXIL is kept from Metal Shader Converter, which would end the whole
+/// process on it (it aborts instead of returning an error), or `None`.
+///
+/// Doubles (`SFI0` bit 0): Apple GPUs have none, and MSC 4.0.3 aborts on a
+/// wave sum of them ("Fatal: Unhandled LLVM type for getMinMaxConstants";
+/// 6871d6e4…, 926c46ba…, a10179ab…, 5dc3b259…, 6f225b64… translated with
+/// doubles on). The Metal host translates without them
+/// (`victory_shader::emit::set_metal_host`): only a translation made with
+/// other settings (a stale cache) gets here.
+pub fn refused_before_conversion(dxil: &[u8]) -> Option<&'static str> {
+    if feature_flags(dxil).is_some_and(|f| f & 1 != 0) {
+        return Some("the shader uses doubles (MSC aborts the process on wave sums of them)");
+    }
+    None
+}
+
 fn convert_impl(
     dxil: &[u8],
     stage: Stage,
@@ -508,6 +538,9 @@ fn convert_impl(
     inputs: &[RawInput],
     geometry: bool,
 ) -> Result<(Converted, Vec<u8>, [u32; 4])> {
+    if let Some(why) = refused_before_conversion(dxil) {
+        return Err(Error(format!("Metal Shader Converter not asked: {why}")));
+    }
     let raw: Vec<RawParam> = params
         .iter()
         .map(|p| match *p {
@@ -652,6 +685,28 @@ mod tests {
 
     fn u64_at(bytes: &[u8], at: usize) -> u64 {
         u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn doubles_are_kept_from_the_converter() {
+        // A container with one part, SFI0 holding `flags`.
+        let container = |flags: u64| {
+            let mut c = b"DXBC".to_vec();
+            c.resize(28, 0);
+            c.extend(1u32.to_le_bytes());
+            c.extend(36u32.to_le_bytes());
+            c.extend(b"SFI0");
+            c.extend(8u32.to_le_bytes());
+            c.extend(flags.to_le_bytes());
+            c
+        };
+        assert_eq!(feature_flags(&container(0x4001)), Some(0x4001));
+        assert!(refused_before_conversion(&container(0x4001)).is_some());
+        assert!(refused_before_conversion(&container(0x4000)).is_none());
+        assert!(refused_before_conversion(b"not a container").is_none());
+        let mut cut = container(1);
+        cut.truncate(40);
+        assert!(refused_before_conversion(&cut).is_none());
     }
 
     #[test]
