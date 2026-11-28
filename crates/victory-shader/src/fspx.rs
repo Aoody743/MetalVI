@@ -204,4 +204,4 @@ pub fn native_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
 
 #[cfg(test)]
 #[path = "fspx_tests.rs"]
-mod tests;
+pub(crate) mod tests;

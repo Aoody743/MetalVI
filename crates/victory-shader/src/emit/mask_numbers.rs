@@ -22,7 +22,7 @@ impl Lower<'_> {
             return false;
         }
         let mut seen = Vec::new();
-        !inst.reads.is_empty() && inst.reads.iter().all(|&(r, v)| self.number(r, v, &mut seen, 0))
+        const_select(inst) || !inst.reads.is_empty() && inst.reads.iter().all(|&(r, v)| self.number(r, v, &mut seen, 0))
     }
 
     /// Whether `v` (in `r`) is a number whatever the structure calls it: a scalar load, a lane
@@ -62,6 +62,9 @@ impl Lower<'_> {
         if name.starts_with("s_load") || name.starts_with("s_buffer_load") || matches!(name, "v_readfirstlane_b32" | "v_readlane_b32") {
             return true;
         }
+        if const_select(inst) {
+            return true;
+        }
         matches!(inst.fields, Fields::Sop { .. })
             && !name.starts_with("s_cselect")
             && !name.contains("saveexec")
@@ -69,4 +72,16 @@ impl Lower<'_> {
             && inst.write(Reg::S(126)).is_none()
             && inst.reads.iter().all(|&(r, a)| self.number(r, a, seen, depth + 1))
     }
+}
+
+/// `s_cselect_b32/b64 sdst, a, b` of two constants: SCC as a number (the AMD compiler's
+/// uniform booleans, -1 or 0, as in the Series S upscaler's spin loops: `s_and_b32 s9, s9,
+/// exec_lo`, `s_cselect_b32 s11, -1, 0`, `s_orn2_b32 s13, s13, s11`, `s_cbranch_scc0`).
+/// Not a lane mask whatever the structure counts it as: it reads no lanes.
+/// `VICTORY_MASK_NUMBERS=0` turns this off with the rest.
+fn const_select(inst: &Inst) -> bool {
+    let Fields::Sop { src, .. } = &inst.fields else { return false };
+    inst.name().starts_with("s_cselect_")
+        && src.len() == 2
+        && src.iter().all(|o| matches!(o, Operand::Const(c) if crate::resource::inline(*c).is_some()) || matches!(o, Operand::Literal(_)))
 }

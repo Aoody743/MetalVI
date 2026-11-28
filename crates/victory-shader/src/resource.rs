@@ -2365,6 +2365,14 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     if inst.name() == "s_movk_i32" {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
+    // `s_bfm_b32` of two constants: a field mask, as the AMD compiler builds
+    // an immediate sampler's dword 1 (the Series S upscaler, FSPX).
+    if inst.name() == "s_bfm_b32"
+        && let [a, b] = src[..]
+        && let (Some(width), Some(shift)) = (lane_of(a), lane_of(b))
+    {
+        return Some(Moved::Const(((1u32 << (width & 31)) - 1) << (shift & 31)));
+    }
     let src = src.first()?;
     match (inst.name(), *src) {
         ("s_mov_b32" | "s_mov_b64", Operand::Scalar { code, .. }) if code != NULL => {
@@ -2377,6 +2385,9 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // A 32-bit literal moved to 64 bits: its high dword zero for a
+        // literal below 2^31 (zero or sign extension agree there).
+        ("s_mov_b64", Operand::Literal(x)) if (x as i32) >= 0 => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;

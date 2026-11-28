@@ -99,7 +99,10 @@ impl<'a> Lower<'a> {
             let Fields::Image { cache, .. } = &inst.fields else {
                 unreachable!()
             };
-            if *d16 || *a16 {
+            // 16-bit coordinates (a16) are read as for loads and stores
+            // (`addr_packed`; the Series S upscaler's `image_atomic_add ...
+            // a16`); 16-bit data is not done.
+            if *d16 {
                 return Err("a 16-bit image atomic");
             }
             // Compare-exchange consumes a replacement followed by a comparand.
@@ -260,8 +263,13 @@ impl<'a> Lower<'a> {
                 return Err("an image store to a mip level");
             }
             // shortcut: stores are taken to write all four channels of a
-            // float format (the console converts by the view's format).
-            if *dmask != 0xF {
+            // float format (the console converts by the view's format). A
+            // store of fewer channels (the Series S upscaler's `image_store
+            // v10, .. d16`, one channel) gives the enabled ones in order and
+            // the rest as the hardware fills them, 0 and alpha 1.
+            // shortcut: that fill is RDNA's as documented, not checked on a
+            // console.
+            if *dmask == 0 {
                 return Err("an image store of some channels");
             }
             let iu = self.s.m.undef(self.s.t.i32);
@@ -273,7 +281,13 @@ impl<'a> Lower<'a> {
                 return Err("image store data");
             };
             let mut vals = Vec::new();
-            for k in 0..4u8 {
+            for channel in 0..4u8 {
+                if *dmask >> channel & 1 == 0 {
+                    vals.push(self.s.m.f32(if channel == 3 { 1f32.to_bits() } else { 0 }));
+                    continue;
+                }
+                // The enabled channels' place in the data.
+                let k = (*dmask & ((1 << channel) - 1)).count_ones() as u8;
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
                 let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;

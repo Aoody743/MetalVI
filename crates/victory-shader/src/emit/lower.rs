@@ -361,8 +361,8 @@ pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 mod heap_address;
 #[path = "mask_numbers.rs"]
 mod mask_numbers;
-#[path = "dot8.rs"]
-mod dot8;
+#[path = "fspx_ops.rs"]
+mod fspx_ops;
 #[path = "mesh_order.rs"]
 pub(super) mod mesh_order;
 pub use mesh_order::{input_reads, set_mesh_output_reads};
@@ -2929,6 +2929,12 @@ impl<'a> Lower<'a> {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
             }
+            // SCC of a mask operation read as data (`s_cselect` of -1, 0).
+            Some(&Val::Missing(_)) | None if self.mask_data == MaskData::Console && self.x.st.scc_some.contains_key(&v) => {
+                let b = Val::Bit(self.scc_some(v)?);
+                self.vals.insert(v, b);
+                return Ok(b);
+            }
             Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
             None => {}
@@ -3608,6 +3614,8 @@ impl<'a> Lower<'a> {
             // The exiting POPS wave id: no wave waits on the host (see
             // `inputs`).
             Operand::Const(239) if self.pops => Ok(self.s.m.i32(0)),
+            // `src_scc`: SCC as 0 or 1.
+            Operand::Const(253) => self.i32_of(inst.read(Reg::Scc).ok_or("an unread SCC")?),
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
                 .ok_or("a special operand (vccz, execz, scc, lds_direct)"),
@@ -7884,7 +7892,7 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.valu16(inst, name, guard) {
             return r;
         }
-        if let Some(r) = self.dot8(inst, name, guard) {
+        if let Some(r) = self.fspx_op(inst, name, guard) {
             return r;
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
