@@ -18,6 +18,7 @@ pub mod chunks;
 pub mod clear_resolve;
 pub mod msc;
 pub mod events;
+pub mod exec;
 pub mod indirect;
 pub mod ir;
 pub mod sampler;
@@ -230,10 +231,21 @@ impl Device {
     /// The pointer is valid while the buffer lives. The caller must synchronize
     /// GPU access before reading or writing through it.
     pub fn shared_buffer_mapped(&self, bytes: &[u8]) -> Result<(Buffer, *mut u8)> {
+        self.shared_buffer_with(bytes, sys::WMTResourceOptions::WMTResourceStorageModeShared)
+    }
+
+    /// As [`Device::shared_buffer_mapped`], without Metal's hazard tracking:
+    /// like memory reached by GPU address, ordering is the encoder's job
+    /// (barriers, `MTLFence`, events).
+    pub fn shared_buffer_untracked_mapped(&self, bytes: &[u8]) -> Result<(Buffer, *mut u8)> {
+        self.shared_buffer_with(bytes, sys::WMTResourceOptions::WMTResourceHazardTrackingModeUntracked)
+    }
+
+    fn shared_buffer_with(&self, bytes: &[u8], options: sys::WMTResourceOptions) -> Result<(Buffer, *mut u8)> {
         let len = bytes.len() as u64;
         let mut info = sys::WMTBufferInfo {
             length: len,
-            options: sys::WMTResourceOptions::WMTResourceStorageModeShared,
+            options,
             memory: sys::WMTMemoryPointer { ptr: std::ptr::null_mut() },
             gpu_address: 0,
         };
@@ -392,6 +404,14 @@ pub enum Compute<'a> {
     /// Writes of earlier dispatches to buffers are seen by later ones
     /// (Metal tracks no hazards for memory reached by address).
     Barrier,
+    /// A memory barrier over the given scopes (buffers, textures, targets).
+    BarrierScope(sys::WMTBarrierScope),
+    /// Later encoders that wait for `fence` see this encoder's work so far
+    /// (`updateFence:`; Metal orders it at the end of the encoder).
+    UpdateFence(&'a events::Fence),
+    /// This encoder's later work waits for encoders that updated `fence`
+    /// (`waitForFence:`).
+    WaitFence(&'a events::Fence),
 }
 
 #[derive(Clone)]
@@ -422,6 +442,16 @@ impl CommandBuffer {
     /// Encodes a compute pass: the steps become winemetal's command chain
     /// (built here, read by the unix side during the call).
     pub fn compute(&self, steps: &[Compute<'_>]) -> Result<()> {
+        self.compute_with(false, steps)
+    }
+
+    /// Encodes a compute pass in a concurrent encoder: dispatches without a
+    /// barrier between them may overlap on the GPU (plan v2 D1).
+    pub fn compute_concurrent(&self, steps: &[Compute<'_>]) -> Result<()> {
+        self.compute_with(true, steps)
+    }
+
+    fn compute_with(&self, concurrent: bool, steps: &[Compute<'_>]) -> Result<()> {
         let mut threads = [1; 3];
         let mut total = 0u64;
         for step in steps {
@@ -445,7 +475,7 @@ impl CommandBuffer {
         }
         let _pool = Pool::new();
         // SAFETY: a live command buffer; the encoder is autoreleased.
-        let encoder = unsafe { sys::MTLCommandBuffer_computeCommandEncoder(self.handle(), false) };
+        let encoder = unsafe { sys::MTLCommandBuffer_computeCommandEncoder(self.handle(), concurrent) };
         if encoder == 0 {
             return Err(Error("computeCommandEncoder".into()));
         }
@@ -488,6 +518,24 @@ impl CommandBuffer {
                     reserved: [0; 3],
                     next: null_next(),
                     scope: sys::WMTBarrierScope::WMTBarrierScopeBuffers,
+                }),
+                Compute::BarrierScope(scope) => Box::new(sys::wmtcmd_compute_memory_barrier {
+                    type_: sys::WMTComputeCommandType::WMTComputeCommandMemoryBarrier,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    scope,
+                }),
+                Compute::UpdateFence(fence) => Box::new(sys::wmtcmd_compute_fence_op {
+                    type_: sys::WMTComputeCommandType::WMTComputeCommandUpdateFence,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    fence: fence.handle(),
+                }),
+                Compute::WaitFence(fence) => Box::new(sys::wmtcmd_compute_fence_op {
+                    type_: sys::WMTComputeCommandType::WMTComputeCommandWaitForFence,
+                    reserved: [0; 3],
+                    next: null_next(),
+                    fence: fence.handle(),
                 }),
                 Compute::Dispatch { groups: [w, h, d] } => Box::new(sys::wmtcmd_compute_dispatch {
                     type_: sys::WMTComputeCommandType::WMTComputeCommandDispatch,
@@ -542,6 +590,24 @@ impl CommandBuffer {
         end.saturating_sub(start)
     }
 
+    /// The GPU start and end timestamps of a completed command buffer, in
+    /// nanoseconds on the GPU clock (0 if unknown). Used to show overlap.
+    pub fn gpu_interval_ns(&self) -> (u64, u64) {
+        // SAFETY: as in `gpu_time_ns`.
+        unsafe {
+            (
+                sys::MTLCommandBuffer_property(self.handle(), sys::WMTCommandBufferProperty::WMTCommandBufferPropertyGPUStartTime),
+                sys::MTLCommandBuffer_property(self.handle(), sys::WMTCommandBufferProperty::WMTCommandBufferPropertyGPUEndTime),
+            )
+        }
+    }
+
+    /// The command buffer's status now (does not wait).
+    pub fn status(&self) -> sys::WMTCommandBufferStatus {
+        // SAFETY: a live command buffer.
+        unsafe { sys::MTLCommandBuffer_status(self.handle()) }
+    }
+
     pub fn wait(&self) -> Result<()> {
         let _pool = Pool::new();
         // SAFETY: a live, committed command buffer.
@@ -588,7 +654,8 @@ chain_link!(
     sys::wmtcmd_compute_dispatch,
     sys::wmtcmd_compute_dispatch_indirect,
     sys::wmtcmd_compute_setbytes,
-    sys::wmtcmd_compute_memory_barrier
+    sys::wmtcmd_compute_memory_barrier,
+    sys::wmtcmd_compute_fence_op
 );
 pub mod render;
 pub mod present;

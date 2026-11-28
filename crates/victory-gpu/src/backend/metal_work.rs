@@ -413,3 +413,6 @@ fn budget_prefix_never_rejects_oversized_first_operation() {
     assert_eq!(fit([WINDOW_NS / 2, WINDOW_NS / 2, 1].into_iter()), 2);
     assert_eq!(fit([1, WINDOW_NS + 1].into_iter()), 1);
 }
+
+#[cfg(test)]
+pub(crate) use crate::backend::metal_phase::profile;

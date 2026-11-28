@@ -17,7 +17,6 @@ macro_rules! phases {
         #[derive(Clone, Copy)]
         pub(super) enum Phase { $($phase),+ }
         const PHASE_NAMES: &[&str] = &[$($name),+];
-        #[cfg(test)]
         const ALL_PHASES: &[Phase] = &[$(Phase::$phase),+];
     };
 }
@@ -48,6 +47,9 @@ phases! {
     CaptureAlloc => "capture alloc",
     CaptureSubmit => "capture submit",
     CaptureWrite => "capture write",
+    DepthCompanionLoad => "depth companion load",
+    DepthCompanionStore => "depth companion store",
+    EncodeRenderPass => "encode render pass",
 }
 
 const PHASE_BITS: u32 = 5;
@@ -64,13 +66,15 @@ impl HostPhase {
         Self(AtomicU64::new(0))
     }
 
-    fn publish(&self, phase: Phase, now_ms: impl Fn() -> u64) {
+    fn publish(&self, phase: Phase, now_ms: impl Fn() -> u64) -> u64 {
         // Resample after a competing write. An idle publication also keeps
         // its timestamp so a delayed writer cannot mistake it for the initial state.
-        let _ = self.0.fetch_update(Relaxed, Relaxed, |previous| {
-            let at = now_ms().max(previous >> PHASE_BITS);
-            Some((at << PHASE_BITS) | phase as u64)
-        });
+        self.0
+            .fetch_update(Relaxed, Relaxed, |previous| {
+                let at = now_ms().max(previous >> PHASE_BITS);
+                Some((at << PHASE_BITS) | phase as u64)
+            })
+            .expect("phase publication is unconditional")
     }
 
     fn stuck(&self, ms: u64, now_ms: impl FnOnce() -> u64) -> Option<(&'static str, u64, u64)> {
@@ -145,8 +149,10 @@ fn with_phases<T>(f: impl FnOnce(&HostPhases) -> T) -> T {
     }
 }
 
-fn publish(lane: usize, phase: Phase) {
-    with_phases(|state| state.lanes[lane].publish(phase, || clock_ms(&state.epoch)));
+fn publish(lane: usize, phase: Phase) -> u64 {
+    #[cfg(test)]
+    profile::mark(PHASE_NAMES[phase as usize]);
+    with_phases(|state| state.lanes[lane].publish(phase, || clock_ms(&state.epoch)))
 }
 
 #[cfg(test)]
@@ -189,6 +195,24 @@ pub(super) fn here(phase: Phase) {
     publish(LANE.get(), phase);
 }
 
+/// Publishes `phase` until the guard drops, then starts the previous phase again.
+pub(super) fn within(phase: Phase) -> impl Drop {
+    struct Restore(usize, Phase, std::marker::PhantomData<std::rc::Rc<()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            publish(self.0, self.1);
+        }
+    }
+
+    let lane = LANE.get();
+    let previous = publish(lane, phase);
+    Restore(
+        lane,
+        ALL_PHASES[(previous & PHASE_MASK) as usize],
+        std::marker::PhantomData,
+    )
+}
+
 /// After a wait or capture, return the capture lane to idle or the run lane to encoding.
 pub(super) fn after_wait() {
     let lane = LANE.get();
@@ -198,6 +222,47 @@ pub(super) fn after_wait() {
         Phase::Idle
     };
     publish(lane, phase);
+}
+
+/// Tests only: time spent in each phase on this thread, between
+/// [`profile::start`] and [`profile::take`] (stage 4 encode profiling).
+#[cfg(test)]
+pub(crate) mod profile {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    thread_local! {
+        static P: RefCell<Option<(&'static str, Instant, HashMap<&'static str, (u64, u64)>)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn start() {
+        P.with_borrow_mut(|p| *p = Some(("", Instant::now(), HashMap::new())));
+    }
+
+    pub(super) fn mark(phase: &'static str) {
+        P.with_borrow_mut(|p| {
+            if let Some((last, at, map)) = p.as_mut() {
+                let now = Instant::now();
+                let e = map.entry(*last).or_default();
+                e.0 += now.duration_since(*at).as_nanos() as u64;
+                e.1 += 1;
+                *last = phase;
+                *at = now;
+            }
+        });
+    }
+
+    /// (phase, ns, times entered), most time first.
+    pub(crate) fn take() -> Vec<(&'static str, u64, u64)> {
+        mark("");
+        let map = P
+            .with_borrow_mut(|p| p.take().map(|(_, _, m)| m))
+            .unwrap_or_default();
+        let mut v: Vec<_> = map.into_iter().map(|(k, (ns, n))| (k, ns, n)).collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
+        v
+    }
 }
 
 #[cfg(test)]
@@ -337,7 +402,7 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(move || {
                 let first_attempt = Cell::new(true);
-                shared.publish(Phase::Commit, || {
+                let previous = shared.publish(Phase::Commit, || {
                     if first_attempt.replace(false) {
                         sampled_tx.send(()).unwrap();
                         resume_rx.recv().unwrap();
@@ -346,6 +411,7 @@ mod tests {
                         30
                     }
                 });
+                assert_eq!(previous, (21 << PHASE_BITS) | Phase::Idle as u64);
             });
             sampled_rx.recv().unwrap();
             phase.publish(Phase::CaptureAlloc, || 20);
@@ -454,6 +520,66 @@ mod tests {
             here(Phase::CaptureWrite);
             assert_eq!(label(LANE_CAPTURE), "capture write");
             assert!(is_idle(LANE_RUN));
+        });
+    }
+
+    #[test]
+    fn scoped_phases_restore_nested_labels_and_idle() {
+        with_test_phases(|| {
+            {
+                let _store = within(Phase::DepthCompanionStore);
+                assert_eq!(label(LANE_CAPTURE), "depth companion store");
+            }
+            assert!(is_idle(LANE_CAPTURE));
+
+            let _run = lane(LANE_RUN);
+            here(Phase::EncodeDraws);
+            {
+                let _load = within(Phase::DepthCompanionLoad);
+                assert_eq!(label(LANE_RUN), "depth companion load");
+                {
+                    let _render = within(Phase::EncodeRenderPass);
+                    assert_eq!(label(LANE_RUN), "encode render pass");
+                }
+                assert_eq!(label(LANE_RUN), "depth companion load");
+            }
+            assert_eq!(label(LANE_RUN), "encode draws");
+            assert!(is_idle(LANE_CAPTURE));
+        });
+    }
+
+    #[test]
+    fn scoped_phase_restores_parent_during_unwind() {
+        with_test_phases(|| {
+            here(Phase::EncodeDraws);
+            let panic = catch_unwind(|| {
+                let _render = within(Phase::EncodeRenderPass);
+                assert_eq!(label(LANE_CAPTURE), "encode render pass");
+                panic!("test unwind");
+            })
+            .unwrap_err();
+            assert_eq!(panic.downcast_ref::<&str>(), Some(&"test unwind"));
+            assert_eq!(label(LANE_CAPTURE), "encode draws");
+        });
+    }
+
+    #[test]
+    fn phase_profiler_records_scoped_phase_and_restoration() {
+        with_test_phases(|| {
+            profile::start();
+            here(Phase::EncodeDraws);
+            {
+                let _render = within(Phase::EncodeRenderPass);
+            }
+            let mut counts: Vec<_> = profile::take()
+                .into_iter()
+                .map(|(phase, _, count)| (phase, count))
+                .collect();
+            counts.sort_unstable();
+            assert_eq!(
+                counts,
+                [("", 1), ("encode draws", 2), ("encode render pass", 1)]
+            );
         });
     }
 }

@@ -3515,20 +3515,33 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Bumped (under the [`BUFFERS`] lock) whenever a title buffer is
+/// registered or released, so a [`buffer_extent`] answer read at an earlier
+/// version can be told stale (`metal_slot_cache::root_extent`).
+static BUFFERS_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn buffers_version() -> u64 {
+    BUFFERS_VERSION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    BUFFERS_VERSION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    map.remove(&(start, resource));
+    BUFFERS_VERSION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 }
 
 /// The title buffer holding `address`, as (start, length), without making

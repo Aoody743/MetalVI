@@ -69,6 +69,7 @@ fn direct_and_indirect_dispatches_sharing_buffers_run_in_order() {
                 groups: [1; 3],
                 tables: Vec::new(),
                 loop_counts: None,
+                after_barrier: true,
             })
         }));
         expected = expected.wrapping_mul(3).wrapping_add(k);

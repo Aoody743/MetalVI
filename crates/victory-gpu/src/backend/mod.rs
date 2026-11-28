@@ -46,3 +46,8 @@ pub mod metal_ambient;
 // P8: pipeline binary archive (VICTORY_METAL_ARCHIVE).
 #[cfg(windows)]
 pub(crate) mod metal_archive;
+// Stage 3: the execution timeline behind the title's queues (opt-in).
+#[cfg(windows)]
+pub mod metal_exec;
+#[cfg(windows)]
+pub mod metal_slot_cache;

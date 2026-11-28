@@ -59,16 +59,16 @@ enum Held {
 /// What a submission's lists recorded for Metal (`VICTORY_METAL`).
 #[cfg(windows)]
 #[derive(Default)]
-struct MetalOps {
-    commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
-    textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+pub(crate) struct MetalOps {
+    pub(crate) commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
+    pub(crate) textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 #[cfg(not(windows))]
-type MetalOps = Vec<()>;
+pub(crate) type MetalOps = Vec<()>;
 
 /// The Metal ops recorded into `lists`, in order.
 #[allow(unused_variables)]
-fn metal_ops(lists: &[This]) -> MetalOps {
+pub(crate) fn metal_ops(lists: &[This]) -> MetalOps {
     #[cfg(windows)]
     if crate::backend::metal::backend().is_some() {
         let mut ops = MetalOps::default();
@@ -87,25 +87,31 @@ fn metal_ops(lists: &[This]) -> MetalOps {
 }
 
 /// Runs a submission's Metal ops (waited for before returning).
-#[allow(unused_variables)]
 fn run_metal(ops: &MetalOps) {
+    run_metal_checked(ops);
+}
+
+/// [`run_metal`]: false if Metal refused or failed it (submission stopped).
+#[allow(unused_variables)]
+pub(crate) fn run_metal_checked(ops: &MetalOps) -> bool {
     #[cfg(windows)]
     if !ops.commands.is_empty()
         && let Some(m) = crate::backend::metal::backend()
     {
         if m.submissions_stopped() {
-            return;
+            return false;
         }
         // Null D3D12 submissions skip deferred texture checks. Perform those
         // checks after queue waits, before Metal samples the private copies.
         for texture in &ops.textures {
             if m.submissions_stopped() {
-                return;
+                return false;
             }
             texture.refresh();
         }
-        m.run(&ops.commands);
+        return m.run(&ops.commands);
     }
+    true
 }
 
 /// The queues that hold something (their addresses).
@@ -589,6 +595,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Stage 3 (`VICTORY_METAL_EXEC=1`): the execution timeline orders
+        // and runs it; this thread does not wait.
+        if !this.is_null() && crate::backend::metal_exec::on() {
+            crate::backend::metal_exec::execute(queue(this).kind, lists);
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -687,6 +699,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if !this.is_null() && crate::backend::metal_exec::on() {
+        crate::backend::metal_exec::signal(queue(this).kind, fence, value);
+        return S_OK;
+    }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
     if hold(this, || Held::Signal(fence as usize, value)) {
@@ -711,6 +728,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if !this.is_null() && crate::backend::metal_exec::on() {
+        crate::backend::metal_exec::wait(queue(this).kind, fence, value);
+        return S_OK;
     }
     #[cfg(windows)]
     if !this.is_null() {
@@ -829,7 +851,13 @@ fn frame_interval(frame: u64) {
         return;
     };
     let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    times.push(now.duration_since(before).as_secs_f64() * 1000.0);
+    let ms = now.duration_since(before).as_secs_f64() * 1000.0;
+    // Each stall over 1 s on its own line (the 64-frame summary hides how
+    // many there were; in 3D a summary covers minutes).
+    if ms > 1000.0 {
+        tracing::info!(frame, ms = format!("{ms:.0}"), "T8 present stall over 1 s");
+    }
+    times.push(ms);
     if times.len() >= 64 {
         times.sort_by(f64::total_cmp);
         let at = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
@@ -862,6 +890,10 @@ extern "system" fn present(
     if crate::backend::metal::backend().is_some_and(|m| m.submissions_stopped()) {
         return 0x887a0005u32 as i32; // DXGI_ERROR_DEVICE_REMOVED
     }
+    // Stage 3: what the queues were given runs first (a wait is not kept
+    // across frames when `forces`).
+    #[cfg(windows)]
+    crate::backend::metal_exec::drain(forces(), "present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
@@ -1107,6 +1139,9 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    // Stage 3: nothing in flight may read pages being remapped.
+    #[cfg(windows)]
+    crate::backend::metal_exec::drain(false, "page mapping");
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }

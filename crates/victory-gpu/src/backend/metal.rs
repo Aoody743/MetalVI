@@ -96,7 +96,12 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     if n <= 2000 || n.is_power_of_two() {
         tracing::info!(n, at = format_args!("{start:#x}"), mb = len >> 20, kb = len >> 10, aliased, "Metal: wiring title memory");
     }
-    struct Wiring(#[allow(dead_code)] crate::watch::Reading, #[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+    // Fields drop in order: the timeline's commits resume first.
+    struct Wiring(
+        #[allow(dead_code)] Option<victory_metal::exec::GpuIdle<'static>>,
+        #[allow(dead_code)] crate::watch::Reading,
+        #[allow(dead_code)] std::sync::MutexGuard<'static, ()>,
+    );
     impl std::ops::Drop for Wiring {
         fn drop(&mut self) {
             metal_phase::after_wait();
@@ -105,8 +110,9 @@ fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
     let reading = crate::watch::title_memory_reading_range(start as usize, len as usize);
     metal_phase::here(Phase::WaitForGpuIdle);
     let flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    let timeline = super::metal_exec::gpu_idle_for_wiring();
     metal_phase::here(Phase::WireTitleMemory);
-    Box::new(Wiring(reading, flight))
+    Box::new(Wiring(timeline, reading, flight))
 }
 
 /// Persistent views of physical-page sections the runtime made, to be wired
@@ -196,6 +202,7 @@ pub(crate) fn title_memory_remapped(at: u64, len: u64) {
         tracing::info!(calls = n, at = format_args!("{at:#x}"), len, "Metal: title memory remapped");
     }
     super::metal_texture::note_remap_partial(at, len);
+    super::metal_slot_cache::stale();
     // Counted only, and never waited for: the runtime calls this holding
     // its page table, which span lookups take under `chunks`.
     if let Some(Some(m)) = BACKEND.get()
@@ -296,6 +303,11 @@ pub(crate) struct MetalCmd {
     /// entry), written into the submission's table ring when run.
     pub(crate) tables: Vec<(u32, DescriptorEntry)>,
     pub(crate) loop_counts: Option<[(u64, Buffer, u64); 2]>,
+    /// A title barrier (or the start of its list, or a command that orders
+    /// like one) comes between this dispatch and the one recorded before it.
+    /// The execution timeline encodes dispatches without one concurrently;
+    /// [`MetalBackend::run`] puts a barrier between all of them anyway.
+    pub(crate) after_barrier: bool,
 }
 
 pub(crate) fn want_loop_counts(name: &str) -> bool {
@@ -361,6 +373,60 @@ pub(crate) enum MetalOp {
     Ambient(super::metal_ambient::MetalAmbient),
 }
 
+/// Stage 4: where [`MetalBackend::encode_external`] encodes (the timeline's
+/// command buffer and ring region) and what
+/// it leaves for after completion.
+pub(crate) struct External {
+    pub(crate) cb: victory_metal::CommandBuffer,
+    pub(crate) ring_buffer: Buffer,
+    /// Where the region starts in `ring_buffer`, its CPU address and bytes.
+    pub(crate) ring_offset: u64,
+    pub(crate) ring_cpu: *mut u8,
+    pub(crate) ring_len: usize,
+    pub(crate) done: Option<Deferred>,
+}
+
+/// The indirect clamp count and traces of an externally encoded chunk, to
+/// report once its command buffer completed ([`Deferred::report`]).
+pub(crate) struct Deferred {
+    counter: Option<victory_metal::indirect::ClampCounter>,
+    traces: Vec<(usize, String, victory_metal::indirect::IndirectTrace)>,
+    batch: u64,
+}
+
+impl Deferred {
+    pub(crate) fn report(mut self, cb: &victory_metal::CommandBuffer, ops: &[Arc<MetalOp>]) {
+        work::report(cb, self.counter.take(), self.batch, &mut self.traces, ops);
+    }
+}
+
+/// Ring space `run_batch` uses for `ops`: (entries, of which one-view table
+/// entries).
+fn ring_need(ops: &[Arc<MetalOp>]) -> (usize, usize) {
+    use super::metal_draw::DrawKind;
+    let entry = size_of::<DescriptorEntry>();
+    let mut tables = 0usize;
+    let mut blob = 0usize;
+    for op in ops {
+        match &**op {
+            MetalOp::Dispatch(c) => tables += c.tables.len(),
+            MetalOp::DispatchIndirect(c) => tables += c.tables.len(),
+            MetalOp::Draw(d) => {
+                for s in &d.stages {
+                    tables += s.tables.len();
+                    blob += s.top.len().next_multiple_of(256);
+                }
+                blob += if d.pso.geometry.is_some() { 1536 } else { 512 };
+                if let DrawKind::Generated { indices, .. } = &d.kind {
+                    blob += (indices.len() * 4).next_multiple_of(256);
+                }
+            }
+            MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) | MetalOp::Ambient(_) => {}
+        }
+    }
+    (tables + blob.div_ceil(entry) + 256 / entry + 1, tables)
+}
+
 /// Serialize every backend command buffer through completion and the fuse.
 /// This cannot interrupt a command buffer which has already been submitted.
 pub(crate) fn submit_checked(
@@ -419,6 +485,16 @@ fn complete_checked(
     work::observe(ops, gpu_ns);
     work::gpu_busy(gpu_ns, ops);
     Ok(())
+}
+
+/// Whether the process-wide fuse has tripped (for the execution timeline).
+pub(crate) fn fuse_tripped() -> bool {
+    fuse::tripped()
+}
+
+/// The measured GPU time per command buffer that trips the fuse.
+pub(crate) fn fuse_limit_ns() -> u64 {
+    fuse::limit_ns()
 }
 
 pub(crate) fn stop_submissions(reason: &'static str) {
@@ -517,9 +593,11 @@ pub(crate) fn note_slot_dirty(heap: usize, index: u32, handle: u64) {
         .entry(heap)
         .or_default()
         .insert(index, handle);
+    super::metal_slot_cache::dirty(heap, index);
 }
 
 pub(crate) fn forget_heap(heap: usize) {
+    super::metal_slot_cache::stale();
     if let Some(map) = DIRTY_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         map.remove(&heap);
     }
@@ -529,6 +607,7 @@ pub(crate) fn forget_heap(heap: usize) {
 }
 
 pub(crate) fn forget_resource(resource: usize) {
+    super::metal_slot_cache::stale();
     super::metal_texture::forget_resource_textures(resource);
     let Some(Some(b)) = BACKEND.get() else { return };
     b.textures.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
@@ -633,6 +712,7 @@ impl MetalBackend {
             // Wires what was added: never while xmem changes mappings.
             let _gate = crate::watch::title_memory_reading();
             let _flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            let _timeline = super::metal_exec::gpu_idle_for_wiring();
             chunks.residency().commit();
         }
     }
@@ -713,6 +793,25 @@ impl MetalBackend {
     }
 
     fn run_batch(&self, ops: &[Arc<MetalOp>]) -> bool {
+        self.run_batch_with(ops, None)
+    }
+
+    /// Stage 4: encodes `ops` (a chunk the execution timeline already cut)
+    /// into the timeline's command buffer and ring region, without cutting,
+    /// committing or waiting; what must happen once it completed is left in
+    /// `ext.done`. Ops whose results the CPU reads right after
+    /// (`BufferCopy`, `FloatRowReadback`) must not come here.
+    pub(crate) fn encode_external(&self, ops: &[Arc<MetalOp>], ext: &mut External) -> bool {
+        self.run_batch_with(ops, Some(ext))
+    }
+
+    /// Ring bytes [`encode_external`] needs for `ops`.
+    pub(crate) fn ring_bytes(ops: &[Arc<MetalOp>]) -> usize {
+        ring_need(ops).0 * size_of::<DescriptorEntry>()
+    }
+
+    fn run_batch_with(&self, ops: &[Arc<MetalOp>], mut ext: Option<&mut External>) -> bool {
+        let external = ext.is_some();
         if fuse::tripped() {
             return false;
         }
@@ -830,34 +929,25 @@ impl MetalBackend {
         // Ring space: the one-view tables' entries, then the bytes draws
         // bind (top levels, draw arguments, index type), 256-aligned.
         let entry = size_of::<DescriptorEntry>();
-        let mut tables = 0usize;
-        let mut blob = 0usize;
-        for op in ops {
-            match &**op {
-                MetalOp::Dispatch(c) => tables += c.tables.len(),
-                MetalOp::DispatchIndirect(c) => tables += c.tables.len(),
-                MetalOp::Draw(d) => {
-                    for s in &d.stages {
-                        tables += s.tables.len();
-                        blob += s.top.len().next_multiple_of(256);
-                    }
-                    blob += if d.pso.geometry.is_some() { 1536 } else { 512 };
-                    if let DrawKind::Generated { indices, .. } = &d.kind {
-                        blob += (indices.len() * 4).next_multiple_of(256);
-                    }
-                }
-                MetalOp::BufferCopy { .. } | MetalOp::Clear(_) | MetalOp::Copy(_) | MetalOp::FloatRowReadback { .. } | MetalOp::Resolve(_) | MetalOp::Ambient(_) => {}
+        let (need, tables) = ring_need(ops);
+        // The ring's entries and their GPU address: this backend's ring, or
+        // the timeline's region for this command buffer (stage 4).
+        let (ring_entries, ring_gpu, ring_buffer, ring_off) = if let Some(x) = ext.as_deref() {
+            if x.ring_len < need * entry {
+                return work::reject("timeline ring region too small");
             }
-        }
-        let need = tables + blob.div_ceil(entry) + 256 / entry + 1;
-        if ring.as_ref().is_none_or(|r| r.capacity < need) {
-            *ring = self.new_ring(need.max(1 << 16));
-            self.commit_residency();
-        }
-        let Some(r) = ring.as_ref() else {
-            return work::reject("descriptor ring unavailable");
+            (x.ring_cpu.cast::<DescriptorEntry>(), x.ring_buffer.gpu_address + x.ring_offset, x.ring_buffer.clone(), x.ring_offset)
+        } else {
+            if ring.as_ref().is_none_or(|r| r.capacity < need) {
+                *ring = self.new_ring(need.max(1 << 16));
+                self.commit_residency();
+            }
+            let Some(r) = ring.as_ref() else {
+                return work::reject("descriptor ring unavailable");
+            };
+            (r.entries, r.buffer.gpu_address, r.buffer.clone(), 0)
         };
-        let base = r.entries.cast::<u8>();
+        let base = ring_entries.cast::<u8>();
         let mut next_entry = 0usize;
         let mut next_byte = (tables * entry).next_multiple_of(256);
         // Writes `top` with its tables' addresses: (bytes, ring offset if
@@ -867,8 +957,8 @@ impl MetalBackend {
             for &(at, e) in tabs {
                 // SAFETY: next_entry < capacity (sized above); the GPU is
                 // idle (the previous submission was waited for).
-                unsafe { r.entries.add(next_entry).write(e) };
-                let gpu = r.buffer.gpu_address + (next_entry * entry) as u64;
+                unsafe { ring_entries.add(next_entry).write(e) };
+                let gpu = ring_gpu + (next_entry * entry) as u64;
                 let at = at as usize;
                 if at + 8 <= top.len() {
                     top[at..at + 8].copy_from_slice(&gpu.to_le_bytes());
@@ -882,7 +972,7 @@ impl MetalBackend {
             // SAFETY: inside the ring (sized above).
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(at), bytes.len()) };
             next_byte = (at + bytes.len()).next_multiple_of(256);
-            at as u64
+            ring_off + at as u64
         };
         // Per op: dispatch top bytes, or per draw its stages' top offsets,
         // draw-argument / uniforms-or-info offsets, and geometry vertex-table / zero-TLAB offsets.
@@ -946,7 +1036,11 @@ impl MetalBackend {
                 }
             }
         }
-        let Ok(mut cb) = self.queue.command_buffer() else { return false };
+        let made = match ext.as_deref() {
+            Some(x) => Ok(x.cb.clone()),
+            None => self.queue.command_buffer(),
+        };
+        let Ok(mut cb) = made else { return false };
         // Compute goes out a few dispatches per command buffer. Wait before
         // submitting the next buffer so a failure or fuse trip cannot leave
         // more of this batch queued. One command buffer of seconds of compute kept the window
@@ -957,6 +1051,9 @@ impl MetalBackend {
         let pass_cap = *PASS_DISPATCHES.get_or_init(|| {
             std::env::var("VICTORY_METAL_PASS_DISPATCHES").ok().and_then(|v| v.parse().ok()).unwrap_or(4)
         });
+        // The timeline already cut this chunk: no cuts (nor the snapshots
+        // that need a cut) inside it.
+        let pass_cap = if external { 0 } else { pass_cap };
         static SPLIT_EVENT: OnceLock<Option<victory_metal::events::SharedEvent>> = OnceLock::new();
         static SPLIT_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let split_event = SPLIT_EVENT.get_or_init(|| {
@@ -988,7 +1085,7 @@ impl MetalBackend {
             Ok("rects") => 2,
             _ => 0,
         });
-        let split = match split_mode {
+        let split = !external && match split_mode {
             1 => true,
             2 => ops.iter().any(|o| matches!(&**o, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }) && d.pso.geometry.is_some())),
             _ => false,
@@ -998,11 +1095,13 @@ impl MetalBackend {
         let mut depth_sync = super::metal_depth::DepthSync::default();
         let load_depth = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, a: &super::metal_draw::Attachment| {
             a.companion.as_ref().is_none_or(|d| {
+                let _phase = metal_phase::within(Phase::DepthCompanionLoad);
                 encoded("depth companion load", sync.load(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
             })
         };
         let store_depth = |sync: &mut super::metal_depth::DepthSync, cb: &victory_metal::CommandBuffer, a: &super::metal_draw::Attachment| {
             a.companion.as_ref().is_none_or(|d| {
+                let _phase = metal_phase::within(Phase::DepthCompanionStore);
                 encoded("depth companion store", sync.store(&self.device, cb, d, a.level, a.slice), || format!("format {} level {} slice {}", a.pixel, a.level, a.slice))
             })
         };
@@ -1033,7 +1132,7 @@ impl MetalBackend {
         while i < ops.len() && ok {
             if i == cb_start {
                 let max_ops = if pass_cap == 1 { 1 } else { usize::MAX };
-                planned_end = i + work::prefix(&ops[i..], max_ops);
+                planned_end = if external { ops.len() } else { i + work::prefix(&ops[i..], max_ops) };
                 if planned_end < ops.len() && split_event.is_none() {
                     return work::reject("budget split needs an ordering event");
                 }
@@ -1348,14 +1447,14 @@ impl MetalBackend {
                     }
                     // Indirect records of this run of draws, translated on
                     // the GPU before its render pass opens (F42).
-                    let mut batches: Vec<Option<victory_metal::indirect::IndirectBatch>> = Vec::new();
+                    let mut batches: Vec<Vec<victory_metal::indirect::IndirectBatch>> = Vec::new();
                     {
                         let mut j = i;
                         while let Some(MetalOp::Draw(d)) = ops.get(j).map(|o| &**o) {
                             if j == planned_end || !d.targets.same(&t) {
                                 break;
                             }
-                            let mut batch = None;
+                            let mut batch = Vec::new();
                             if let DrawKind::Indirect { records, records_offset, stride, max, count, index, .. } = &d.kind {
                                 let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok())
                                     else { return work::reject("indirect translator unavailable") };
@@ -1386,16 +1485,43 @@ impl MetalBackend {
                                     clamp_counter = victory_metal::indirect::ClampCounter::new(&self.device).ok();
                                 }
                                 let Some(counter) = clamp_counter.as_ref() else { return work::reject("indirect counter unavailable") };
-                                match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&d.pso.name)) {
-                                    Ok(mut b) => {
-                                        if let Some(trace) = b.as_mut().and_then(|batch| batch.take_trace()) {
-                                            indirect_traces.push((j, d.pso.name.clone(), trace));
+                                let limit = victory_metal::indirect::RECORD_LIMIT;
+                                if external && *max > limit {
+                                    // Stage 4 (timeline only): more records
+                                    // than one bounded translation takes, in
+                                    // parts of `limit` drawn one after the
+                                    // other (not rejected); the count, if
+                                    // any, is the whole list's.
+                                    let mut first = 0;
+                                    while first < *max {
+                                        let part = (*max - first).min(limit);
+                                        let source = IndirectSource {
+                                            records: (records, *records_offset + u64::from(first) * u64::from(*stride)),
+                                            max_count: part,
+                                            ..source
+                                        };
+                                        match tr.encode_bounded_part(&self.device, &cb, &source, counter, first) {
+                                            Ok(b) => batch.extend(b),
+                                            Err(e) => {
+                                                tracing::error!(error = %e, "Metal: indirect draw translation failed");
+                                                return work::reject("indirect draw translation");
+                                            }
                                         }
-                                        batch = b;
+                                        first += part;
                                     }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "Metal: indirect draw translation failed");
-                                        return work::reject("indirect draw translation");
+                                    exec_compute::note_draw_parts(max.div_ceil(limit));
+                                } else {
+                                    match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&d.pso.name)) {
+                                        Ok(mut b) => {
+                                            if let Some(trace) = b.as_mut().and_then(|batch| batch.take_trace()) {
+                                                indirect_traces.push((j, d.pso.name.clone(), trace));
+                                            }
+                                            batch.extend(b);
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "Metal: indirect draw translation failed");
+                                            return work::reject("indirect draw translation");
+                                        }
                                     }
                                 }
                             }
@@ -1446,25 +1572,25 @@ impl MetalBackend {
                                 steps.push(stage_buffer(s.bind, b, 0, msc::SAMPLER_HEAP_BIND_POINT));
                             }
                             if !s.top.is_empty() {
-                                steps.push(stage_buffer(s.bind, &r.buffer, top, msc::ARGUMENT_BUFFER_BIND_POINT));
+                                steps.push(stage_buffer(s.bind, &ring_buffer, top, msc::ARGUMENT_BUFFER_BIND_POINT));
                             } else if s.bind == super::metal_draw::STAGE_OBJECT {
-                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *zero_tlab, index: msc::ARGUMENT_BUFFER_BIND_POINT });
+                                steps.push(Render::ObjectBuffer { buffer: &ring_buffer, offset: *zero_tlab, index: msc::ARGUMENT_BUFFER_BIND_POINT });
                             }
                             if s.bind == STAGE_VERTEX {
                                 // MSC's draw arguments and index type (IRRuntimeDrawPrimitives).
-                                steps.push(stage_buffer(s.bind, &r.buffer, *args, msc::DRAW_ARGUMENTS_BIND_POINT));
-                                steps.push(stage_buffer(s.bind, &r.buffer, *uniforms, msc::DRAW_UNIFORMS_BIND_POINT));
+                                steps.push(stage_buffer(s.bind, &ring_buffer, *args, msc::DRAW_ARGUMENTS_BIND_POINT));
+                                steps.push(stage_buffer(s.bind, &ring_buffer, *uniforms, msc::DRAW_UNIFORMS_BIND_POINT));
                                 if let Some(fetch) = &d.vertex {
                                     steps.push(Render::VertexBytes { bytes: &fetch.table, index: msc::VERTEX_TABLE_BIND_POINT });
                                 }
                             } else if s.bind == super::metal_draw::STAGE_OBJECT {
                                 // MSC's geometry-emulation object/mesh ABI.
-                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *args, index: msc::DRAW_ARGUMENTS_BIND_POINT });
-                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *uniforms, index: msc::DRAW_UNIFORMS_BIND_POINT });
-                                steps.push(Render::ObjectBuffer { buffer: &r.buffer, offset: *vtable, index: msc::VERTEX_TABLE_BIND_POINT });
-                                steps.push(Render::MeshBuffer { buffer: &r.buffer, offset: *zero_tlab, index: msc::ARGUMENT_BUFFER_BIND_POINT });
-                                steps.push(Render::MeshBuffer { buffer: &r.buffer, offset: *args, index: msc::DRAW_ARGUMENTS_BIND_POINT });
-                                steps.push(Render::MeshBuffer { buffer: &r.buffer, offset: *uniforms, index: msc::DRAW_UNIFORMS_BIND_POINT });
+                                steps.push(Render::ObjectBuffer { buffer: &ring_buffer, offset: *args, index: msc::DRAW_ARGUMENTS_BIND_POINT });
+                                steps.push(Render::ObjectBuffer { buffer: &ring_buffer, offset: *uniforms, index: msc::DRAW_UNIFORMS_BIND_POINT });
+                                steps.push(Render::ObjectBuffer { buffer: &ring_buffer, offset: *vtable, index: msc::VERTEX_TABLE_BIND_POINT });
+                                steps.push(Render::MeshBuffer { buffer: &ring_buffer, offset: *zero_tlab, index: msc::ARGUMENT_BUFFER_BIND_POINT });
+                                steps.push(Render::MeshBuffer { buffer: &ring_buffer, offset: *args, index: msc::DRAW_ARGUMENTS_BIND_POINT });
+                                steps.push(Render::MeshBuffer { buffer: &ring_buffer, offset: *uniforms, index: msc::DRAW_UNIFORMS_BIND_POINT });
                             }
                         }
                         let primitive = sys::WMTPrimitiveType(d.primitive);
@@ -1490,7 +1616,7 @@ impl MetalBackend {
                             DrawKind::Indirect { index, .. } => {
                                 // One Metal indirect draw per record, with
                                 // its MSC draw arguments.
-                                if let Some(batch) = batches.get(i - group_first).and_then(Option::as_ref) {
+                                for batch in batches.get(i - group_first).into_iter().flatten() {
                                     for r in 0..batch.record_count() {
                                         let Some(rec) = batch.record(r) else { continue };
                                         if g.mesh && g.geometry.is_none() {
@@ -1532,7 +1658,7 @@ impl MetalBackend {
                                 primitive_type: primitive,
                                 index_type: 1,
                                 index_count: indices.len() as u64,
-                                index_buffer: &r.buffer,
+                                index_buffer: &ring_buffer,
                                 index_offset: *vtable,
                                 instance_count: *instances,
                                 base_vertex: *base,
@@ -1546,7 +1672,11 @@ impl MetalBackend {
                         });
                         i += 1;
                     }
-                    ok = encoded("render pass", cb.render_pass_with(&pass, &steps), || {
+                    let rendered = {
+                        let _phase = metal_phase::within(Phase::EncodeRenderPass);
+                        cb.render_pass_with(&pass, &steps)
+                    };
+                    ok = encoded("render pass", rendered, || {
                         let colors: Vec<u32> = t.colors.iter().map(|c| c.as_ref().map_or(0, |c| c.pixel)).collect();
                         format!("{}x{} samples {} colors {:?} depth {:?} stencil {}", t.width, t.height, t.samples, colors, t.depth.as_ref().map(|d| d.pixel), t.stencil)
                     });
@@ -1569,7 +1699,9 @@ impl MetalBackend {
                     }
                 }
             }
-            let cut = if pass_cap == 1 {
+            let cut = if external {
+                None
+            } else if pass_cap == 1 {
                 Some("single operation")
             } else if i == planned_end {
                 Some("estimated time")
@@ -1649,6 +1781,11 @@ impl MetalBackend {
         let encoded_at = started.elapsed();
         metal_phase::here(Phase::ResidencyCommit);
         self.commit_residency();
+        if let Some(x) = ext.as_deref_mut() {
+            // The timeline commits it; this is reported once it completed.
+            x.done = Some(Deferred { counter: clamp_counter.take(), traces: std::mem::take(&mut indirect_traces), batch });
+            return true;
+        }
         metal_phase::here(Phase::MainBatchSubmit);
         let committed_at = started.elapsed();
         tracing::debug!(batch, command = cb.handle(), first = cb_start, end = ops.len(), reason = "batch end", "Metal: command buffer operations");
@@ -1851,6 +1988,23 @@ impl MetalBackend {
 
     /// Mirrors all descriptor slots dirtied since the last sync for `heap`,
     /// returning `(heap_buffer, strides_gpu)`.
+    /// The heap's buffer and strides address when it exists and no slot of
+    /// it waits to be synced ([`sync_heap`] would do nothing but return
+    /// these).
+    pub(crate) fn clean_heap(&self, heap: usize) -> Option<(Buffer, u64)> {
+        let dirty = DIRTY_SLOTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|m| m.get(&heap).is_some_and(|s| !s.is_empty()));
+        if dirty {
+            return None;
+        }
+        let heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+        let h = heaps.get(&heap)?;
+        Some((h.buffer.clone(), h.strides.as_ref().map_or(0, |(b, _)| b.gpu_address)))
+    }
+
     pub(crate) fn sync_heap(&self, heap: usize, count: u32, samplers: bool) -> Option<(Buffer, u64)> {
         super::metal_texture::drain_remap_partial();
         let dirty: Vec<(u32, u64)> = DIRTY_SLOTS
@@ -2525,6 +2679,10 @@ pub(super) mod work;
 
 #[path = "metal_completion.rs"]
 mod completion;
+
+/// Stage 4 start: compute ops as execution-timeline segments.
+#[path = "metal_exec_compute.rs"]
+pub(crate) mod exec_compute;
 
 #[path = "metal_diag.rs"]
 pub(crate) mod diag;

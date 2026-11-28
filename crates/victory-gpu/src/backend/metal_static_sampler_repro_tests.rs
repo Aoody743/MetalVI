@@ -290,6 +290,7 @@ fn static_sampler_r8_draw_and_compute_repro() {
             groups: [1, 1, 1],
             tables: Vec::new(),
             loop_counts: None,
+            after_barrier: true,
         }))]));
         unsafe { out_mem.cast::<[f32; 4]>().read() }
     };
@@ -556,6 +557,7 @@ fn run_order_probe(fault: Option<&'static str>) {
             groups: [1; 3],
             tables: Vec::new(),
             loop_counts: None,
+            after_barrier: true,
         })));
         expected = expected.wrapping_mul(3).wrapping_add(k);
     }
@@ -631,7 +633,7 @@ fn fuse_leaves_out_a_slow_pipeline() {
     let mut top = conv.top_level.clone();
     assert!(top.set_constants(0, 0, &[7, 0, 0, 0]));
     assert!(top.set_root_descriptor(ResourceType::Uav, 1, 0, out.gpu_address));
-    let op = || Arc::new(MetalOp::Dispatch(MetalCmd { pso: mp.clone(), heap: None, sampler_heap: None, top: top.bytes.clone(), groups: [1, 1, 1], tables: Vec::new(), loop_counts: None }));
+    let op = || Arc::new(MetalOp::Dispatch(MetalCmd { pso: mp.clone(), heap: None, sampler_heap: None, top: top.bytes.clone(), groups: [1, 1, 1], tables: Vec::new(), loop_counts: None, after_barrier: true }));
     let (order_pso, order_conv) = backend.device.compute_pipeline_dxil(&order_dxil, &params, &[]).unwrap();
     let order_mp = Arc::new(MetalCompute {
         cost_ns: Default::default(),
@@ -651,6 +653,7 @@ fn fuse_leaves_out_a_slow_pipeline() {
         groups: [1, 1, 1],
         tables: Vec::new(),
         loop_counts: None,
+        after_barrier: true,
     }));
     unsafe { mem.cast::<u64>().write(0) };
     assert!(!backend.run(&[op(), after]));
