@@ -900,6 +900,7 @@ impl MetalBackend {
             match &*ops[i] {
                 MetalOp::BufferCopy { .. } => unreachable!("split before encoding"),
                 MetalOp::Dispatch(producer) => {
+                    work::here("encode dispatches");
                     if pass_cap == 1 && let Some(counts) = &producer.loop_counts {
                         let sources = counts.each_ref().map(|(_, buffer, offset)| (buffer, *offset));
                         match work::snapshot_words::<1>(&self.device, &self.queue, &sources) {
@@ -961,6 +962,7 @@ impl MetalBackend {
                     depth_sync.colour_may_change();
                 }
                 MetalOp::DispatchIndirect(c) => {
+                    work::here("encode indirect dispatch");
                     cb_dispatches = cb_dispatches.saturating_add(1);
                     if c.max > 256 {
                         static LARGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1019,6 +1021,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::FloatRowReadback { src, dst, offset, width } => {
+                    work::here("encode readback");
                     let bytes = width * 16;
                     let pitch = bytes.next_multiple_of(256);
                     if readback_scratch.as_ref().is_none_or(|b| b.len < u64::from(pitch)) {
@@ -1034,6 +1037,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Copy(c) => {
+                    work::here("encode texture copy");
                     if let Err(e) = super::metal_copy::encode_texture_to_texture(
                         &cb,
                         &c.src.texture,
@@ -1058,6 +1062,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Resolve(r) => {
+                    work::here("encode resolve");
                     let result = match CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
                         Ok(cr) => cr.resolve_region(
                             &cb, &r.src, r.src_slice, &r.dst, r.dst_level, r.dst_slice, r.format, r.region,
@@ -1073,6 +1078,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Clear(c) if !c.rects.is_empty() => {
+                    work::here("encode rectangle clear");
                     // Rectangles: F49's quad-per-rectangle clear.
                     if let Ok(cr) = CR.get_or_init(|| victory_metal::clear_resolve::ClearResolve::new(&self.device)) {
                         if !load_depth(&mut depth_sync, &cb, &c.target) {
@@ -1107,6 +1113,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Clear(c) => {
+                    work::here("encode clear");
                     let clear = sys::WMTLoadAction::WMTLoadActionClear;
                     let mut pass = RenderPass { width: c.target.width, height: c.target.height, samples: c.target.samples, ..Default::default() };
                     if c.depth.is_none() && !load_depth(&mut depth_sync, &cb, &c.target) {
@@ -1137,6 +1144,7 @@ impl MetalBackend {
                     i += 1;
                 }
                 MetalOp::Draw(first) => {
+                    work::here("encode draws");
                     let t = first.targets.clone();
                     if let Some(d) = &t.depth
                         && !load_depth(&mut depth_sync, &cb, d)
@@ -1421,6 +1429,7 @@ impl MetalBackend {
         }
         // GPU-written ocean textures back into title memory (F44).
         if ops.iter().any(|o| matches!(**o, MetalOp::Dispatch(_) | MetalOp::DispatchIndirect(_))) {
+            work::here("writeback");
             if let Err(e) = self.writeback_all(&cb) {
                 tracing::error!(error = %e, "Metal: writeback failed before commit");
                 return work::reject("writeback unavailable");
