@@ -969,6 +969,9 @@ extern "system" fn present(
         }
         // And the largest targets Metal drew into since the last capture.
         let mut drawn = std::mem::take(&mut *crate::backend::metal_draw::DRAWN_TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+        // In first-draw order before the sort: kept so `metal_pass_diff.py`
+        // can name the first pass that differs.
+        let first_drawn = drawn.clone();
         drawn.sort_by_key(|&(_, area)| std::cmp::Reverse(area));
         #[cfg(feature = "diagnostics")]
         if std::env::var("VICTORY_METAL_SCENE_FRAME").ok().and_then(|v| v.parse().ok()) == Some(frame) {
@@ -985,6 +988,8 @@ extern "system" fn present(
         }
         for (k, (r, _)) in drawn.into_iter().take(6).enumerate() {
             m.capture(r as This, &format!("frame{frame:06}-rt{k}"));
+            let order = first_drawn.iter().position(|&(t, _)| t == r).unwrap_or(usize::MAX);
+            tracing::info!(frame, rt = k, resource = r, order, targets = first_drawn.len(), "Metal capture: a render target's place in the draw order");
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
