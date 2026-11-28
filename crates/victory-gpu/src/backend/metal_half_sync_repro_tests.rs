@@ -536,3 +536,47 @@ fn without_bounds_checks_the_answers_stay() {
     assert_ne!(libs[0], libs[1], "the unchecked conversion is the checked one");
     eprintln!("BOUNDS metallib bytes checked {} unchecked {}", libs[0].len(), libs[1].len());
 }
+
+/// A memory loop: each lane reads its dword of the UAV, adds one and stores it back, s0
+/// times (`buffer_load_dword` / `buffer_store_dword` through a table view).
+const MEMORY_LOOP: &[u32] = &[
+    0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+    0xBE94_0380, // s_mov_b32 s20, 0
+    0xE030_1000, 0x8002_0102, // LOOP: buffer_load_dword v1, v2, s[8:11], 0 offen
+    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+    0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+    0xE070_1000, 0x8002_0102, // buffer_store_dword v1, v2, s[8:11], 0 offen
+    0x8014_8114, // s_add_u32 s20, s20, 1
+    0xBF06_0014, // s_cmp_eq_u32 s20, s0
+    0xBF84_FFF7, // s_cbranch_scc0 LOOP
+];
+
+/// P7: what bounds checks cost on a loop of view reads and writes: the same program
+/// converted with (`All`) and without (`None`) them, the GPU time of each over rounds.
+/// One group checks the answer (s0 increments of 0); 256 groups (writing the same
+/// dwords: the answer is not checked there) give the time.
+#[test]
+#[ignore = "needs victorymetal built from pso-perf (MSC_FLAG_NO_BOUNDS_CHECK)"]
+fn what_bounds_checks_cost_on_a_memory_loop() {
+    use victory_metal::msc::{BoundsPolicy, bounds_policy_supported, set_bounds_policy};
+    let _pool = victory_metal::Pool::new();
+    assert!(bounds_policy_supported(), "this victorymetal ignores MSC_FLAG_NO_BOUNDS_CHECK");
+    victory_shader::emit::set_host_max_wave(32);
+    let shader = victory_shader::emit::translate_native(&program_of(MEMORY_LOOP, false)).expect("translate");
+    let backend = MetalBackend::new().unwrap();
+    const N: u32 = 2000;
+    let mut medians = Vec::new();
+    for policy in [BoundsPolicy::All, BoundsPolicy::None, BoundsPolicy::All, BoundsPolicy::None] {
+        set_bounds_policy(Some(policy.clone()));
+        // The output buffer starts at 0 each run (run allocates it).
+        let r = run(&backend, &shader, 64, 1, N);
+        assert!(r.out.iter().all(|&v| v == N), "{policy:?}: {:?}", &r.out[..8]);
+        let mut ms: Vec<f64> = (0..7).map(|_| run(&backend, &shader, 64, 256, N).ms).collect();
+        ms.sort_by(f64::total_cmp);
+        eprintln!("BOUNDS-COST {policy:?}: GPU ms {ms:.3?} median {:.3}", ms[3]);
+        medians.push(ms[3]);
+    }
+    set_bounds_policy(None);
+    let (on, off) = ((medians[0] + medians[2]) / 2.0, (medians[1] + medians[3]) / 2.0);
+    eprintln!("BOUNDS-COST checked {on:.3} ms, unchecked {off:.3} ms: {:.1}% less", 100.0 * (on - off) / on);
+}
