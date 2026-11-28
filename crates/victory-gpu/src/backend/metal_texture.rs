@@ -315,6 +315,13 @@ impl MetalBackend {
         true
     }
 
+    /// Marks `key` as a dirty partly filled texture at `mem` (tests).
+    #[cfg(test)]
+    pub(super) fn mark_partial_dirty_for_test(key: usize, mem: u64) {
+        PARTIAL_FILLED.lock().unwrap().insert(key, PartialEntry { mem, size: 4096, first_mip: 1, dirty: true });
+        PARTIAL_DIRTY.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
     fn maybe_refill_partial(&self, key: usize) {
         if PARTIAL_DIRTY.load(std::sync::atomic::Ordering::Acquire) == 0 {
             return;
@@ -353,7 +360,14 @@ impl MetalBackend {
     /// textures, filled) on first use.
     pub(crate) fn texture_for(&self, r: This) -> Option<Arc<MetalTexture>> {
         let key = r as usize;
-        if let Some(t) = self.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned() {
+        // Unlock before the refill: it locks `textures` again, and a guard
+        // in an `if let` scrutinee lives through the then-block (edition
+        // 2024 too). Held there, a dirty partly filled texture deadlocked
+        // this thread on itself: the silent freezes of 2026-11-28
+        // (stage-r-stall1/3/5, stage-r-ab-learn*), during captures, draws
+        // and the loading screen.
+        let cached = self.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&key).cloned();
+        if let Some(t) = cached {
             if t.is_some() {
                 self.maybe_refill_partial(key);
             }
