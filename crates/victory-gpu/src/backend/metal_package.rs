@@ -745,6 +745,12 @@ pub(crate) fn settings() -> Option<&'static Settings> {
         let dir = std::env::var_os("VICTORY_METAL_PACKAGE_DIR").filter(|v| !v.is_empty()).map_or_else(|| PathBuf::from("."), PathBuf::from);
         let cap = std::env::var("VICTORY_METAL_PACKAGE_CAP_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(4096) << 20;
         tracing::warn!(frame, dir = %dir.display(), cap_mb = cap >> 20, "VICTORY_METAL_PACKAGE_FRAME: this frame's Metal compute work is recorded (slow frame)");
+        // The variable only: asking the timeline here could start it early.
+        if std::env::var("VICTORY_METAL_EXEC").as_deref() == Ok("1") {
+            // Its timeline encodes compute (and with timeline draws, the
+            // rest) without `queue::run_metal_checked`: those ops are missed.
+            tracing::warn!("VICTORY_METAL_PACKAGE_FRAME with VICTORY_METAL_EXEC=1: timeline-encoded ops are not recorded; record with EXEC=0");
+        }
         Some(Settings { frame, dir, cap })
     })
     .as_ref()
