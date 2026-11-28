@@ -78,15 +78,15 @@ fn physical_alias(va: u64, len: u64) -> Option<u64> {
 /// The runtime's contiguous mapping of the physical pages behind a title
 /// range that runs across views of pages that do not follow on
 /// ([`victory_metal::chunks::Mirror`]); set once at start.
-static PHYSICAL_MIRROR: OnceLock<fn(u64, u64) -> Option<u64>> = OnceLock::new();
+static PHYSICAL_MIRROR: OnceLock<fn(u64, u64) -> Option<(u64, u64, u64)>> = OnceLock::new();
 
 /// Registers [`PHYSICAL_MIRROR`] (xmem). Same rules as
 /// [`set_physical_alias`]: no call back into the GPU side.
-pub fn set_physical_mirror(f: fn(u64, u64) -> Option<u64>) {
+pub fn set_physical_mirror(f: fn(u64, u64) -> Option<(u64, u64, u64)>) {
     let _ = PHYSICAL_MIRROR.set(f);
 }
 
-fn physical_mirror(va: u64, len: u64) -> Option<u64> {
+fn physical_mirror(va: u64, len: u64) -> Option<(u64, u64, u64)> {
     PHYSICAL_MIRROR.get().and_then(|f| f(va, len))
 }
 
