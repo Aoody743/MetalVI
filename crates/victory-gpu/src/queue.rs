@@ -670,12 +670,52 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One present plane, 0x48 bytes (the title passes an array of them): frame
+/// token, the plane's resources, then source rectangles, placement, colour
+/// space, scale filter, extended descriptions and flags (unused here).
+/// Series S presents two: its scene (1920x1080, black in menus) and its UI
+/// (3840x2160) over it; Series X draws its UI into a single plane.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _source_rects: *const u8,
+    _placement: *const u8,
+    _color_space: u32,
+    _scale_filter: u32,
+    _extended_count: u32,
+    _extended: *const u8,
+    _flags: u32,
+}
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+/// Most planes composited at a present (the console shows up to three).
+const MAX_PLANES: usize = 4;
+
+/// The first resource of each of the `planes` planes at `params`, bottom
+/// plane first (planes with no resource are skipped).
+///
+/// # Safety
+/// `params` points at `planes` planes, each listing `count` resources.
+#[cfg_attr(not(windows), allow(dead_code))]
+unsafe fn plane_resources(planes: u32, params: *const Plane) -> Vec<This> {
+    let mut out = Vec::new();
+    if params.is_null() {
+        return out;
+    }
+    for i in 0..(planes as usize).min(MAX_PLANES) {
+        // SAFETY: i < planes (the caller's array).
+        let plane = unsafe { &*params.add(i) };
+        if plane.count > 0 && !plane.resources.is_null() {
+            // SAFETY: the plane lists `count` > 0 resources.
+            let resource = unsafe { *plane.resources };
+            if !resource.is_null() {
+                out.push(resource);
+            }
+        }
+    }
+    out
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -971,6 +1011,11 @@ extern "system" fn present(
         // SAFETY: the plane lists `count` resources.
         let resource = unsafe { *plane.resources };
         m.capture(resource, &format!("frame{frame:06}"));
+        // The planes over it (Series S: the UI), as the window shows them.
+        // SAFETY: the title passes `planes` plane descriptions.
+        for (i, &over) in unsafe { plane_resources(planes, plane_parameters) }.iter().enumerate().skip(1) {
+            m.capture(over, &format!("frame{frame:06}-plane{i}"));
+        }
         // What wrote the presented texture since the last capture.
         let writes = std::mem::take(&mut *crate::backend::metal_draw::WRITES.lock().unwrap_or_else(|e| e.into_inner()));
         let mine = writes.iter().find(|(r, _)| *r == resource as usize).map_or([0; 9], |(_, n)| *n);
@@ -1026,14 +1071,11 @@ extern "system" fn present(
     // the D3D12 present is skipped when it shows.
     #[cfg(windows)]
     if crate::backend::metal_present::present_on()
-        && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
         && let Some(m) = crate::backend::metal::backend()
-        // SAFETY: the plane lists `count` resources.
-        && m.present_metal(unsafe { *plane.resources })
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let resources = unsafe { plane_resources(planes, plane_parameters) }
+        && !resources.is_empty()
+        && m.present_metal(&resources)
     {
         return S_OK;
     }
@@ -1235,6 +1277,34 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// PresentX planes come 0x48 bytes apart: the second plane's resource (the
+    /// Series S UI over its black scene plane) is found, planes without a
+    /// resource are skipped, and the bottom plane stays first.
+    #[test]
+    fn present_planes_are_read_at_their_stride() {
+        let scene = 0x1000usize as This;
+        let ui = 0x2000usize as This;
+        let blank = |token, count, resources: *const This| Plane {
+            token,
+            count,
+            resources,
+            _source_rects: std::ptr::null(),
+            _placement: std::ptr::null(),
+            _color_space: 0,
+            _scale_filter: 0,
+            _extended_count: 0,
+            _extended: std::ptr::null(),
+            _flags: 0,
+        };
+        let planes = [blank(7, 1, &scene), blank(7, 0, std::ptr::null()), blank(7, 1, &ui)];
+        // SAFETY: three planes, each listing what its count says.
+        assert_eq!(unsafe { plane_resources(3, planes.as_ptr()) }, vec![scene, ui]);
+        // SAFETY: as above; only the first plane is read.
+        assert_eq!(unsafe { plane_resources(1, planes.as_ptr()) }, vec![scene]);
+        // SAFETY: no planes.
+        assert!(unsafe { plane_resources(2, std::ptr::null()) }.is_empty());
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

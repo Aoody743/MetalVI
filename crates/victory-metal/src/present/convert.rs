@@ -27,7 +27,9 @@ impl Default for PresentOptions {
 pub struct PresentConverter {
     device: Device,
     library: Object,
-    pipelines: [Option<RenderPipeline>; 2],
+    /// By drawable format (BGRA8Unorm, its sRGB twin): the opaque draw, then
+    /// the overlay draw.
+    pipelines: [Option<RenderPipeline>; 4],
 }
 
 impl PresentConverter {
@@ -35,7 +37,7 @@ impl PresentConverter {
         Ok(Self {
             device: device.clone(),
             library: device.library_msl(include_str!("convert.metal"))?,
-            pipelines: [None, None],
+            pipelines: [None, None, None, None],
         })
     }
 
@@ -83,6 +85,33 @@ impl PresentConverter {
         dst: &Texture,
         options: PresentOptions,
     ) -> Result<()> {
+        self.encode(cb, src, source_dxgi, dst, options, false)
+    }
+
+    /// Encodes an overlay plane over what `dst` holds (after [`Self::draw`]
+    /// of the plane below): aspect-fit like it, premultiplied alpha
+    /// (ONE / ONE_MINUS_SOURCE_ALPHA), nothing drawn outside it. Series S
+    /// presents its scene (1920x1080) and its UI (3840x2160) as two planes.
+    pub fn overlay(
+        &mut self,
+        cb: &CommandBuffer,
+        src: &Texture,
+        source_dxgi: u32,
+        dst: &Texture,
+        options: PresentOptions,
+    ) -> Result<()> {
+        self.encode(cb, src, source_dxgi, dst, options, true)
+    }
+
+    fn encode(
+        &mut self,
+        cb: &CommandBuffer,
+        src: &Texture,
+        source_dxgi: u32,
+        dst: &Texture,
+        options: PresentOptions,
+        overlay: bool,
+    ) -> Result<()> {
         let (src_format, mode) = source_mode(source_dxgi, options)?;
         if src.handle() == dst.handle() || src.pixel_format() != src_format {
             return Err(Error(
@@ -126,7 +155,8 @@ impl PresentConverter {
             zfar: 1.0,
         };
         let constants = [mode, target as u32, exposure.to_bits()].map(u32::to_le_bytes);
-        if self.pipelines[target].is_none() {
+        let slot = target + 2 * usize::from(overlay);
+        if self.pipelines[slot].is_none() {
             let mut desc = RenderPipelineDesc {
                 topology_class: 3,
                 sample_count: 1,
@@ -137,17 +167,30 @@ impl PresentConverter {
                 write_mask: 15,
                 ..Default::default()
             };
-            self.pipelines[target] = Some(self.device.render_pipeline_desc(
+            if overlay {
+                // MTLBlendFactorOne, MTLBlendFactorOneMinusSourceAlpha, MTLBlendOperationAdd.
+                let c = &mut desc.colors[0];
+                c.blending = true;
+                (c.src_rgb, c.dst_rgb, c.op_rgb) = (1, 5, 0);
+                (c.src_alpha, c.dst_alpha, c.op_alpha) = (1, 5, 0);
+            }
+            let fragment = if overlay { "overlay_fragment" } else { "convert_fragment" };
+            self.pipelines[slot] = Some(self.device.render_pipeline_desc(
                 (&self.library, "convert_vertex"),
-                Some((&self.library, "convert_fragment")),
+                Some((&self.library, fragment)),
                 &desc,
             )?);
         }
-        let pipeline = self.pipelines[target].as_ref().expect("initialized above");
+        let pipeline = self.pipelines[slot].as_ref().expect("initialized above");
+        let load_action = if overlay {
+            sys::WMTLoadAction::WMTLoadActionLoad
+        } else {
+            sys::WMTLoadAction::WMTLoadActionClear
+        };
         cb.render_pass(
             &[ColorAttachment {
                 texture: dst,
-                load_action: sys::WMTLoadAction::WMTLoadActionClear,
+                load_action,
                 store_action: sys::WMTStoreAction::WMTStoreActionStore,
                 clear: [0., 0., 0., 1.],
             }],

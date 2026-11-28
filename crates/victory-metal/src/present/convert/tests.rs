@@ -212,3 +212,84 @@ fn wine_readback() {
         false,
     );
 }
+
+/// Series S presents two planes: the scene (black in menus) and the UI over it.
+/// The overlay draw keeps the plane below where the UI is transparent and puts
+/// the premultiplied UI over it elsewhere, the UI larger than the scene (both
+/// fitted to the target).
+#[test]
+#[ignore = "requires Rosetta Wine with victorymetal"]
+fn wine_overlay_plane_blends_over_the_scene() {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(4).unwrap();
+    let mut converter = PresentConverter::new(&device).unwrap();
+    let defaults = PresentOptions::default();
+    let texture = |width: u32, height: u32, mut bytes: Vec<u8>| {
+        let t = device
+            .new_texture(&crate::texture::TextureDescriptor {
+                width,
+                height,
+                pixel_format: Format::WMTPixelFormatRGBA8Unorm,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(bytes.len(), (width * height * 4) as usize);
+        // SAFETY: tightly packed RGBA8 rows of this texture; not in use by the GPU yet.
+        unsafe {
+            sys::MTLTexture_replaceRegion(
+                t.handle(),
+                sys::WMTOrigin { x: 0, y: 0, z: 0 },
+                sys::WMTSize { width: width.into(), height: height.into(), depth: 1 },
+                0,
+                0,
+                sys::WMTMemoryPointer { ptr: bytes.as_mut_ptr().cast() },
+                u64::from(width) * 4,
+                0,
+            );
+        }
+        t
+    };
+    // Scene 4x4 dark red; UI 8x8: left half transparent, right half
+    // premultiplied green at alpha 0.5 (code 128 -> 64 premultiplied).
+    let scene = texture(4, 4, [100, 0, 0, 255].repeat(16));
+    let row = [[0u8, 0, 0, 0].repeat(4), [0u8, 64, 0, 128].repeat(4)].concat();
+    let ui = texture(8, 8, row.repeat(8));
+    let target = device
+        .new_texture(&crate::texture::TextureDescriptor {
+            width: 8,
+            height: 8,
+            pixel_format: Format::WMTPixelFormatBGRA8Unorm,
+            usage: sys::WMTTextureUsage::WMTTextureUsageRenderTarget,
+            ..Default::default()
+        })
+        .unwrap();
+    let cb = queue.command_buffer().unwrap();
+    converter.draw(&cb, &scene, 28, &target, defaults).unwrap();
+    converter.overlay(&cb, &ui, 28, &target, defaults).unwrap();
+    cb.commit();
+    cb.wait().unwrap();
+    let mut raw = vec![[0_u8; 4]; 64];
+    // SAFETY: the GPU is finished and raw spans the 8x8 BGRA target.
+    unsafe {
+        sys::MTLTexture_getBytes(
+            target.handle(),
+            sys::WMTOrigin { x: 0, y: 0, z: 0 },
+            sys::WMTSize { width: 8, height: 8, depth: 1 },
+            0,
+            0,
+            sys::WMTMemoryPointer { ptr: raw.as_mut_ptr().cast() },
+            32,
+            0,
+        );
+    }
+    for (i, pixel) in raw.iter().enumerate() {
+        let x = i % 8;
+        // BGRA: the scene alone on the left, red * (1 - 0.5) + green 64 on the right.
+        let want: [u8; 4] = if x < 4 { [0, 0, 100, 255] } else { [0, 64, 50, 255] };
+        for c in 0..3 {
+            assert!(pixel[c].abs_diff(want[c]) <= 1, "({x}, {}): got {pixel:?}, want {want:?}", i / 8);
+        }
+    }
+    println!("overlay plane: 64 pixels match");
+}
