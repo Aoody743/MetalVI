@@ -452,7 +452,8 @@ impl HostPipeline {
             let keep = victory_shader::emit::input_semantics(&ps.host.dxil)?;
             let outs = ms.translated().and_then(|t| victory_shader::emit::output_semantics(&t.host.dxil));
             tracing::info!(?shaders, ?keep, ?outs, "mesh outputs and what the pixel shader reads");
-            let v = ms.pruned_mesh(keep)?;
+            let reads = victory_shader::emit::input_reads(&ps.host.dxil);
+            let v = ms.pruned_mesh(keep, reads)?;
             let after = v.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil));
             tracing::info!(?shaders, bytes, ?after, limit, "mesh outputs the pixel shader does not read left out");
             Some(v)

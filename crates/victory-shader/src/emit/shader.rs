@@ -222,6 +222,10 @@ pub(crate) struct Shader {
     pub prims: Vec<SigElement>,
     /// A mesh shader (`threads` is its thread-group size).
     pub mesh: Option<Mesh>,
+    /// A mesh shader whose vertex outputs were put in another order than the console's
+    /// rows (`lower::mesh_order`): their rows are numbered in list order when it is
+    /// finished, after the exports found their elements by the console's rows.
+    pub renumber_outputs: bool,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
     /// Dwords of user data the shader reads (0: no user-data buffer).
@@ -286,6 +290,7 @@ impl Shader {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh: None,
+            renumber_outputs: false,
             geometry: None,
             user_data: 0,
             samplers: 0,
@@ -791,6 +796,9 @@ impl Shader {
         if self.pixel {
             container::same_mode_per_row(&mut self.inputs, true);
         } else {
+            if self.renumber_outputs {
+                super::lower::mesh_order::renumber(&mut self.outputs);
+            }
             container::same_mode_per_row(&mut self.outputs, false);
         }
         let sigs = if graphics {

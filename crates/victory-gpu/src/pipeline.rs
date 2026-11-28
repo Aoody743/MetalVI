@@ -238,9 +238,14 @@ impl Shader {
     /// This mesh shader with only the user outputs `keep` names (what the
     /// pixel shader behind reads), as a shader of its own: for a pipeline
     /// over Metal's mesh output limit. `None` if it does not translate so.
-    pub(crate) fn pruned_mesh(&self, keep: Vec<(String, u32)>) -> Option<Arc<Shader>> {
+    /// `reads`: the leading components of each input the pixel shader reads
+    /// (`victory_shader::emit::input_reads`), for outputs still over the limit once
+    /// ordered.
+    pub(crate) fn pruned_mesh(&self, keep: Vec<(String, u32)>, reads: Option<Vec<(String, u32, u8)>>) -> Option<Arc<Shader>> {
         let old = victory_shader::emit::set_mesh_outputs_keep(Some(keep));
+        let old_reads = victory_shader::emit::set_mesh_output_reads(reads);
         let done = translate(&self.container);
+        victory_shader::emit::set_mesh_output_reads(old_reads);
         victory_shader::emit::set_mesh_outputs_keep(old);
         let t = done.map_err(|e| tracing::warn!(hash = %self.hash, error = %e, "pruned mesh variant does not translate")).ok()?;
         let translated = OnceLock::new();
