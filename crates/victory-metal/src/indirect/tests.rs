@@ -845,12 +845,66 @@ fn counted_mesh_clamp() {
     check_work_clamp(IndirectKind::TitleMesh1D, [48, 1, 1, 4, 1, 1], [32, 1, 1, 0, 0, 4, 1, 1, 0, 0]);
 }
 
+/// A bounded rectangle record is cut into `RECT_SEGMENTS` draws of at most
+/// 32 object groups, in vertex order; only what no segment covers is clamped.
 #[test]
-fn counted_rectangle_clamp() {
-    let kind = IndirectKind::Rectangles(crate::msc::GeometryConfig {
-        vertex_output_size: 32, max_input_primitives: 32, max_payload_size: 16256,
-    });
-    check_work_clamp(kind, [300, 4, 7, 9, 3, 1, 0, 2], [1, 4, 1, 0, 0, 1, 1, 1, 0, 0]);
+fn bounded_rectangles_are_segmented_in_vertex_order() {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    let cfg = crate::msc::GeometryConfig { vertex_output_size: 32, max_input_primitives: 32, max_payload_size: 16256 };
+    let stride = cfg.object_vertex_stride().unwrap();
+    assert_eq!(stride, 255);
+    let segs = RECT_SEGMENTS as usize;
+    // Per segment with 4 instances: (32 / 4) groups * 255 vertices = 2040.
+    let chunk = 2040u32;
+    let cases: [([u32; 4], u32); 3] = [
+        // Fits one segment: drawn whole, not clamped.
+        ([300, 4, 7, 9], 0),
+        // Needs 5 segments: drawn whole, not clamped.
+        ([4 * chunk + 30, 4, 7, 9], 0),
+        // More than all segments cover: the rest is clamped (counted once).
+        ([RECT_SEGMENTS * chunk + 600, 4, 7, 9], 1),
+    ];
+    for (input, clamped) in cases {
+        let counter = ClampCounter::new(&device).unwrap();
+        let src = Shared::new(&device, &input);
+        let out = Shared::new(&device, &vec![u32::MAX; segs * 5]);
+        let params = Shared::new(&device, &vec![u32::MAX; segs * 12]);
+        let cb = queue.command_buffer().unwrap();
+        let source = IndirectSource { kind: IndirectKind::Rectangles(cfg), records: (&src.0, 0), stride: 16, max_count: 1, count: None };
+        let batch = translator.encode_bounded(&device, &cb, &source, &counter).unwrap().unwrap();
+        assert_eq!(batch.record_count(), RECT_SEGMENTS);
+        let mut blit = cb.blit_encoder().unwrap();
+        blit.copy_buffer(&batch.output, 0, &out.0, 0, segs as u64 * RECORD_BYTES);
+        blit.copy_buffer(batch.draw_params.as_ref().unwrap(), 0, &params.0, 0, segs as u64 * 48);
+        blit.finish();
+        cb.commit();
+        cb.wait().unwrap();
+        let (out, params) = (out.words(), params.words());
+        let total = input[0] - input[0] % 3;
+        let mut drawn = 0u32;
+        for seg in 0..segs {
+            let first = seg as u32 * chunk;
+            let n = if first < total { (total - first).min(chunk) } else { 0 };
+            let groups = n.div_ceil(stride);
+            let o = &out[seg * 5..seg * 5 + 5];
+            let p = &params[seg * 12..seg * 12 + 4];
+            if n == 0 {
+                assert_eq!(o, [0; 5], "segment {seg} of {input:?}");
+                assert_eq!(&p[..2], [0, 0], "segment {seg} of {input:?}");
+                continue;
+            }
+            assert!(groups * input[1] <= 32, "segment {seg}: {groups} groups x {} instances", input[1]);
+            assert_eq!(o, [groups, input[1], 1, 0, 0], "segment {seg} of {input:?}");
+            // Vertex count, instances, first vertex, first instance.
+            assert_eq!(p, [n, input[1], input[2] + first, input[3]], "segment {seg} of {input:?}");
+            drawn += n;
+        }
+        assert_eq!(drawn, total.min(RECT_SEGMENTS * chunk));
+        assert_eq!(unsafe { counter.completed_count() }, clamped, "{input:?}");
+    }
 }
 
 #[test]

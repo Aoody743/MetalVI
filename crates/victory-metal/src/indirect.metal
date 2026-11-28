@@ -2,7 +2,7 @@
 using namespace metal;
 
 struct Options {
-    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace, first;
+    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace, segments, first;
 };
 
 struct Record {
@@ -22,7 +22,12 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
                                device atomic_uint *clamped [[buffer(5)]],
                                device uint *trace [[buffer(6)]],
                                uint id [[thread_position_in_grid]]) {
-    if (id >= opts.max_count) return;
+    // Rectangle records (kind 11) are cut into `segments` draws of at most
+    // `groups` object groups each, in vertex order; `id` is the output
+    // record, `rec` the source record. Other kinds: one output per record.
+    uint segs = opts.kind == 11 && opts.groups ? max(opts.segments, 1u) : 1u;
+    uint rec = id / segs, seg = id % segs;
+    if (rec >= opts.max_count) return;
     Record result = {};
     Record original = {};
     // `first`: these records start at that record of the title's list (a
@@ -30,8 +35,8 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
     // the whole list's.
     uint raw_count = opts.has_count ? *count : opts.first + opts.max_count;
     uint live = min(opts.max_count, raw_count > opts.first ? raw_count - opts.first : 0u);
-    if (id < live) {
-        device const uint *args = src + ulong(id) * opts.stride;
+    if (rec < live) {
+        device const uint *args = src + ulong(rec) * opts.stride;
         uint words = opts.kind == 0 || opts.kind == 11 ? 4 : (opts.kind == 1 ? 5 : 3);
         for (uint i = 0; i < words; ++i) result.words[i] = args[i];
         original = result;
@@ -54,20 +59,32 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
                         remaining /= max(1u, result.words[axis]);
                     }
                 }
+            } else if (opts.kind == 11) {
+                // This segment's whole rectangles: at most `groups` object
+                // groups of `object_stride` vertices per draw.
+                uint instances = min(result.words[1], opts.groups);
+                uint chunk = (opts.groups / max(instances, 1u)) * opts.object_stride;
+                chunk -= chunk % 3;
+                ulong total = ulong(result.words[0] - result.words[0] % 3);
+                ulong covered = min(total, ulong(chunk) * ulong(segs));
+                ulong first = ulong(seg) * ulong(chunk);
+                uint n = first < covered ? uint(min(ulong(chunk), covered - first)) : 0u;
+                result.words[0] = n;
+                result.words[1] = instances;
+                result.words[2] = original.words[2] + uint(first);
+                // Counted once per record: what no segment covers.
+                if (seg == 0 && (instances != original.words[1] || covered != ulong(original.words[0])))
+                    atomic_fetch_add_explicit(clamped, 1u, memory_order_relaxed);
             } else {
                 uint instances = min(result.words[1], opts.inputs);
-                if (opts.kind == 11) instances = min(instances, opts.groups);
                 result.words[1] = instances;
-                uint n = min(result.words[0], opts.inputs / max(instances, 1u));
-                if (opts.kind == 11) {
-                    n = min(n, (opts.groups / max(instances, 1u)) * opts.object_stride);
-                    n -= n % 3;
-                }
-                result.words[0] = n;
+                result.words[0] = min(result.words[0], opts.inputs / max(instances, 1u));
             }
-            bool changed = false;
-            for (uint i = 0; i < words; ++i) changed |= original.words[i] != result.words[i];
-            if (changed) atomic_fetch_add_explicit(clamped, 1u, memory_order_relaxed);
+            if (opts.kind != 11) {
+                bool changed = false;
+                for (uint i = 0; i < words; ++i) changed |= original.words[i] != result.words[i];
+                if (changed) atomic_fetch_add_explicit(clamped, 1u, memory_order_relaxed);
+            }
         }
     }
     if (opts.kind == 2) {
@@ -110,7 +127,7 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
         result = {};
     dst[id] = result;
     if (opts.kind <= 1) draw_params[id] = result;
-    if (opts.trace) {
-        reinterpret_cast<device TraceRecord *>(trace)[id] = {raw_count, uint(id < live), original, result};
+    if (opts.trace && seg == 0) {
+        reinterpret_cast<device TraceRecord *>(trace)[rec] = {raw_count, uint(rec < live), original, result};
     }
 }

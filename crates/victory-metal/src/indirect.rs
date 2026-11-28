@@ -13,6 +13,14 @@ const THREADS: u64 = 64;
 pub const RECORD_LIMIT: u32 = 64;
 pub const GROUPS_PER_RECORD: u32 = 32;
 pub const INPUTS_PER_RECORD: u32 = 512;
+/// Draws a bounded rectangle record is cut into, each of at most the group
+/// budget (`record_budget().0` object groups): with 32 groups of 255
+/// vertices, 16 draws cover 130,560 vertices (43,520 rectangles, a 4K
+/// frame of 16x16 tiles). Before, a record was cut to its first 510 vertices
+/// (the input budget): tiled lighting and post passes drew only their first
+/// tiles, the regular blue blocks of the window. The rest past the segments
+/// is still clamped and counted.
+pub const RECT_SEGMENTS: u32 = 16;
 
 /// The per-record budget the clamp applies: `GROUPS_PER_RECORD` and
 /// `INPUTS_PER_RECORD` unless `VICTORY_METAL_INDIRECT_GROUPS` /
@@ -181,6 +189,9 @@ impl IndirectTranslator {
         if source.count.is_some() && !valid_window(count, count_offset, 4) {
             return Err(Error("invalid indirect count window".into()));
         }
+        // Output records per source record (see `RECT_SEGMENTS`).
+        let segments = if matches!(source.kind, IndirectKind::Rectangles(_)) && counter.is_some() { RECT_SEGMENTS } else { 1 };
+        let outputs = u64::from(source.max_count) * u64::from(segments);
         let rect = if let IndirectKind::Rectangles(cfg) = source.kind {
             Some((cfg.object_vertex_stride().ok_or_else(|| Error("invalid MSC geometry stride".into()))?, cfg.max_input_primitives))
         } else { None };
@@ -195,15 +206,16 @@ impl IndirectTranslator {
             if counter.is_some() { record_budget().0 } else { 0 },
             record_budget().1,
             u32::from(trace),
+            segments,
             first,
         ];
-        let mut options = [0; 44];
+        let mut options = [0; 48];
         for (dst, value) in options.chunks_exact_mut(4).zip(values) {
             dst.copy_from_slice(&value.to_le_bytes());
         }
-        let output = device.private_buffer(u64::from(source.max_count) * RECORD_BYTES)?;
+        let output = device.private_buffer(outputs * RECORD_BYTES)?;
         let draw_params = (kind <= 1 || rect.is_some())
-            .then(|| device.private_buffer(u64::from(source.max_count) * if rect.is_some() { 48 } else { DRAW_PARAMS_BYTES }))
+            .then(|| device.private_buffer(outputs * if rect.is_some() { 48 } else { DRAW_PARAMS_BYTES }))
             .transpose()?;
         let trace = if trace {
             let (buffer, ptr) = device.shared_buffer_mapped(&vec![0; source.max_count as usize * TRACE_BYTES])?;
@@ -242,14 +254,14 @@ impl IndirectTranslator {
             Compute::Buffer { buffer: counter.map_or(&output, |c| &c.0), offset: 0, index: 5 },
             Compute::Buffer { buffer: trace.as_ref().map_or(&output, |t| &t.buffer), offset: 0, index: 6 },
             Compute::Dispatch {
-                groups: [u64::from(source.max_count).div_ceil(THREADS), 1, 1],
+                groups: [outputs.div_ceil(THREADS), 1, 1],
             },
         ])?;
         Ok(Some(IndirectBatch {
             output,
             draw_params,
             kind: source.kind,
-            count: source.max_count,
+            count: source.max_count * segments,
             trace,
         }))
     }
@@ -278,7 +290,8 @@ impl IndirectBatch {
     pub fn take_trace(&mut self) -> Option<IndirectTrace> {
         self.trace.take()
     }
-    /// The GPU writes exactly this many records, including inactive records.
+    /// The GPU writes exactly this many records, including inactive records
+    /// (`RECT_SEGMENTS` per bounded rectangle record).
     pub fn record_count(&self) -> u32 {
         self.count
     }

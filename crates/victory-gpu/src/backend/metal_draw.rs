@@ -716,7 +716,6 @@ impl MetalBackend {
     /// as a binary PPM (8-bit RGBA/BGRA formats only; others are skipped)
     /// to `<dir>/<name>.ppm`.
     pub(crate) fn capture(&self, resource: This, name: &str) {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         if self.stopped_endpoint("capture") { return; }
         let Some(dir) = std::env::var_os("VICTORY_METAL_CAPTURE_DIR") else { return };
         let Some(t) = self.texture_for(resource) else { return };
@@ -747,15 +746,11 @@ impl MetalBackend {
         let (row, bytes) = (row as u32, bytes64 as usize);
         super::metal::work::here("capture alloc");
         let _pool = victory_metal::Pool::new();
-        // SAFETY: a fresh allocation, freed after the GPU is done.
-        let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-        if mem.is_null() {
-            return;
-        }
-        // SAFETY: lives until the blit is waited for.
-        super::metal::work::here("capture wrap");
-        if let Ok(buffer) = unsafe { self.device.wrap(mem, bytes as u64) }
-            && let Ok(cb) = self.queue.command_buffer()
+        // Metal's own shared memory, read after the wait: a no-copy wrap of
+        // a fresh 33 MB allocation was wired for every readback (see
+        // `victory_metal::chunks::Gate` for what wiring next to remaps did).
+        let Ok((buffer, mem)) = self.device.shared_buffer_mapped(&vec![0u8; bytes]) else { return };
+        if let Ok(cb) = self.queue.command_buffer()
             && let Ok(mut blit) = cb.blit_encoder()
         {
             blit.copy_from_texture_to_buffer(&t.texture, 0, 0, [0, 0, 0], [u64::from(w), u64::from(h), 1], &buffer, 0, row, row * h);
@@ -764,7 +759,7 @@ impl MetalBackend {
             if super::metal::submit_checked(&cb, &[], true, "capture readback").is_ok() {
                 super::metal::work::here("capture write");
                 // SAFETY: the GPU wrote `bytes` bytes there.
-                let data = unsafe { std::slice::from_raw_parts(mem.cast::<u8>(), bytes) };
+                let data = unsafe { std::slice::from_raw_parts(mem.cast_const(), bytes) };
                 let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
                 for y in 0..h as usize {
                     for x in 0..w as usize {
@@ -793,8 +788,7 @@ impl MetalBackend {
                 }
             }
         }
-        // SAFETY: ours, the GPU is done.
-        unsafe { VirtualFree(mem, 0, MEM_RELEASE) };
+        drop(buffer);
         super::metal::work::after_wait();
     }
 }
