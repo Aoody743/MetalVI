@@ -619,6 +619,10 @@ static BACKEND: OnceLock<Option<MetalBackend>> = OnceLock::new();
 #[path = "metal_memory.rs"]
 mod memory;
 
+/// T3 frame package: record one frame's compute work, replay it offline.
+#[path = "metal_package.rs"]
+pub(crate) mod package;
+
 #[cfg(feature = "diagnostics")]
 pub(crate) fn stall_locks() -> impl Iterator<Item = (&'static str, usize)> {
     // A stall may occur while the backend is starting. Do not wait for it.
@@ -729,6 +733,7 @@ impl MetalBackend {
             tracing::warn!(pipeline = %p.name, error = %e, "no Metal pipeline for a compute pipeline");
         }
         let made = made.ok().map(Arc::new);
+        package::note_compute(&made, p);
         self.compute.lock().unwrap_or_else(|e| e.into_inner()).insert(key, made.clone());
         made
     }
