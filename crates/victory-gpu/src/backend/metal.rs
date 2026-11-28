@@ -296,6 +296,7 @@ fn complete_checked(
     #[cfg(test)]
     diag::LAST_GPU_NS.store(gpu_ns, std::sync::atomic::Ordering::Relaxed);
     work::observe(ops, gpu_ns);
+    work::gpu_busy(gpu_ns, ops);
     Ok(())
 }
 
@@ -1454,6 +1455,7 @@ impl MetalBackend {
                 false
             }
         };
+        work::RUN_NS.fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let elapsed_ms = started.elapsed().as_millis() as u64;
         if elapsed_ms > 500 {
             let ms = |d: std::time::Duration| d.as_millis() as u64;

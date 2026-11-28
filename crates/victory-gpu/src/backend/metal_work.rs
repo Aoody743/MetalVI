@@ -157,6 +157,35 @@ pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
     if let Some(n) = units && ns != 0 { cost.store(ns.div_ceil(n), Ordering::Relaxed); }
 }
 
+/// GPU time against wall time, logged every 5 s: whether a slow stretch is
+/// the GPU's work or time spent elsewhere (encoding, waiting, the title).
+/// Wall time spent in `run_batch` (encoding, submitting, waiting).
+pub(super) static RUN_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn gpu_busy(gpu_ns: u64, ops: &[Arc<MetalOp>]) {
+    struct Busy { since: std::time::Instant, gpu_ns: u64, buffers: u64, ops: u64, top: HashMap<&'static str, u64> }
+    static BUSY: std::sync::Mutex<Option<Busy>> = std::sync::Mutex::new(None);
+    let mut guard = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    let b = guard.get_or_insert_with(|| Busy { since: std::time::Instant::now(), gpu_ns: 0, buffers: 0, ops: 0, top: HashMap::new() });
+    b.gpu_ns = b.gpu_ns.saturating_add(gpu_ns);
+    b.buffers += 1;
+    b.ops += ops.len() as u64;
+    // A buffer's time by the kind of its first operation.
+    if let Some(op) = ops.first() {
+        *b.top.entry(kind(op)).or_insert(0) += gpu_ns;
+    }
+    let wall = b.since.elapsed();
+    if wall >= std::time::Duration::from_secs(5) {
+        let mut top: Vec<_> = b.top.iter().map(|(k, ns)| format!("{k}:{}ms", ns / 1_000_000)).collect();
+        top.sort();
+        tracing::info!(wall_ms = wall.as_millis() as u64, gpu_ms = b.gpu_ns / 1_000_000,
+            busy_pct = (b.gpu_ns as f64 / wall.as_nanos().max(1) as f64 * 100.0) as u64,
+            run_batch_ms = RUN_NS.swap(0, Ordering::Relaxed) / 1_000_000, buffers = b.buffers, ops = b.ops, by_first = %top.join(","), frame = crate::frame::current(),
+            "Metal: GPU busy share");
+        *guard = None;
+    }
+}
+
 /// An over-window operation runs alone. Replan after each completion so
 /// observed costs can inform the next boundary.
 pub(super) fn prefix(ops: &[Arc<MetalOp>], max_ops: usize) -> usize {
