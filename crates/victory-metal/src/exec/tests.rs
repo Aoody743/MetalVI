@@ -990,3 +990,100 @@ fn fault_gpu_idle_bounded() {
     drop(t);
     never.signal(1);
 }
+
+/// Run V0 R3: a drain before a present was stopped after 5 s while the
+/// encoder thread encoded one 4,772-op batch (2.8 s) with nothing in
+/// flight. Encoding and host work longer than the drain's GPU timeout are
+/// not a hang: the drain waits for them and everything runs.
+#[test]
+#[ignore = "requires Metal"]
+fn drain_waits_for_a_slow_encoder() {
+    let _pool = Pool::new();
+    let g: &'static Gpu = Box::leak(Box::new(Gpu::new()));
+    g.set(0, 1);
+    let t = g.timeline(cfg(false));
+    t.submit(0, vec![
+        Segment::new("slow host work", Work::Host(Box::new(|| {
+            std::thread::sleep(Duration::from_millis(600));
+            true
+        }))),
+        Segment::new("slow encoding", Work::Encode {
+            ring_bytes: 0,
+            groups: 1,
+            encode: Box::new(move |e| {
+                std::thread::sleep(Duration::from_millis(600));
+                let a = args(2, 0, 5);
+                e.cb.compute(&[
+                    crate::Compute::Pipeline { pipeline: &g.add, threads_per_group: [1; 3] },
+                    crate::Compute::Buffer { buffer: &g.buf, offset: 0, index: 0 },
+                    crate::Compute::Bytes { bytes: &a, index: 1 },
+                    crate::Compute::Dispatch { groups: [1; 3] },
+                ])
+            }),
+        }),
+        Segment::new("after", Work::Compute(vec![g.add(1, 0, 1)])),
+    ])
+    .unwrap();
+    let start = Instant::now();
+    let drained = t.drain(Duration::from_millis(200));
+    let took = start.elapsed();
+    println!("drain behind 1.2 s of encoder work: {drained:?} after {took:?}");
+    assert!(drained.unwrap(), "everything ran");
+    assert!(took >= Duration::from_millis(1000), "the drain waited for the encoder ({took:?})");
+    assert!(t.stopped().is_none());
+    assert_eq!((g.get(1), g.get(2)), (2, 6));
+}
+
+/// A committed command buffer that never completes is still found by the
+/// drain (here before the completion thread's own, longer, hang timeout).
+#[test]
+#[ignore = "requires Metal"]
+fn fault_drain_finds_a_gpu_stall() {
+    let _pool = Pool::new();
+    let g = Gpu::new();
+    let never = SharedEvent::new(&g.device).unwrap();
+    let n2 = never.clone();
+    let t = g.timeline(Config { hang_ms: 10_000, ..cfg(false) });
+    t.submit(0, vec![Segment::new("stuck", Work::Encode {
+        ring_bytes: 0,
+        groups: 0,
+        encode: Box::new(move |e| {
+            e.cb.encode_wait(&n2, 1);
+            Ok(())
+        }),
+    })])
+    .unwrap();
+    let start = Instant::now();
+    let drained = t.drain(Duration::from_millis(300));
+    let took = start.elapsed();
+    println!("drain on a stuck GPU: {drained:?} after {took:?}");
+    let e = drained.unwrap_err().to_string();
+    assert!(e.contains("no GPU progress"), "{e}");
+    assert!(took >= Duration::from_millis(300) && took < Duration::from_secs(2), "{took:?}");
+    t.stop("test");
+    never.signal(1);
+    drop(t);
+}
+
+/// The backstop: a timeline that makes no progress at all (here host work
+/// that does not return) ends a drain after `encoder_stall_ms`.
+#[test]
+#[ignore = "requires Metal"]
+fn fault_drain_backstop() {
+    let _pool = Pool::new();
+    let g = Gpu::new();
+    let t = g.timeline(Config { encoder_stall_ms: 300, ..cfg(false) });
+    t.submit(0, vec![Segment::new("stuck host work", Work::Host(Box::new(|| {
+        std::thread::sleep(Duration::from_millis(1200));
+        true
+    })))])
+    .unwrap();
+    let start = Instant::now();
+    let drained = t.drain(Duration::from_millis(100));
+    let took = start.elapsed();
+    println!("drain behind host work that does not return: {drained:?} after {took:?}");
+    let e = drained.unwrap_err().to_string();
+    assert!(e.contains("made no progress"), "{e}");
+    assert!(took >= Duration::from_millis(300) && took < Duration::from_millis(1100), "{took:?}");
+    drop(t);
+}

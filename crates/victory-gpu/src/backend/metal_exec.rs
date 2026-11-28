@@ -274,10 +274,12 @@ pub(crate) fn drain(force: bool, why: &'static str) {
                 tracing::info!(why, "Metal: execution timeline holds work at waits (none in flight)");
             }
         }
-        // Stopped, or work still on the GPU after 5 s: hung. What comes next
-        // (a page remap, a present) must not run beside it, so everything
-        // stops; the timeline releases its events so nothing it committed
-        // waits forever.
+        // Stopped, or committed work made no GPU progress for 5 s (hung), or
+        // the timeline made no progress at all for `VICTORY_METAL_ENCODER_
+        // STALL_MS` (default 60 s). Encoder time alone (a big batch, host
+        // work) is not a hang (V0 R3). What comes next (a page remap, a
+        // present) must not run beside a hang, so everything stops; the
+        // timeline releases its events so nothing it committed waits forever.
         Err(e) => {
             tracing::error!(why, error = %e, in_flight = ?t.in_flight(), "Metal safety stop: execution timeline did not drain");
             super::metal::stop_submissions("execution timeline did not drain");
