@@ -2,7 +2,7 @@
 using namespace metal;
 
 struct Options {
-    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace, segments;
+    uint kind, stride, max_count, has_count, index_capacity, object_stride, mesh_threads, groups, inputs, trace, segments, segment_groups;
 };
 
 struct Record {
@@ -25,7 +25,10 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
     // Rectangle records (kind 11) are cut into `segments` draws of at most
     // `groups` object groups each, in vertex order; `id` is the output
     // record, `rec` the source record. Other kinds: one output per record.
-    uint segs = opts.kind == 11 && opts.groups ? max(opts.segments, 1u) : 1u;
+    // Dispatch records (kind 2) of a program with a group base are cut the
+    // same way along x, `segment_groups` groups each (see `RECT_SEGMENTS`
+    // and `DispatchSegments` on the host side).
+    uint segs = (opts.kind == 11 || opts.kind == 2) && opts.groups ? max(opts.segments, 1u) : 1u;
     uint rec = id / segs, seg = id % segs;
     if (rec >= opts.max_count) return;
     Record result = {};
@@ -46,7 +49,31 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
             }
         }
         if (opts.groups) {
-            if (opts.kind == 2 || opts.kind == 10 || opts.kind == 12) {
+            if (opts.kind == 2 && segs > 1) {
+                // x in segments of `segment_groups`: segment `seg` starts at
+                // group seg * segment_groups (the program adds that base).
+                // Only one-row dispatches (y = z = 1); others as before, in
+                // the first segment.
+                if (result.words[1] == 1 && result.words[2] == 1) {
+                    ulong total = ulong(result.words[0]);
+                    ulong covered = min(total, ulong(opts.segment_groups) * ulong(segs));
+                    ulong first = ulong(seg) * ulong(opts.segment_groups);
+                    result.words[0] = first < covered ? uint(min(ulong(opts.segment_groups), covered - first)) : 0u;
+                    if (result.words[0] == 0) result = {};
+                    if (seg == 0 && covered != total) atomic_fetch_add_explicit(clamped, 1u, memory_order_relaxed);
+                } else if (seg == 0) {
+                    uint remaining = opts.groups;
+                    for (uint axis = 0; axis < 3; ++axis) {
+                        result.words[axis] = min(result.words[axis], remaining);
+                        remaining /= max(1u, result.words[axis]);
+                    }
+                    bool changed = false;
+                    for (uint i = 0; i < 3; ++i) changed |= original.words[i] != result.words[i];
+                    if (changed) atomic_fetch_add_explicit(clamped, 1u, memory_order_relaxed);
+                } else {
+                    result = {};
+                }
+            } else if (opts.kind == 2 || opts.kind == 10 || opts.kind == 12) {
                 if (opts.kind == 12 && (result.words[1] != 1 || result.words[2] != 1)) {
                     result = {};
                 } else {
@@ -77,7 +104,7 @@ kernel void translate_indirect(device const uint *src [[buffer(0)]],
                 result.words[1] = instances;
                 result.words[0] = min(result.words[0], opts.inputs / max(instances, 1u));
             }
-            if (opts.kind != 11) {
+            if (opts.kind != 11 && !(opts.kind == 2 && segs > 1)) {
                 bool changed = false;
                 for (uint i = 0; i < words; ++i) changed |= original.words[i] != result.words[i];
                 if (changed) atomic_fetch_add_explicit(clamped, 1u, memory_order_relaxed);

@@ -119,6 +119,11 @@ impl TopLevel {
         self.layout.iter().copied().find(|l| l.kind == kind && l.space == space && l.slot == slot)
     }
 
+    /// The byte offset of the root constants at `b<slot>, space<space>`.
+    pub fn constants_offset(&self, space: u32, slot: u32) -> Option<u32> {
+        self.find(ResourceType::Constant, space, slot).map(|l| l.offset)
+    }
+
     /// Root constants at `b<slot>, space<space>` (victory's user data:
     /// b0, space0). Returns false if the signature has none there or they
     /// do not fit.

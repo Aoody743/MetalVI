@@ -2112,6 +2112,7 @@ impl State {
             count: count_buf,
             records_va: records,
             count_va: count,
+            group_base_at: bound.group_base_at,
         })));
         true
     }
@@ -2649,6 +2650,8 @@ impl State {
                 *w = v;
             }
         }
+        let group_base_at = host.user_data.iter().find(|u| u.root == RootType::Other(USER_GROUP_BASE))
+            .and_then(|u| Some(top.constants_offset(USER_DATA_SPACE, 0)? as usize + u.index as usize * 4));
         if !words.is_empty() && !top.set_constants(USER_DATA_SPACE, 0, &words) {
             once!(pipeline = %p.name, "Metal: user data does not fit the top-level layout");
             return Err(Drop::UserDataLayout);
@@ -2794,7 +2797,7 @@ impl State {
             Some(Missing::Unmapped) => Drop::SlotUnmapped,
             Some(_) => Drop::SlotMissing,
         };
-        Ok(MetalStage { top: top.bytes, tables, heap: heap_buffer, sampler_heap: sampler_buffer, outcome })
+        Ok(MetalStage { top: top.bytes, tables, heap: heap_buffer, sampler_heap: sampler_buffer, outcome, group_base_at })
     }
 
     #[cfg(feature = "diagnostics")]
@@ -3909,6 +3912,9 @@ pub(crate) struct MetalStage {
     heap: Option<victory_metal::Buffer>,
     sampler_heap: Option<victory_metal::Buffer>,
     outcome: crate::backend::metal::Drop,
+    /// Where in `top` the program reads its first group's number
+    /// (`USER_GROUP_BASE`), if it does: dispatches can then be cut.
+    group_base_at: Option<usize>,
 }
 
 #[cfg(windows)]

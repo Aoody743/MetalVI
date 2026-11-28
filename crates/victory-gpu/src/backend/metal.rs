@@ -265,6 +265,9 @@ pub(crate) struct MetalDispatchIndirect {
     /// Title addresses of the records and the count (diagnostics).
     pub(crate) records_va: u64,
     pub(crate) count_va: Option<u64>,
+    /// Where in `top` the program reads its first group's number: the
+    /// dispatch is cut in segments ([`victory_metal::indirect::DispatchSegments`]).
+    pub(crate) group_base_at: Option<usize>,
 }
 
 /// What a title list records for Metal, in its order.
@@ -1011,8 +1014,21 @@ impl MetalBackend {
                         }
                     }
                     if let Some(tr) = TRANSLATOR.get_or_init(|| victory_metal::indirect::IndirectTranslator::new(&self.device).ok()) {
-                        use victory_metal::indirect::{IndirectKind, IndirectSource};
-                        let source = IndirectSource {
+                        use victory_metal::indirect::{DispatchSegments, IndirectKind, IndirectSource};
+                        // A program that adds a group base: the record is cut
+                        // in segments, each with its own base in its top bytes.
+                        let segments = c.group_base_at.filter(|_| work::dispatch_segments_on()).map(|_| DispatchSegments::DEFAULT);
+                        let seg_tops: Vec<Vec<u8>> = match (segments, c.group_base_at) {
+                            (Some(d), Some(at)) if at + 4 <= dispatch_tops[i].len() => (0..d.segments)
+                                .map(|k| {
+                                    let mut top = dispatch_tops[i].clone();
+                                    top[at..at + 4].copy_from_slice(&(k * d.groups).to_le_bytes());
+                                    top
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        };
+                        let source = IndirectSource { dispatch_segments: segments.filter(|_| !seg_tops.is_empty()),
                             kind: IndirectKind::Dispatch,
                             records: (&c.records, c.records_offset),
                             stride: c.stride,
@@ -1041,8 +1057,9 @@ impl MetalBackend {
                                     if let Some(b) = &c.sampler_heap {
                                         steps.push(Compute::Buffer { buffer: b, offset: 0, index: msc::SAMPLER_HEAP_BIND_POINT });
                                     }
-                                    if !dispatch_tops[i].is_empty() {
-                                        steps.push(Compute::Bytes { bytes: &dispatch_tops[i], index: msc::ARGUMENT_BUFFER_BIND_POINT });
+                                    let top = if seg_tops.is_empty() { &dispatch_tops[i] } else { &seg_tops[(rec_idx as usize) % seg_tops.len()] };
+                                    if !top.is_empty() {
+                                        steps.push(Compute::Bytes { bytes: top, index: msc::ARGUMENT_BUFFER_BIND_POINT });
                                     }
                                     steps.push(Compute::DispatchIndirect { arguments: rec.buffer, offset: rec.offset });
                                 }
@@ -1220,7 +1237,7 @@ impl MetalBackend {
                                     None if d.pso.mesh => IndirectKind::TitleMesh1D,
                                     None => IndirectKind::Draw,
                                 };
-                                let source = IndirectSource {
+                                let source = IndirectSource { dispatch_segments: None,
                                     kind,
                                     records: (records, *records_offset),
                                     stride: *stride,

@@ -249,6 +249,14 @@ pub(in crate::backend) fn after_wait() {
     phase(lane, if lane == LANE_RUN { "run_batch encode" } else { "" });
 }
 
+/// Indirect dispatches of programs with a group base are cut in segments
+/// (`victory_metal::indirect::DispatchSegments`); `VICTORY_METAL_DISPATCH_SEGMENTS=0`
+/// clamps them to the group budget as before.
+pub(super) fn dispatch_segments_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_DISPATCH_SEGMENTS").as_deref() != Ok("0"))
+}
+
 /// Cut a bounded command buffer after every compute pass (as before
 /// 0056e07): the default again since 2026-11-28, for the reason given at
 /// `SOLO_MAX_NS`. `VICTORY_METAL_CUT_EVERY_PASS=0` cuts by dispatch count.

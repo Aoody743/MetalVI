@@ -58,6 +58,7 @@ fn direct_and_indirect_dispatches_sharing_buffers_run_in_order() {
                 count: None,
                 records_va: mem as u64 + 4096,
                 count_va: None,
+                group_base_at: None,
             })
         } else {
             MetalOp::Dispatch(MetalCmd {

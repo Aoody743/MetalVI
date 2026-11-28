@@ -22,6 +22,24 @@ pub const INPUTS_PER_RECORD: u32 = 512;
 /// is still clamped and counted.
 pub const RECT_SEGMENTS: u32 = 16;
 
+/// How a bounded dispatch record of a program that adds a group base to its
+/// group id (`victory_shader::emit::USER_GROUP_BASE`, one-dimensional
+/// programs) is cut: `segments` dispatches of at most `groups` groups in x,
+/// the n-th starting at group n * `groups` (the caller sets the base of
+/// each). The title's final gather of indirect light asks for 115,200
+/// groups in one dispatch: clamped to the group budget it drew a sliver,
+/// and no host dispatch takes over 65,535 in an axis anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DispatchSegments {
+    pub segments: u32,
+    pub groups: u32,
+}
+
+impl DispatchSegments {
+    /// 16 x 8,192 groups (131,072 in all).
+    pub const DEFAULT: Self = Self { segments: 16, groups: 8192 };
+}
+
 /// The per-record budget the clamp applies: `GROUPS_PER_RECORD` and
 /// `INPUTS_PER_RECORD` unless `VICTORY_METAL_INDIRECT_GROUPS` /
 /// `VICTORY_METAL_INDIRECT_INPUTS` give larger finite values (at most 2^20
@@ -105,6 +123,8 @@ pub enum IndirectKind {
 
 pub struct IndirectSource<'a> {
     pub kind: IndirectKind,
+    /// Bounded dispatches only: cut in segments (see [`DispatchSegments`]).
+    pub dispatch_segments: Option<DispatchSegments>,
     pub records: (&'a Buffer, u64),
     pub stride: u32,
     pub max_count: u32,
@@ -179,7 +199,11 @@ impl IndirectTranslator {
             return Err(Error("invalid indirect count window".into()));
         }
         // Output records per source record (see `RECT_SEGMENTS`).
-        let segments = if matches!(source.kind, IndirectKind::Rectangles(_)) && counter.is_some() { RECT_SEGMENTS } else { 1 };
+        let (segments, segment_groups) = match (source.kind, source.dispatch_segments) {
+            (IndirectKind::Rectangles(_), _) if counter.is_some() => (RECT_SEGMENTS, 0),
+            (IndirectKind::Dispatch, Some(d)) if counter.is_some() && d.segments > 1 => (d.segments, d.groups.clamp(1, 65_535)),
+            _ => (1, 0),
+        };
         let outputs = u64::from(source.max_count) * u64::from(segments);
         let rect = if let IndirectKind::Rectangles(cfg) = source.kind {
             Some((cfg.object_vertex_stride().ok_or_else(|| Error("invalid MSC geometry stride".into()))?, cfg.max_input_primitives))
@@ -196,8 +220,9 @@ impl IndirectTranslator {
             record_budget().1,
             u32::from(trace),
             segments,
+            segment_groups,
         ];
-        let mut options = [0; 44];
+        let mut options = [0; 48];
         for (dst, value) in options.chunks_exact_mut(4).zip(values) {
             dst.copy_from_slice(&value.to_le_bytes());
         }

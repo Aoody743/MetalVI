@@ -143,7 +143,7 @@ fn bounded_title_mesh_records() {
     let src = Shared::new(&device, &words);
     let out = Shared::new(&device, &[0xFEu32;25]);
     let cb = queue.command_buffer().unwrap();
-    let batch = translator.encode(&device, &cb, &IndirectSource {
+    let batch = translator.encode(&device, &cb, &IndirectSource { dispatch_segments: None,
         kind: IndirectKind::TitleMesh1D, records: (&src.0, 0), stride: 12, max_count: 5, count: None,
     }).unwrap().unwrap();
     let mut blit = cb.blit_encoder().unwrap();
@@ -267,7 +267,7 @@ fn wine_gpu_readback() {
     let mesh_target = target(&device);
 
     let cb = queue.command_buffer().unwrap();
-    let source = IndirectSource {
+    let source = IndirectSource { dispatch_segments: None,
         kind: IndirectKind::Draw,
         records: (&draw_src.0, 12),
         stride: 24,
@@ -279,7 +279,7 @@ fn wine_gpu_readback() {
             .encode(
                 &device,
                 &cb,
-                &IndirectSource {
+                &IndirectSource { dispatch_segments: None,
                     max_count: 0,
                     ..source
                 }
@@ -292,7 +292,7 @@ fn wine_gpu_readback() {
             .encode(
                 &device,
                 &cb,
-                &IndirectSource {
+                &IndirectSource { dispatch_segments: None,
                     stride: 23,
                     ..source
                 }
@@ -304,7 +304,7 @@ fn wine_gpu_readback() {
             .encode(
                 &device,
                 &cb,
-                &IndirectSource {
+                &IndirectSource { dispatch_segments: None,
                     records: (&draw_src.0, 13),
                     ..source
                 }
@@ -316,7 +316,7 @@ fn wine_gpu_readback() {
             .encode(
                 &device,
                 &cb,
-                &IndirectSource {
+                &IndirectSource { dispatch_segments: None,
                     max_count: 4,
                     ..source
                 }
@@ -328,7 +328,7 @@ fn wine_gpu_readback() {
             .encode(
                 &device,
                 &cb,
-                &IndirectSource {
+                &IndirectSource { dispatch_segments: None,
                     count: Some((&count.0, 20)),
                     ..source
                 }
@@ -357,7 +357,7 @@ fn wine_gpu_readback() {
         .encode(
             &device,
             &cb,
-            &IndirectSource {
+            &IndirectSource { dispatch_segments: None,
                 max_count: 1,
                 count: Some((&zero.0, 0)),
                 ..source
@@ -365,7 +365,7 @@ fn wine_gpu_readback() {
         )
         .unwrap()
         .unwrap();
-    let indexed_source = IndirectSource {
+    let indexed_source = IndirectSource { dispatch_segments: None,
         kind: IndirectKind::DrawIndexed {
             index_capacity: 4,
             index_type: 0,
@@ -383,7 +383,7 @@ fn wine_gpu_readback() {
         .encode(
             &device,
             &cb,
-            &IndirectSource {
+            &IndirectSource { dispatch_segments: None,
                 count: Some((&count.0, 8)),
                 ..indexed_source // min(2, 99)
             },
@@ -394,7 +394,7 @@ fn wine_gpu_readback() {
         .encode(
             &device,
             &cb,
-            &IndirectSource {
+            &IndirectSource { dispatch_segments: None,
                 kind: IndirectKind::Dispatch,
                 records: (&dispatch_src.0, 4),
                 stride: 16,
@@ -408,7 +408,7 @@ fn wine_gpu_readback() {
         .encode(
             &device,
             &cb,
-            &IndirectSource {
+            &IndirectSource { dispatch_segments: None,
                 kind: IndirectKind::DrawMesh,
                 records: (&mesh_src.0, 0),
                 stride: 16,
@@ -745,7 +745,7 @@ fn clamps_oversized_dispatch_groups() {
         .encode(
             &device,
             &cb,
-            &IndirectSource {
+            &IndirectSource { dispatch_segments: None,
                 kind: IndirectKind::Dispatch,
                 records: (&src.0, 0),
                 stride: 12,
@@ -780,7 +780,7 @@ fn check_work_clamp<const N: usize>(kind: IndirectKind, input: [u32; N], expecte
     let src = Shared::new(&device, &input);
     let dst = Shared::new(&device, &[u32::MAX; 10]);
     let cb = queue.command_buffer().unwrap();
-    let source = IndirectSource { kind, records: (&src.0, 0), stride: (N * 2) as u32, max_count: 2, count: None };
+    let source = IndirectSource { dispatch_segments: None, kind, records: (&src.0, 0), stride: (N * 2) as u32, max_count: 2, count: None };
     let batch = translator.encode_bounded(&device, &cb, &source, &counter).unwrap().unwrap();
     let mut blit = cb.blit_encoder().unwrap();
     blit.copy_buffer(&batch.output, 0, &dst.0, 0, dst.0.len);
@@ -807,7 +807,7 @@ fn trace_counted_dispatch_before_and_after_clamp() {
     let args = Shared::new(&device, &[9, 8, 2, 2, 2, 1]);
     let count = Shared::new(&device, &[1]);
     let cb = queue.command_buffer().unwrap();
-    let source = IndirectSource {
+    let source = IndirectSource { dispatch_segments: None,
         kind: IndirectKind::Dispatch,
         records: (&args.0, 0),
         stride: 12,
@@ -873,7 +873,7 @@ fn bounded_rectangles_are_segmented_in_vertex_order() {
         let out = Shared::new(&device, &vec![u32::MAX; segs * 5]);
         let params = Shared::new(&device, &vec![u32::MAX; segs * 12]);
         let cb = queue.command_buffer().unwrap();
-        let source = IndirectSource { kind: IndirectKind::Rectangles(cfg), records: (&src.0, 0), stride: 16, max_count: 1, count: None };
+        let source = IndirectSource { dispatch_segments: None, kind: IndirectKind::Rectangles(cfg), records: (&src.0, 0), stride: 16, max_count: 1, count: None };
         let batch = translator.encode_bounded(&device, &cb, &source, &counter).unwrap().unwrap();
         assert_eq!(batch.record_count(), RECT_SEGMENTS);
         let mut blit = cb.blit_encoder().unwrap();
@@ -935,7 +935,7 @@ fn translates_and_clamps_indirect_rectangles() {
         .encode(
             &device,
             &cb,
-            &IndirectSource {
+            &IndirectSource { dispatch_segments: None,
                 kind: IndirectKind::Rectangles(cfg),
                 records: (&src.0, 0),
                 stride: 16,
@@ -975,4 +975,97 @@ fn translates_and_clamps_indirect_rectangles() {
     for rec in 1..4 {
         assert_eq!(&params[rec * 12..rec * 12 + 2], &[0, 0]);
     }
+}
+
+/// A bounded dispatch of a program that adds a group base, cut in segments
+/// with the base of each set as the host does, writes exactly what the
+/// whole dispatch writes, also past 65,535 groups (no host axis takes more):
+/// every group writes `group * 7 + thread + 1` at its own place.
+#[test]
+fn segmented_dispatch_writes_what_the_whole_dispatch_writes() {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(4).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    const THREADS: u32 = 2;
+    let pipeline = device.compute_pipeline_msl(
+        "#include <metal_stdlib>\nusing namespace metal;\nkernel void k(device uint *out [[buffer(0)]], constant uint *base [[buffer(1)]],\n uint3 group [[threadgroup_position_in_grid]], uint3 t [[thread_position_in_threadgroup]]) {\n uint g = base[0] + group.x; out[g * 2 + t.x] = g * 7 + t.x + 1; }",
+        "k",
+    ).unwrap();
+    let run = |total: u32, segments: Option<DispatchSegments>| -> (Vec<u32>, u32) {
+        let out = Shared::new(&device, &vec![0u32; 80_000 * THREADS as usize]);
+        let src = Shared::new(&device, &[total, 1, 1]);
+        let counter = ClampCounter::new(&device).unwrap();
+        let cb = queue.command_buffer().unwrap();
+        let source = IndirectSource { dispatch_segments: segments, kind: IndirectKind::Dispatch, records: (&src.0, 0), stride: 12, max_count: 1, count: None };
+        let batch = translator.encode_bounded(&device, &cb, &source, &counter).unwrap().unwrap();
+        let bases: Vec<[u32; 1]> = (0..batch.record_count()).map(|r| [segments.map_or(0, |d| r * d.groups)]).collect();
+        let base_bytes: Vec<Vec<u8>> = bases.iter().map(|b| b[0].to_le_bytes().to_vec()).collect();
+        let mut steps = Vec::new();
+        for r in 0..batch.record_count() {
+            let rec = batch.record(r).unwrap();
+            steps.push(Compute::Pipeline { pipeline: &pipeline, threads_per_group: [u64::from(THREADS), 1, 1] });
+            steps.push(Compute::Buffer { buffer: &out.0, offset: 0, index: 0 });
+            steps.push(Compute::Bytes { bytes: &base_bytes[r as usize], index: 1 });
+            steps.push(Compute::DispatchIndirect { arguments: rec.buffer, offset: rec.offset });
+        }
+        cb.compute(&steps).unwrap();
+        cb.commit();
+        cb.wait().unwrap();
+        (out.words(), unsafe { counter.completed_count() })
+    };
+    let expect = |total: u32| -> Vec<u32> {
+        let mut v = vec![0u32; 80_000 * THREADS as usize];
+        for g in 0..total {
+            for t in 0..THREADS {
+                v[(g * THREADS + t) as usize] = g * 7 + t + 1;
+            }
+        }
+        v
+    };
+    let seg = |segments, groups| Some(DispatchSegments { segments, groups });
+    // Within the segments: all groups, nothing clamped.
+    let (got, clamped) = run(70_000, seg(4, 32_768));
+    assert_eq!(clamped, 0);
+    assert!(got == expect(70_000), "70,000 groups in 32,768-group segments");
+    let (got, clamped) = run(1_000, seg(16, 64));
+    assert_eq!(clamped, 0);
+    assert!(got == expect(1_000), "1,000 groups in 64-group segments");
+    // Past all segments: the rest clamped, counted once.
+    let (got, clamped) = run(1_000, seg(4, 64));
+    assert_eq!(clamped, 1);
+    assert!(got == expect(256), "4 x 64 groups drawn");
+    // Not segmented: the group budget, as before.
+    let (got, clamped) = run(1_000, None);
+    assert_eq!(clamped, 1);
+    assert!(got == expect(GROUPS_PER_RECORD), "the group budget only");
+}
+
+/// Multi-row dispatches (y or z over 1) are not segmented: the first
+/// segment gets the old clamp, the others nothing.
+#[test]
+fn multi_row_dispatches_keep_the_old_clamp_when_segmented() {
+    let _pool = Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(1).unwrap();
+    let translator = IndirectTranslator::new(&device).unwrap();
+    let counter = ClampCounter::new(&device).unwrap();
+    let src = Shared::new(&device, &[9u32, 8, 2]);
+    let out = Shared::new(&device, &[u32::MAX; 4 * 5]);
+    let cb = queue.command_buffer().unwrap();
+    let source = IndirectSource {
+        dispatch_segments: Some(DispatchSegments { segments: 4, groups: 1024 }),
+        kind: IndirectKind::Dispatch, records: (&src.0, 0), stride: 12, max_count: 1, count: None,
+    };
+    let batch = translator.encode_bounded(&device, &cb, &source, &counter).unwrap().unwrap();
+    assert_eq!(batch.record_count(), 4);
+    let mut blit = cb.blit_encoder().unwrap();
+    blit.copy_buffer(&batch.output, 0, &out.0, 0, 4 * RECORD_BYTES);
+    blit.finish();
+    cb.commit();
+    cb.wait().unwrap();
+    let w = out.words();
+    assert_eq!(&w[0..5], &[9, 3, 1, 0, 0], "the old clamp: 9 x 3 x 1 <= 32 groups");
+    assert!(w[5..].iter().all(|&x| x == 0));
+    assert_eq!(unsafe { counter.completed_count() }, 1);
 }
