@@ -361,18 +361,23 @@ fn depth_resource_views_use_only_compatible_formats() {
         slices: 1,
         companion: Default::default(),
     };
-    for wanted in [62, 47, 21] {
+    // Stencil: X32_TYPELESS_G8X24_UINT (22), X24_TYPELESS_G8_UINT (47),
+    // R8_UINT (62); depth: R32_FLOAT_X8X24_TYPELESS (21) and the rest.
+    for wanted in [62, 47, 22] {
         assert_eq!(
             view_format(&t, wanted),
             Pixel::WMTPixelFormatX32_Stencil8,
             "DXGI {wanted}"
         );
     }
-    for wanted in [0, 28, 41, 46] {
+    for wanted in [0, 21, 28, 41, 46] {
         assert_eq!(view_format(&t, wanted), pixel, "DXGI {wanted}");
     }
     t.desc.format = 19; // A declared typeless depth/stencil resource.
-    assert_eq!(view_format(&t, 21), Pixel::WMTPixelFormatX32_Stencil8);
+    assert_eq!(view_format(&t, 21), pixel, "21 reads the depth plane");
+    assert_eq!(view_format(&t, 22), Pixel::WMTPixelFormatX32_Stencil8, "22 reads the stencil plane");
+    // Plane slice 1 reads stencil whatever the format says.
+    assert_eq!(super::super::metal_texture::view_format_plane(&t, 21, 1), Pixel::WMTPixelFormatX32_Stencil8);
     let pixel = Pixel::WMTPixelFormatDepth32Float;
     let plain = MetalTexture {
         texture: texture(&device, pixel, false),
@@ -461,4 +466,71 @@ fn stand_in_and_packed_texture_views_use_only_compatible_formats() {
     };
     assert_eq!(view_format(&t_packed, 86), Pixel::WMTPixelFormatA1BGR5Unorm);
     assert_eq!(view_format(&t_packed, 57), Pixel::WMTPixelFormatA1BGR5Unorm);
+}
+
+/// A D32S8 texture read through the game's views of its two planes (format
+/// 19 depth): view 21 reads depth, view 22 / plane 1 reads stencil in green
+/// (D3D's G8 views), as made by `make_texture_entry`.
+#[test]
+fn depth_and_stencil_views_read_their_planes() {
+    use super::super::metal_texture::{MetalTexture, make_texture_entry};
+    use victory_metal::render::{PassDepth, RenderPass};
+    use victory_metal::{Compute, texture::Texture};
+    let _pool = victory_metal::Pool::new();
+    let device = Device::first().unwrap();
+    let queue = device.new_queue(4).unwrap();
+    let pixel = Pixel::WMTPixelFormatDepth32Float_Stencil8;
+    let tex = device.new_texture(&TextureDescriptor {
+        pixel_format: pixel,
+        width: 4,
+        height: 4,
+        usage: sys::WMTTextureUsage(1 | 4 | 0x10),
+        options: sys::WMTResourceOptions(0x20),
+        ..Default::default()
+    }).unwrap();
+    let cb = queue.command_buffer().unwrap();
+    let pd = PassDepth {
+        texture: &tex, level: 0, slice: 0,
+        load: sys::WMTLoadAction::WMTLoadActionClear, store: sys::WMTStoreAction::WMTStoreActionStore,
+        clear_depth: 0.25, clear_stencil: 43,
+    };
+    cb.render_pass_with(&RenderPass { width: 4, height: 4, samples: 1, depth: Some(pd), stencil: Some(pd), ..Default::default() }, &[]).unwrap();
+    cb.commit();
+    cb.wait().unwrap();
+    // SAFETY: ResourceDesc is an integer-only C record.
+    let mut desc: ResourceDesc = unsafe { std::mem::zeroed() };
+    desc.format = 19;
+    desc.width = 4;
+    desc.height = 4;
+    desc.dimension = 3;
+    desc.sample_count = 1;
+    let t = MetalTexture { texture: tex, pixel, desc, mips: 1, slices: 1, companion: Default::default() };
+    let depth = device.compute_pipeline_msl(
+        "#include <metal_stdlib>\nusing namespace metal;\nkernel void rd(depth2d<float> d [[texture(0)]], device float *o [[buffer(0)]]) { o[0] = d.read(uint2(1, 1)); }",
+        "rd").unwrap();
+    let stencil = device.compute_pipeline_msl(
+        "#include <metal_stdlib>\nusing namespace metal;\nkernel void rs(texture2d<uint> s [[texture(0)]], device uint *o [[buffer(0)]]) { uint4 v = s.read(uint2(1, 1)); o[0] = v.r; o[1] = v.g; }",
+        "rs").unwrap();
+    // D3D12_SHADER_RESOURCE_VIEW_DESC words of a 2D SRV: format, dimension 4,
+    // default component mapping, pad, mip 0, 1 mip, plane slice, min LOD.
+    let srv = |format: u32, plane: u32| [format, 4, 0x1688, 0, 0, 1, plane, 0, 0, 0];
+    let read = |pipeline: &victory_metal::ComputePipeline, words: [u32; 10]| -> [u32; 2] {
+        let (view, _) = make_texture_entry(&t, Some(&words), false).expect("a view");
+        let view = Texture::from_object(view);
+        let (out, mapped) = device.shared_buffer_mapped(&[0u8; 8]).unwrap();
+        let cb = queue.command_buffer().unwrap();
+        cb.compute(&[
+            Compute::Pipeline { pipeline, threads_per_group: [1, 1, 1] },
+            Compute::Texture { texture: &view, index: 0 },
+            Compute::Buffer { buffer: &out, offset: 0, index: 0 },
+            Compute::Dispatch { groups: [1, 1, 1] },
+        ]).unwrap();
+        cb.commit();
+        cb.wait().unwrap();
+        // SAFETY: 8 bytes the GPU wrote and is done with.
+        unsafe { [mapped.cast::<u32>().read(), mapped.cast::<u32>().add(1).read()] }
+    };
+    assert_eq!(f32::from_bits(read(&depth, srv(21, 0))[0]), 0.25, "view 21 reads depth");
+    assert_eq!(read(&stencil, srv(22, 1)), [43, 43], "view 22 (plane 1) reads stencil in red and green");
+    assert_eq!(read(&stencil, srv(22, 0))[1], 43, "view 22 reads stencil whatever the plane says");
 }

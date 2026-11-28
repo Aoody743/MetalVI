@@ -827,16 +827,28 @@ impl MetalBackend {
     }
 }
 
-fn make_texture_entry(t: &MetalTexture, words: Option<&[u32]>, unordered: bool) -> Option<(victory_metal::Object, DescriptorEntry)> {
-    let (format, type_, levels, slices, swizzle, min_lod) = match words {
-        None => (t.pixel, None, (0, t.mips), (0, t.slices), identity(), 0.0),
+pub(in crate::backend) fn make_texture_entry(t: &MetalTexture, words: Option<&[u32]>, unordered: bool) -> Option<(victory_metal::Object, DescriptorEntry)> {
+    let (format, type_, levels, slices, swizzle, min_lod, green_stencil) = match words {
+        None => (t.pixel, None, (0, t.mips), (0, t.slices), identity(), 0.0, false),
         Some(w) => {
             let Some(v) = (if unordered { uav_view(w, t) } else { srv_view(w, t) }) else {
                 fail(if unordered { "UAV description" } else { "SRV description" }, Some(&t.desc), Some(w));
                 return None;
             };
-            let format = view_format(t, w[0]);
-            (format, v.type_, v.levels, v.slices, v.swizzle, v.min_lod)
+            // Plane slice of 2D (dimension 4) and 2D array (5) SRVs.
+            let plane = match (unordered, w.get(1)) {
+                (false, Some(4)) => w.get(6).copied().unwrap_or(0),
+                (false, Some(5)) => w.get(8).copied().unwrap_or(0),
+                _ => 0,
+            };
+            let format = view_format_plane(t, w[0], plane);
+            // D3D's G8 stencil views (22, 47) read stencil in green; Metal's
+            // stencil formats give it in red: copy red to green.
+            let green_stencil = stencil_views()
+                && matches!(format, WMTPixelFormat::WMTPixelFormatX32_Stencil8 | WMTPixelFormat::WMTPixelFormatX24_Stencil8)
+                && matches!(w[0], 22 | 47);
+            let swizzle = if green_stencil { stencil_in_green() } else { v.swizzle };
+            (format, v.type_, v.levels, v.slices, swizzle, v.min_lod, green_stencil)
         }
     };
     let type_ = type_.unwrap_or_else(|| base_type(t));
@@ -845,8 +857,9 @@ fn make_texture_entry(t: &MetalTexture, words: Option<&[u32]>, unordered: bool) 
     let min_lod = (min_lod - levels.0 as f32).max(0.0);
     let slices = (slices.0.min(t.slices - 1), slices.1.min(t.slices - slices.0.min(t.slices - 1)).max(1));
     let type_ = view_type(t, type_, slices.1);
-    // No swizzle on depth formats (not something to risk an assertion on).
-    let swizzle = if is_depth_pixel(format.0) { identity() } else { swizzle };
+    // No swizzle on depth formats (not something to risk an assertion on),
+    // except stencil in green on stencil views (allowed; checked on M1).
+    let swizzle = if is_depth_pixel(format.0) && !green_stencil { identity() } else { swizzle };
     let mut id = 0u64;
     let _pool = victory_metal::Pool::new();
     // SAFETY: a live texture; the view is kept below.
@@ -990,6 +1003,33 @@ fn mtl_view_group(p: u32) -> Option<u8> {
 ///   stand-in targets whose `t.pixel` differs from `t.desc.format`), else
 ///   `t.pixel`.
 pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
+    view_format_plane(t, wanted, 0)
+}
+
+/// `VICTORY_METAL_STENCIL_VIEWS=0`: the old stencil-view rule (21, 47, 62),
+/// which swapped the planes of 32-bit depth/stencil views.
+pub(crate) fn stencil_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_STENCIL_VIEWS").as_deref() != Ok("0"))
+}
+
+/// Whether a view of a depth/stencil texture in DXGI format `wanted`, plane
+/// `plane`, reads the stencil plane. DXGI 21 (R32_FLOAT_X8X24_TYPELESS) and
+/// 46 (R24_UNORM_X8_TYPELESS) read depth; 22 (X32_TYPELESS_G8X24_UINT), 47
+/// (X24_TYPELESS_G8_UINT) and 62 (R8_UINT), or plane slice 1, read stencil.
+/// The old rule took 21 for stencil and 22 for depth: the game reads its
+/// format-19 depth through 21 and 22, so lighting that rebuilt positions
+/// from depth read stencil-as-float (~0: sky with reversed Z) and the
+/// material class read depth bits (depth-probe-scan-20261128).
+pub(crate) fn reads_stencil(wanted: u32, plane: u32) -> bool {
+    if !stencil_views() {
+        return matches!(wanted, 62 | 47 | 21);
+    }
+    matches!(wanted, 22 | 47 | 62) || plane == 1
+}
+
+/// As [`view_format`], for plane slice `plane` of the view.
+pub(crate) fn view_format_plane(t: &MetalTexture, wanted: u32, plane: u32) -> WMTPixelFormat {
     if wanted == 0 {
         return t.pixel;
     }
@@ -997,10 +1037,9 @@ pub(crate) fn view_format(t: &MetalTexture, wanted: u32) -> WMTPixelFormat {
     // A depth texture by its Metal format (a typeless title format made a
     // depth one, `depth_pixel`): depth formats cast to nothing else.
     if own.is_some_and(|o| o.depth_stencil) || is_depth_pixel(t.pixel.0) {
-        // R8_UINT (62), X24_TYPELESS_G8_UINT (47), X32_TYPELESS_G8X24_UINT (21)
-        let stencil = matches!(wanted, 62 | 47 | 21);
-        return match (stencil, t.pixel) {
+        return match (reads_stencil(wanted, plane), t.pixel) {
             (true, WMTPixelFormat::WMTPixelFormatDepth32Float_Stencil8) => WMTPixelFormat::WMTPixelFormatX32_Stencil8,
+            (true, WMTPixelFormat::WMTPixelFormatDepth24Unorm_Stencil8) if stencil_views() => WMTPixelFormat::WMTPixelFormatX24_Stencil8,
             _ => t.pixel,
         };
     }
@@ -1037,6 +1076,11 @@ fn view_type(t: &MetalTexture, wanted: WMTTextureType, slices: u32) -> WMTTextur
         T::WMTTextureType2D if slices > 1 => T::WMTTextureType2DArray,
         w => w,
     }
+}
+
+/// (red, red, zero, one): a stencil view read as D3D's G8 formats.
+pub(crate) fn stencil_in_green() -> WMTTextureSwizzleChannels {
+    WMTTextureSwizzleChannels { r: WMTTextureSwizzle(2), g: WMTTextureSwizzle(2), b: WMTTextureSwizzle(0), a: WMTTextureSwizzle(1) }
 }
 
 pub(crate) fn identity() -> WMTTextureSwizzleChannels {
