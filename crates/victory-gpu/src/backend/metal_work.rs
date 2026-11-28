@@ -67,6 +67,7 @@ pub(super) fn kind(op: &MetalOp) -> &'static str {
         MetalOp::FloatRowReadback { .. } => "readback",
         MetalOp::BufferCopy { .. } => "CPU buffer copy",
         MetalOp::Resolve(_) => "resolve",
+        MetalOp::Ambient(_) => "ambient",
     }
 }
 
@@ -101,6 +102,7 @@ fn solo_key(op: &MetalOp) -> Option<usize> {
         MetalOp::Copy(_) => Some(2),
         MetalOp::Resolve(_) => Some(3),
         MetalOp::FloatRowReadback { .. } => Some(4),
+        MetalOp::Ambient(_) => Some(5),
         _ => None,
     }
 }
@@ -309,6 +311,7 @@ pub(super) fn trace_ops(batch: u64, ops: &[Arc<MetalOp>]) {
             MetalOp::FloatRowReadback { .. } => "readback",
             MetalOp::BufferCopy { .. } => "CPU buffer copy",
             MetalOp::Resolve(_) => "resolve",
+            MetalOp::Ambient(_) => "ambient",
         };
         tracing::debug!(frame, batch, op_index, kind, "Metal: recorded operation");
     }

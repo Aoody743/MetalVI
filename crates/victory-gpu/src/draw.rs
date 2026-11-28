@@ -2056,7 +2056,54 @@ impl State {
             tables: bound.tables,
             loop_counts,
         })));
+        if let Some(level) = crate::backend::metal_ambient::level()
+            && p.stages[0].shader.probe_resolve
+        {
+            self.metal_ambient(m, p, level);
+        }
         true
+    }
+
+    /// The stand-in for the probes' indirect light, right after a dispatch
+    /// of their resolve (`VICTORY_AMBIENT=constant:<level>`, builder off):
+    /// recorded behind it into the list, on the image at
+    /// [`crate::backend::metal_ambient::LIGHT`] of its tables.
+    #[cfg(windows)]
+    fn metal_ambient(&mut self, m: &crate::backend::metal::MetalBackend, p: &HostPipeline, level: f32) {
+        use crate::backend::metal_ambient::{LIGHT, MetalAmbient};
+        static RAN: AtomicU64 = AtomicU64::new(0);
+        let (slot, offset) = LIGHT;
+        let writes = p.stages[0].translated().used.iter().any(|u| {
+            u.kind == ResourceType::Uav && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == LIGHT
+        });
+        if !writes {
+            once!(pipeline = %p.name, "Metal ambient: the resolve writes no image at its usual place; left as it is");
+            return;
+        }
+        let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+            return;
+        };
+        let (resource, words) = match crate::descriptor::view(table + u64::from(offset) * 4) {
+            Some(View::Unordered(r, _, desc)) => (r as This, desc),
+            Some(View::Placed(true, resource, desc)) if resource[0] != 1 => {
+                let address = crate::backend::metal_views::placed_address(&desc);
+                let Some(r) = crate::resource::texture_at(address, &resource) else { return };
+                (r, desc[..10].try_into().ok())
+            }
+            _ => return,
+        };
+        if resource.is_null() || crate::resource::buffer_bytes(resource).is_some() {
+            return;
+        }
+        let Some(op) = m.texture_for(resource).and_then(|t| MetalAmbient::new(&t, words.as_ref().map(|w| &w[..]), level))
+        else {
+            once!(pipeline = %p.name, ?words, "Metal ambient: the resolve's image is not a 32-bit 2D view; left as it is");
+            return;
+        };
+        if RAN.fetch_add(1, Ordering::Relaxed) < 5 {
+            tracing::info!(pipeline = %p.name, size = ?op.size, level, "Metal ambient: a constant stand-in after the probes' resolve");
+        }
+        self.metal.push(std::sync::Arc::new(crate::backend::metal::MetalOp::Ambient(op)));
     }
 
     /// An indirect compute dispatch on Metal, encoded via `IndirectTranslator`.

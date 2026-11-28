@@ -38,3 +38,6 @@ pub mod metal_copy;
 pub mod metal_render_map;
 #[cfg(windows)]
 pub mod metal_warm;
+// Lead B: the probes' indirect light without rays (VICTORY_AMBIENT).
+#[cfg(windows)]
+pub mod metal_ambient;
