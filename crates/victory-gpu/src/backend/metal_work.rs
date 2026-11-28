@@ -34,15 +34,15 @@ pub(super) fn reject(reason: &'static str) -> bool {
 }
 
 fn profile(op: &MetalOp) -> Option<(&AtomicU64, u64)> {
-    use victory_metal::indirect::{GROUPS_PER_RECORD, INPUTS_PER_RECORD};
+    let (groups_per_record, inputs_per_record) = victory_metal::indirect::record_budget();
     let product = |g: &[u64; 3]| g.iter().copied().fold(1u64, u64::saturating_mul);
     let (cost, units) = match op {
         MetalOp::Dispatch(c) => (&c.pso.cost_ns, product(&c.groups)),
-        MetalOp::DispatchIndirect(c) => (&c.pso.cost_ns, u64::from(c.max) * u64::from(GROUPS_PER_RECORD)),
+        MetalOp::DispatchIndirect(c) => (&c.pso.cost_ns, u64::from(c.max) * u64::from(groups_per_record)),
         MetalOp::Draw(d) => (&d.pso.cost_ns, match &d.kind {
             DrawKind::Mesh { groups } => product(groups),
             DrawKind::Geometry { draw, .. } => product(&draw.groups),
-            DrawKind::Indirect { max, .. } => u64::from(*max) * u64::from(if d.pso.mesh || d.pso.geometry.is_some() { GROUPS_PER_RECORD } else { INPUTS_PER_RECORD }),
+            DrawKind::Indirect { max, .. } => u64::from(*max) * u64::from(if d.pso.mesh || d.pso.geometry.is_some() { groups_per_record } else { inputs_per_record }),
             DrawKind::Vertices { count, instances, .. } | DrawKind::Indexed { count, instances, .. } => u64::from(*count) * u64::from(*instances),
             DrawKind::Generated { indices, instances, .. } => (indices.len() as u64).saturating_mul(u64::from(*instances)),
         }),

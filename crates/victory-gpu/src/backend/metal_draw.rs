@@ -708,6 +708,9 @@ pub(crate) fn filtered_trace() -> bool {
     *ENABLED.get_or_init(|| std::env::var("VICTORY_METAL_TRACE_PSO").is_ok_and(|s| !s.is_empty()))
 }
 
+/// The largest texture `capture` reads back.
+const CAPTURE_MAX_BYTES: u64 = 256 << 20;
+
 impl MetalBackend {
     /// Reads Metal texture `resource` back (level 0, slice 0) and writes it
     /// as a binary PPM (8-bit RGBA/BGRA formats only; others are skipped)
@@ -730,8 +733,18 @@ impl MetalBackend {
         };
         let format = t.pixel.0;
         let (w, h) = (t.desc.width as u32, t.desc.height.max(1));
-        let row = (w * bpp).next_multiple_of(256);
-        let bytes = (row * h) as usize;
+        let row = (u64::from(w) * u64::from(bpp)).next_multiple_of(256);
+        let bytes64 = row * u64::from(h);
+        // Captures stopped the game at frame 1080 of stage-r-stall1/stall3
+        // (the frame's picture written, then no render target and no further
+        // log line): name each target before it is read back, and leave out
+        // the huge ones (a whole buffer of it is allocated and wrapped).
+        tracing::info!(name, resource = resource as usize, w, h, format, bytes = bytes64, "Metal: capturing a texture");
+        if bytes64 > CAPTURE_MAX_BYTES {
+            tracing::warn!(name, w, h, format, bytes = bytes64, "Metal: capture left out (too large)");
+            return;
+        }
+        let (row, bytes) = (row as u32, bytes64 as usize);
         let _pool = victory_metal::Pool::new();
         // SAFETY: a fresh allocation, freed after the GPU is done.
         let mem = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
