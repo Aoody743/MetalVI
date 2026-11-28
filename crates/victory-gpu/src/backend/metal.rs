@@ -1392,7 +1392,7 @@ impl MetalBackend {
                 tracing::debug!(batch, command = cb.handle(), first = cb_start, end = i, reason, "Metal: command buffer operations");
                 work::here("bounded pass submit");
                 let result = submit_checked(&cb, &ops[cb_start..i], true, "bounded pass");
-                work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces);
+                work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces, &ops[cb_start..i]);
                 if let Err(e) = result {
                     tracing::warn!(error = %e, "Metal: a bounded command buffer failed");
                     fuse::stop();
@@ -1442,7 +1442,7 @@ impl MetalBackend {
         let committed_at = started.elapsed();
         tracing::debug!(batch, command = cb.handle(), first = cb_start, end = ops.len(), reason = "batch end", "Metal: command buffer operations");
         let waited = submit_checked(&cb, &ops[cb_start..], cb_start < ops.len(), "main batch");
-        work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces);
+        work::report(&cb, clamp_counter.take(), batch, &mut indirect_traces, &ops[cb_start..]);
         let waited_at = started.elapsed();
         let res = match waited {
             Ok(()) => {

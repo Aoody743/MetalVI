@@ -388,7 +388,7 @@ fn snapshot_indirect_arguments_reads_gpu_writes() {
 }
 
 pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>,
-    batch: u64, traces: &mut Vec<(usize, victory_metal::indirect::IndirectTrace)>) {
+    batch: u64, traces: &mut Vec<(usize, victory_metal::indirect::IndirectTrace)>, ops: &[Arc<MetalOp>]) {
     if let Some(counter) = counter {
         use victory_metal::sys;
         // SAFETY: the buffer is owned; never read GPU output after an error or non-commit.
@@ -401,7 +401,26 @@ pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_
         if records != 0 {
             static CLAMPED: AtomicU64 = AtomicU64::new(0);
             let total = CLAMPED.fetch_add(u64::from(records), Ordering::Relaxed) + u64::from(records);
-            tracing::warn!(records, total, "Metal: indirect arguments clamped; not a correctness sample");
+            // Which indirect work the clamp cut (the counter is per buffer):
+            // its pipelines, by kind, for the first lines.
+            static LINES: AtomicU64 = AtomicU64::new(0);
+            let pipelines = if LINES.fetch_add(1, Ordering::Relaxed) < 400 {
+                let mut names: Vec<String> = ops.iter().filter_map(|op| match &**op {
+                    MetalOp::DispatchIndirect(c) => Some(format!("dispatch:{}:max{}", c.pso.name, c.max)),
+                    MetalOp::Draw(d) => match &d.kind {
+                        DrawKind::Indirect { max, .. } => Some(format!("{}:{}:max{max}",
+                            if d.pso.geometry.is_some() { "rects" } else if d.pso.mesh { "mesh" } else { "draw" }, d.pso.name)),
+                        _ => None,
+                    },
+                    _ => None,
+                }).collect();
+                names.sort();
+                names.dedup();
+                names.join(",")
+            } else {
+                String::new()
+            };
+            tracing::warn!(records, total, pipelines, "Metal: indirect arguments clamped; not a correctness sample");
         }
         for (op_index, trace) in traces.drain(..) {
             // SAFETY: the owning command buffer completed successfully above.
