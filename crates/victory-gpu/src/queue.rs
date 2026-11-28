@@ -851,7 +851,13 @@ fn frame_interval(frame: u64) {
         return;
     };
     let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    times.push(now.duration_since(before).as_secs_f64() * 1000.0);
+    let ms = now.duration_since(before).as_secs_f64() * 1000.0;
+    // Each stall over 1 s on its own line (the 64-frame summary hides how
+    // many there were; in 3D a summary covers minutes).
+    if ms > 1000.0 {
+        tracing::info!(frame, ms = format!("{ms:.0}"), "T8 present stall over 1 s");
+    }
+    times.push(ms);
     if times.len() >= 64 {
         times.sort_by(f64::total_cmp);
         let at = |p: f64| times[((times.len() - 1) as f64 * p) as usize];
