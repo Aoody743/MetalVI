@@ -75,6 +75,27 @@ fn physical_alias(va: u64, len: u64) -> Option<u64> {
     PHYSICAL_ALIAS.get().and_then(|f| f(va, len))
 }
 
+/// Held while title memory is wrapped and wired ([`victory_metal::chunks::Gate`]):
+/// the readers' side of the runtime's mapping gate, which xmem holds as a
+/// writer while it changes mappings. Each wiring is logged first (rate
+/// limited), so a stall in the kernel names its range.
+fn wiring_gate(start: u64, len: u64, aliased: bool) -> Box<dyn std::any::Any> {
+    static LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = LINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n <= 2000 || n.is_power_of_two() {
+        tracing::info!(n, at = format_args!("{start:#x}"), mb = len >> 20, kb = len >> 10, aliased, "Metal: wiring title memory");
+    }
+    struct Wiring(#[allow(dead_code)] crate::watch::Reading);
+    impl std::ops::Drop for Wiring {
+        fn drop(&mut self) {
+            work::after_wait();
+        }
+    }
+    let reading = crate::watch::title_memory_reading_range(start as usize, len as usize);
+    work::here("wiring title memory");
+    Box::new(Wiring(reading))
+}
+
 /// Counts mapping changes. Recorded Metal lists can still contain old GPU
 /// addresses, so the post-map notification cannot safely re-wrap memory.
 pub(crate) fn title_memory_remapped(at: u64, len: u64) {
@@ -471,6 +492,7 @@ impl MetalBackend {
             .unwrap_or(6144)
             << 20;
         chunks.alias = Some(physical_alias);
+        chunks.gate = Some(wiring_gate);
         let queue = device.new_queue(64)?;
         queue.add_residency_set(chunks.residency());
         Ok(Self {
@@ -510,6 +532,8 @@ impl MetalBackend {
     pub(crate) fn commit_residency(&self) {
         if self.residency_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
             let chunks = self.chunks();
+            // Wires what was added: never while xmem changes mappings.
+            let _gate = crate::watch::title_memory_reading();
             chunks.residency().commit();
         }
     }
@@ -599,7 +623,7 @@ impl MetalBackend {
             if st.spans >= (last * 2).max(64) || st.spans >= last + 2048 || (st.capped > 0 && last != u64::MAX && st.spans == last) {
                 LOGGED.store(if st.capped > 0 && st.spans == last { u64::MAX } else { st.spans }, std::sync::atomic::Ordering::Relaxed);
                 let stale_uses = victory_metal::chunks::STALE_USES.load(std::sync::atomic::Ordering::Relaxed);
-                tracing::info!(spans = st.spans, span_mb = st.span_bytes >> 20, capped = st.capped, refused = st.refused, remaps_under_spans = st.remaps_under_spans, stale_spans = st.stale_spans, stale_uses, "Metal: title memory span buffers");
+                tracing::info!(spans = st.spans, direct_spans = st.direct_spans, span_mb = st.span_bytes >> 20, capped = st.capped, refused = st.refused, remaps_under_spans = st.remaps_under_spans, stale_spans = st.stale_spans, stale_uses, "Metal: title memory span buffers");
             }
         }
         use super::metal_draw::{DrawKind, STAGE_VERTEX, draw_params, stage_buffer};

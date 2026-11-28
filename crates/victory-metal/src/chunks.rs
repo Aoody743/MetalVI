@@ -73,7 +73,20 @@ pub struct Chunks {
     /// Where else the bytes of a title range are mapped, never remapped
     /// ([`Alias`]): spans are made there instead.
     pub alias: Option<Alias>,
+    /// Taken around every wrap and residency commit of title memory
+    /// ([`Gate`]).
+    pub gate: Option<Gate>,
 }
+
+/// Called before title memory `[start, start+len)` is wrapped and wired
+/// (`aliased`: at a persistent alias, never remapped); what it returns is
+/// held until the wiring is done. The GPU side passes the runtime's mapping
+/// gate (readers' side), so wiring never runs while xmem changes mappings:
+/// a residency-set commit wiring pages that were being remapped stalled in
+/// the kernel (`IOGeneralMemoryDescriptor::wireVirtual`) and froze the
+/// whole process, which then could not exit (2026-11-28, spindump of
+/// stage-r-clamp-trace-20261128-105906).
+pub type Gate = fn(u64, u64, bool) -> Box<dyn core::any::Any>;
 
 /// The host address of the same bytes as title range `[va, va+len)` in a
 /// mapping nobody remaps (xmem's persistent views of its physical-page
@@ -91,6 +104,9 @@ pub struct Stats {
     pub pages: u64,
     pub rewrapped_chunks: u64,
     pub spans: u64,
+    /// Spans at title addresses (no persistent alias): these pages can be
+    /// remapped under them.
+    pub direct_spans: u64,
     pub refused: u64,
     /// Bytes under live span buffers (they overlap chunks and each other).
     pub span_bytes: u64,
@@ -178,6 +194,7 @@ impl Chunks {
             longest_span: 0,
             stale: std::collections::HashSet::new(),
             alias: None,
+            gate: None,
         })
     }
 
@@ -210,6 +227,7 @@ impl Chunks {
             longest_span: 0,
             stale: std::collections::HashSet::new(),
             alias: None,
+            gate: None,
         })
     }
 
@@ -346,13 +364,16 @@ impl Chunks {
         if let Some(window) = self.resident_window(va, len) {
             return Some(window);
         }
-        let va = self.home(va, len);
+        let home = self.home(va, len);
+        let aliased = home != va;
+        let va = home;
         let end = va.checked_add(len)?;
         for (start, end) in Self::span_ranges(va, end) {
             if self.stats.span_bytes.saturating_add(end - start) > self.span_cap {
                 self.stats.capped += 1;
                 return None;
             }
+            let _gate = self.gate.map(|g| g(start, end - start, aliased));
             // SAFETY: committed now; the alias, where there is one, is
             // never remapped.
             match unsafe { self.device.wrap(start as *mut c_void, end - start) } {
@@ -361,6 +382,9 @@ impl Chunks {
                     self.residency.commit();
                     self.spans.insert((start, end), b.clone());
                     self.stats.spans += 1;
+                    if !aliased {
+                        self.stats.direct_spans += 1;
+                    }
                     self.stats.span_bytes += end - start;
                     self.longest_span = self.longest_span.max(end - start);
                     return Some((b, va - start));
@@ -373,6 +397,7 @@ impl Chunks {
 
     /// Wraps every chunk touching `[at, at+len)` that is not wrapped yet.
     pub fn wrap(&mut self, at: u64, len: u64) {
+        let _gate = self.gate.map(|g| g(at, len, false));
         for chunk in self.chunk_range(at, len) {
             if !self.chunks.contains_key(&chunk) {
                 self.wrap_chunk(chunk);
@@ -608,5 +633,51 @@ mod span_tests {
         assert_eq!(chunks.stats.spans, 1, "both pages are in the section view's one span");
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(second) };
+    }
+
+    /// Every wrap of title memory runs inside the gate (the GPU side's
+    /// mapping gate): spans and chunk wraps call it first and hold what it
+    /// returns until the wiring is committed; aliased spans say so.
+    #[test]
+    fn spans_and_chunk_wraps_are_wired_inside_the_gate() {
+        use std::sync::Mutex;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        static CALLS: Mutex<Vec<(u64, u64, bool)>> = Mutex::new(Vec::new());
+        static HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        struct Held;
+        impl Drop for Held {
+            fn drop(&mut self) {
+                HELD.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        fn gate(start: u64, len: u64, aliased: bool) -> Box<dyn core::any::Any> {
+            CALLS.lock().unwrap().push((start, len, aliased));
+            HELD.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::new(Held)
+        }
+        let Ok(device) = Device::first() else { return };
+        let mut chunks = Chunks::sparse(&device).unwrap();
+        chunks.gate = Some(gate);
+        let bytes = 8usize << 20;
+        // SAFETY: a fresh allocation of our own, never freed (test).
+        let base = unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let (b, off) = chunks.window_buffer(base + 4096, 4096).expect("committed");
+        assert!(off + 4096 <= b.len);
+        // One gate per wrap attempt (a refused candidate range is tried
+        // first, then a narrower one): the last made the span.
+        let calls = CALLS.lock().unwrap().clone();
+        assert!(!calls.is_empty() && calls.len() as u64 == 1 + chunks.stats.refused, "{calls:?}");
+        let (start, len, aliased) = *calls.last().unwrap();
+        assert!(start <= base + 4096 && base + 8192 <= start + len);
+        assert!(!aliased);
+        assert_eq!(chunks.stats.direct_spans, 1);
+        // A second view in the same span wires nothing.
+        let before = calls.len();
+        chunks.window_buffer(base + 65536, 4096).expect("in the span");
+        assert_eq!(CALLS.lock().unwrap().len(), before);
+        chunks.wrap(base, 4 << 20);
+        assert_eq!(CALLS.lock().unwrap().len(), before + 1, "a chunk wrap takes the gate");
+        assert_eq!(HELD.load(std::sync::atomic::Ordering::SeqCst), 0, "released after the commit");
     }
 }
