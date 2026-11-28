@@ -99,6 +99,7 @@ impl MetalBackend {
             return known.clone();
         }
         let made = self.make_graphics(p, rects);
+        super::metal_archive::tick();
         if made.is_err() {
             dump_failed(p);
         }

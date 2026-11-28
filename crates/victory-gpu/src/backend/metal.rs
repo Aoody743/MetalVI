@@ -574,6 +574,7 @@ impl MetalBackend {
         }
         let _pool = victory_metal::Pool::new();
         let device = Device::first()?;
+        super::metal_archive::open(&device);
         let mut chunks = Chunks::sparse(&device)?;
         // `VICTORY_METAL_SPAN_CAP_MB` (default 6144): what span buffers over
         // title memory may hold before new ones are refused (their draws
@@ -640,6 +641,7 @@ impl MetalBackend {
             return known.clone();
         }
         let made = self.make_compute(p);
+        super::metal_archive::tick();
         if let Err(e) = &made {
             tracing::warn!(pipeline = %p.name, error = %e, "no Metal pipeline for a compute pipeline");
         }
@@ -2159,6 +2161,11 @@ pub(crate) fn msc_cache_path(
     let dir = dir.as_ref()?;
     let mut h = blake3::Hasher::new();
     h.update(b"msc-4.0.3/bounds-check/v1\0");
+    // Unchecked conversions (P7 allow-list) live under their own names;
+    // checked ones keep the names they always had (warm caches stay valid).
+    if !victory_metal::msc::bounds_check(dxil) {
+        h.update(b"no-bounds-check\0");
+    }
     h.update(dxil);
     h.update(format!("{params:?}{samplers:?}").as_bytes());
     Some(dir.join(format!("{}.vmsc", &h.finalize().to_hex()[..32])))
@@ -2457,6 +2464,10 @@ mod append_idiom_repro_tests;
 #[cfg(test)]
 #[path = "metal_submit_tests.rs"]
 mod submit_tests;
+
+#[cfg(test)]
+#[path = "metal_archive_tests.rs"]
+mod archive_tests;
 
 /// Names what a command buffer that does not complete was running: a
 /// GPU-side hang (a shader that never ends) blocks `cb.wait()` with no

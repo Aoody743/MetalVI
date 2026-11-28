@@ -38,3 +38,14 @@ uint64_t VM_GpuResourceID(uint64_t handle) {
     return 0;
   return params.ret;
 }
+
+uint32_t MSC_Features(void) {
+  return MSC_FEATURE_FLAGS | MSC_FEATURE_ARCHIVE_STATS;
+}
+
+uint64_t VM_ArchiveAddFailures(void) {
+  struct vm_archive_stats_params params = {0};
+  if (WINE_UNIX_CALL(VM_UNIX_ARCHIVE_ADD_FAILURES, &params))
+    return 0;
+  return params.add_failures;
+}

@@ -369,15 +369,21 @@ impl Device {
         info.input_primitive_topology = sys::WMTPrimitiveTopologyClass(desc.topology_class);
         // Metal rejects a zero tessellation factor even without tessellation.
         info.max_tessellation_factor = 64;
-        let mut err = 0;
-        // SAFETY: info is valid for the call; newRenderPipelineState returns owned (+1).
-        let pso = Object::adopt(unsafe {
-            match stage_in_library {
-                Some(lib) => sys::VM_NewRenderPipelineStageIn(self.handle(), &info, lib.handle(), &mut err),
-                None => sys::MTLDevice_newRenderPipelineState(self.handle(), &info, &mut err),
+        let make = |l: crate::archive::Lookup, err: &mut obj_handle_t| {
+            let mut info = info;
+            info.binary_archives_for_lookup = sys::WMTConstMemoryPointer { ptr: l.archives.cast() };
+            info.num_binary_archives_for_lookup = l.count;
+            info.binary_archive_for_serialization = l.serialize;
+            info.fail_on_binary_archive_miss = l.fail_on_miss;
+            // SAFETY: info (and the archive list) is valid for the call; returns owned (+1).
+            unsafe {
+                match stage_in_library {
+                    Some(lib) => sys::VM_NewRenderPipelineStageIn(self.handle(), &info, lib.handle(), err),
+                    None => sys::MTLDevice_newRenderPipelineState(self.handle(), &info, err),
+                }
             }
-        })
-            .ok_or_else(|| error_text(err, "newRenderPipelineState"))?;
+        };
+        let pso = crate::archive::create(&make, "newRenderPipelineState")?;
         Ok(RenderPipeline(pso))
     }
 }
@@ -406,10 +412,13 @@ impl Device {
         let mut info = Self::mesh_pipeline_info(desc);
         info.mesh_function = mesh.handle();
         info.fragment_function = fragment.as_ref().map_or(0, |f| f.handle());
-        let mut err = 0;
-        // SAFETY: info is valid for the call; returns owned (+1).
-        let pso = Object::adopt(unsafe { sys::MTLDevice_newMeshRenderPipelineState(self.handle(), &info, &mut err) })
-            .ok_or_else(|| error_text(err, "newMeshRenderPipelineState"))?;
+        let make = |l: crate::archive::Lookup, err: &mut obj_handle_t| {
+            let mut info = info;
+            Self::set_mesh_lookup(&mut info, l);
+            // SAFETY: info (and the archive list) is valid for the call; returns owned (+1).
+            unsafe { sys::MTLDevice_newMeshRenderPipelineState(self.handle(), &info, err) }
+        };
+        let pso = crate::archive::create(&make, "newMeshRenderPipelineState")?;
         Ok(RenderPipeline(pso))
     }
 
@@ -455,14 +464,24 @@ impl Device {
         if raw.is_null() {
             return Err(Error("victorymetal.dll has no VM_NewGeometryPipeline (rebuild native/victorymetal)".into()));
         }
-        let mut err = 0;
-        // SAFETY: the shared C structs and all pointed-to data live through the call.
-        let pso = unsafe {
-            let f: unsafe extern "C" fn(obj_handle_t, *const sys::WMTMeshRenderPipelineInfo, *const Functions, *mut obj_handle_t) -> obj_handle_t =
-                core::mem::transmute(raw);
-            f(self.handle(), &info, &functions, &mut err)
+        let make = |l: crate::archive::Lookup, err: &mut obj_handle_t| {
+            let mut info = info;
+            Self::set_mesh_lookup(&mut info, l);
+            // SAFETY: the shared C structs and all pointed-to data live through the call.
+            unsafe {
+                let f: unsafe extern "C" fn(obj_handle_t, *const sys::WMTMeshRenderPipelineInfo, *const Functions, *mut obj_handle_t) -> obj_handle_t =
+                    core::mem::transmute(raw);
+                f(self.handle(), &info, &functions, err)
+            }
         };
-        Object::adopt(pso).map(RenderPipeline).ok_or_else(|| error_text(err, "VM_NewGeometryPipeline"))
+        crate::archive::create(&make, "VM_NewGeometryPipeline").map(RenderPipeline)
+    }
+
+    fn set_mesh_lookup(info: &mut sys::WMTMeshRenderPipelineInfo, l: crate::archive::Lookup) {
+        info.binary_archives_for_lookup = sys::WMTConstMemoryPointer { ptr: l.archives.cast() };
+        info.num_binary_archives_for_lookup = l.count;
+        info.binary_archive_for_serialization = l.serialize;
+        info.fail_on_binary_archive_miss = l.fail_on_miss;
     }
 
     fn mesh_pipeline_info(desc: &RenderPipelineDesc) -> sys::WMTMeshRenderPipelineInfo {

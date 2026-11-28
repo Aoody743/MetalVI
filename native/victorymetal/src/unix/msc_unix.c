@@ -136,7 +136,12 @@ static NTSTATUS compile(struct msc_compile_params *p, struct msc_stage_in_params
   IRCompilerSetMinimumGPUFamily(compiler, IRGPUFamilyApple7);
   /* D3D12 semantics: reads past a view give 0, writes past it are dropped
    * (title memory is the GPU's memory here: a stray write is corruption). */
-  IRCompilerSetCompatibilityFlags(compiler, IRCompatibilityFlagBoundsCheck | IRCompatibilityFlagTextureMinLODClamp);
+  /* MSC_FLAG_NO_BOUNDS_CHECK drops the checks for a pipeline the caller
+   * has verified (allow-list by DXIL hash; never the default). */
+  uint64_t compat = IRCompatibilityFlagTextureMinLODClamp;
+  if (!(p->flags & MSC_FLAG_NO_BOUNDS_CHECK))
+    compat |= IRCompatibilityFlagBoundsCheck;
+  IRCompilerSetCompatibilityFlags(compiler, (IRCompatibilityFlags)compat);
   if (geometry && p->stage == IRShaderStageVertex) {
     IRCompilerEnableGeometryAndTessellationEmulation(compiler, true);
     IRCompilerSetInputTopology(compiler, IRInputTopologyTriangle);

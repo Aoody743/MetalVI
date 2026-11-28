@@ -38,3 +38,6 @@ pub mod metal_copy;
 pub mod metal_render_map;
 #[cfg(windows)]
 pub mod metal_warm;
+// P8: pipeline binary archive (VICTORY_METAL_ARCHIVE).
+#[cfg(windows)]
+pub(crate) mod metal_archive;
