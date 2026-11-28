@@ -986,7 +986,7 @@ impl MetalBackend {
                         match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&c.pso.name)) {
                             Ok(Some(mut batch)) => {
                                 if let Some(trace) = batch.take_trace() {
-                                    indirect_traces.push((i, trace));
+                                    indirect_traces.push((i, c.pso.name.clone(), trace));
                                 }
                                 let mut steps = Vec::new();
                                 for rec_idx in 0..batch.record_count() {
@@ -1194,7 +1194,7 @@ impl MetalBackend {
                                 match tr.encode_bounded_with_trace(&self.device, &cb, &source, counter, work::trace_indirect(&d.pso.name)) {
                                     Ok(mut b) => {
                                         if let Some(trace) = b.as_mut().and_then(|batch| batch.take_trace()) {
-                                            indirect_traces.push((j, trace));
+                                            indirect_traces.push((j, d.pso.name.clone(), trace));
                                         }
                                         batch = b;
                                     }

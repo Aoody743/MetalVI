@@ -388,7 +388,7 @@ fn snapshot_indirect_arguments_reads_gpu_writes() {
 }
 
 pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_metal::indirect::ClampCounter>,
-    batch: u64, traces: &mut Vec<(usize, victory_metal::indirect::IndirectTrace)>, ops: &[Arc<MetalOp>]) {
+    batch: u64, traces: &mut Vec<(usize, String, victory_metal::indirect::IndirectTrace)>, ops: &[Arc<MetalOp>]) {
     if let Some(counter) = counter {
         use victory_metal::sys;
         // SAFETY: the buffer is owned; never read GPU output after an error or non-commit.
@@ -422,11 +422,19 @@ pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_
             };
             tracing::warn!(records, total, pipelines, "Metal: indirect arguments clamped; not a correctness sample");
         }
-        for (op_index, trace) in traces.drain(..) {
+        for (op_index, pipeline, trace) in traces.drain(..) {
             // SAFETY: the owning command buffer completed successfully above.
             for (record, args) in unsafe { trace.completed_records() }.enumerate() {
-                tracing::debug!(batch, op_index, record, raw_count = args.raw_count, active = args.active,
-                    before = ?args.before, after = ?args.after, "Metal: indirect trace record");
+                // Records the clamp changed, at info (`VICTORY_METAL_TRACE_INDIRECT`
+                // picks the pipelines); the rest at debug.
+                static CHANGED: AtomicU64 = AtomicU64::new(0);
+                if args.active && args.before != args.after && CHANGED.fetch_add(1, Ordering::Relaxed) < 4000 {
+                    tracing::info!(batch, op_index, %pipeline, record, raw_count = args.raw_count,
+                        before = ?args.before, after = ?args.after, "Metal: indirect record clamped");
+                } else {
+                    tracing::debug!(batch, op_index, %pipeline, record, raw_count = args.raw_count, active = args.active,
+                        before = ?args.before, after = ?args.after, "Metal: indirect trace record");
+                }
             }
         }
     }
