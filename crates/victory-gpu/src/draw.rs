@@ -26,7 +26,7 @@ use crate::pipeline::host::HostPipeline;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
-enum Root {
+pub(crate) enum Root {
     #[default]
     None,
     /// A descriptor table's first descriptor (an address in a heap).
@@ -2040,7 +2040,7 @@ impl State {
             return false;
         };
         let _pool = victory_metal::Pool::new();
-        let bound = match self.metal_stage(m, p, &p.stages[0], true, mp.top_level.clone(), limit, [groups[0], groups[1]]) {
+        let bound = match self.metal_bind(m, &p.name, p.stages[0].translated(), mp.top_level.clone(), limit, [groups[0], groups[1]]) {
             Ok(b) => b,
             Err(d) => {
                 count(d);
@@ -2154,7 +2154,7 @@ impl State {
             (rb, ro, cb)
         };
         let _pool = victory_metal::Pool::new();
-        let bound = match self.metal_stage(m, p, &p.stages[0], true, mp.top_level.clone(), 0, [1, 1]) {
+        let bound = match self.metal_bind(m, &p.name, p.stages[0].translated(), mp.top_level.clone(), 0, [1, 1]) {
             Ok(b) => b,
             Err(d) => {
                 count_outcome(d);
@@ -2644,6 +2644,54 @@ impl State {
         p: &crate::pipeline::host::HostPipeline,
         stage: &crate::pipeline::host::Stage,
         compute: bool,
+        top: victory_metal::ir::TopLevel,
+        limit: u32,
+        groups_xy: [u32; 2],
+    ) -> Result<MetalStage, crate::backend::metal::Drop> {
+        self.metal_stage_of(m, &p.name, stage.translated(), compute, top, limit, groups_xy)
+    }
+
+    /// A compute stage's Metal bindings by `VICTORY_METAL_PREP` (P1):
+    /// `off` the record step above ([`State::metal_stage`]); `on` the
+    /// independent binding layer (`backend::metal::prep`), the record step
+    /// only for what it does not support; `shadow` the record step's, with
+    /// the layer's computed beside it and compared.
+    #[cfg(windows)]
+    fn metal_bind(
+        &self,
+        m: &crate::backend::metal::MetalBackend,
+        name: &str,
+        t: &crate::pipeline::Translated,
+        top: victory_metal::ir::TopLevel,
+        limit: u32,
+        groups_xy: [u32; 2],
+    ) -> Result<MetalStage, crate::backend::metal::Drop> {
+        use crate::backend::metal::prep;
+        let mode = prep::mode();
+        if mode == prep::Mode::Off {
+            return self.metal_stage_of(m, name, t, true, top, limit, groups_xy);
+        }
+        let input = prep::Input { name, t, roots: &self.compute, heaps: self.heaps, limit, groups_xy };
+        if mode == prep::Mode::On
+            && let Some(bound) = prep::bind_on(m, &input, top.clone())
+        {
+            return bound;
+        }
+        let old = self.metal_stage_of(m, name, t, true, top.clone(), limit, groups_xy);
+        if mode == prep::Mode::Shadow {
+            let new = prep::bind(m, &input, top.clone());
+            prep::compare(m, &input, &top, &old, &new);
+        }
+        old
+    }
+
+    #[cfg(windows)]
+    fn metal_stage_of(
+        &self,
+        m: &crate::backend::metal::MetalBackend,
+        name: &str,
+        t: &crate::pipeline::Translated,
+        compute: bool,
         mut top: victory_metal::ir::TopLevel,
         limit: u32,
         groups_xy: [u32; 2],
@@ -2652,14 +2700,13 @@ impl State {
         use crate::backend::metal_heap::Missing;
         use victory_shader::emit::{SLOT_STRIDES, SLOT_WAVE_SCRATCH, USER_DATA_SPACE, USER_GROUP_BASE, USER_GROUP_COUNT_X, USER_GROUP_COUNT_Y};
         static SKIPPED_HOST_WORDS: AtomicU64 = AtomicU64::new(0);
-        let t = stage.translated();
         let host = &t.host;
 
         // Title memory by address (`SLOT_MEMORY`): the views of what the
         // root arguments name, in the run after the view heap's slots.
         let memory = if host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
             if self.heaps[0] == 0 {
-                once!(pipeline = %p.name, "Metal: a shader reads title memory by address with no view heap bound: dropped");
+                once!(pipeline = %name, "Metal: a shader reads title memory by address with no view heap bound: dropped");
                 return Err(Drop::MemoryDirectory);
             }
             let (mut addresses, mut constants) = (Vec::new(), Vec::new());
@@ -2674,7 +2721,7 @@ impl State {
             match m.memory_ready(self.heaps[0], heap.count(), &addresses, &constants) {
                 Some(r) => Some(r),
                 None => {
-                    once!(pipeline = %p.name, "Metal: no room for title memory views: dropped");
+                    once!(pipeline = %name, "Metal: no room for title memory views: dropped");
                     return Err(Drop::MemoryDirectory);
                 }
             }
@@ -2703,7 +2750,7 @@ impl State {
                 RootType::Other(_) => {
                     // A host word this backend does not build
                     if SKIPPED_HOST_WORDS.fetch_add(1, Ordering::Relaxed).is_power_of_two() {
-                        tracing::info!(pipeline = %p.name, "Metal: a shader needs the memory directory: skipped");
+                        tracing::info!(pipeline = %name, "Metal: a shader needs the memory directory: skipped");
                     }
                     return Err(Drop::MemoryDirectory);
                 }
@@ -2716,7 +2763,7 @@ impl State {
         let group_base_at = host.user_data.iter().find(|u| u.root == RootType::Other(USER_GROUP_BASE))
             .and_then(|u| Some(top.constants_offset(USER_DATA_SPACE, 0)? as usize + u.index as usize * 4));
         if !words.is_empty() && !top.set_constants(USER_DATA_SPACE, 0, &words) {
-            once!(pipeline = %p.name, "Metal: user data does not fit the top-level layout");
+            once!(pipeline = %name, "Metal: user data does not fit the top-level layout");
             return Err(Drop::UserDataLayout);
         }
 
@@ -2802,7 +2849,7 @@ impl State {
                 let gpu = if extent == 0 { 0 } else { chunks.window(va, extent) };
                 match r {
                     RootSlot::Cbv(_) if !compute && va != 0 && gpu == 0 => {
-                        once!(pipeline = %p.name, slot, "Metal: graphics root constant buffer has no mapped GPU address");
+                        once!(pipeline = %name, slot, "Metal: graphics root constant buffer has no mapped GPU address");
                         return Err(Drop::SlotUnmapped);
                     }
                     RootSlot::TableSrv(_) | RootSlot::TableUav(_) => {
@@ -4023,14 +4070,40 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
 /// One stage's Metal bindings ([`State::metal_stage`]).
 #[cfg(windows)]
 pub(crate) struct MetalStage {
-    top: Vec<u8>,
-    tables: Vec<(u32, victory_metal::ir::DescriptorEntry)>,
-    heap: Option<victory_metal::Buffer>,
-    sampler_heap: Option<victory_metal::Buffer>,
-    outcome: crate::backend::metal::Drop,
+    pub(crate) top: Vec<u8>,
+    pub(crate) tables: Vec<(u32, victory_metal::ir::DescriptorEntry)>,
+    pub(crate) heap: Option<victory_metal::Buffer>,
+    pub(crate) sampler_heap: Option<victory_metal::Buffer>,
+    pub(crate) outcome: crate::backend::metal::Drop,
     /// Where in `top` the program reads its first group's number
     /// (`USER_GROUP_BASE`), if it does: dispatches can then be cut.
-    group_base_at: Option<usize>,
+    pub(crate) group_base_at: Option<usize>,
+}
+
+/// Tests of the P1 binding layer: a list's compute bindings recorded the
+/// way `State::metal_dispatch` records them (`prep`: through the
+/// `VICTORY_METAL_PREP` switch; else the record step alone), for a title
+/// state of `heaps` and compute `roots`.
+#[cfg(all(windows, test))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn metal_bind_for_test(
+    m: &crate::backend::metal::MetalBackend,
+    prep: bool,
+    t: &crate::pipeline::Translated,
+    heaps: [usize; 2],
+    roots: Vec<Root>,
+    top: victory_metal::ir::TopLevel,
+    limit: u32,
+    groups_xy: [u32; 2],
+) -> Result<MetalStage, crate::backend::metal::Drop> {
+    let mut s = State::default();
+    s.heaps = heaps;
+    s.compute = roots;
+    if prep {
+        s.metal_bind(m, "prep test", t, top, limit, groups_xy)
+    } else {
+        s.metal_stage_of(m, "prep test", t, true, top, limit, groups_xy)
+    }
 }
 
 #[cfg(windows)]

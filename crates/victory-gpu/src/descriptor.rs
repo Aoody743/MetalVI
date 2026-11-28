@@ -1026,6 +1026,21 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+/// A shader-visible view or sampler heap of `count` descriptors, for tests
+/// elsewhere in the crate (kept for the process): the heap object.
+#[cfg(test)]
+pub(crate) fn test_heap(count: u32, samplers: bool) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let e = Extended(
+        HeapDesc { kind: if samplers { SAMPLERS } else { VIEWS_KIND }, count, flags: SHADER_VISIBLE, nodes: 0 },
+        Placement { address: 0, size: 0 },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(create_heap(std::ptr::null(), &e.0, &HEAP_IIDS[0], &mut out), crate::object::S_OK);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

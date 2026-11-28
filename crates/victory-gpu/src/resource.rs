@@ -1850,6 +1850,7 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
+        crate::backend::metal::prep::buffer_made(at, resource.data() as u64, desc.width);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1910,6 +1911,7 @@ impl Drop for Resource {
                 std::ptr::from_ref::<Resource>(self) as usize,
                 self.data() as u64,
             );
+            crate::backend::metal::prep::buffer_gone(std::ptr::from_ref::<Resource>(self) as usize, self.data() as u64);
         }
     }
 }

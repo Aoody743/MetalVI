@@ -202,6 +202,7 @@ pub(crate) fn title_memory_remapped(at: u64, len: u64) {
     }
     super::metal_texture::note_remap_partial(at, len);
     super::metal_slot_cache::stale();
+    prep::remapped(at, len);
     // Counted only, and never waited for: the runtime calls this holding
     // its page table, which span lookups take under `chunks`.
     if let Some(Some(m)) = BACKEND.get()
@@ -219,7 +220,7 @@ impl MetalBackend {
 }
 
 /// Why dispatches did not run on Metal, counted for the log.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Drop {
     Ran,
     NoBackend,
@@ -593,10 +594,12 @@ pub(crate) fn note_slot_dirty(heap: usize, index: u32, handle: u64) {
         .or_default()
         .insert(index, handle);
     super::metal_slot_cache::dirty(heap, index);
+    prep::written(heap, index, handle);
 }
 
 pub(crate) fn forget_heap(heap: usize) {
     super::metal_slot_cache::stale();
+    prep::heap_gone(heap);
     if let Some(map) = DIRTY_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         map.remove(&heap);
     }
@@ -607,6 +610,7 @@ pub(crate) fn forget_heap(heap: usize) {
 
 pub(crate) fn forget_resource(resource: usize) {
     super::metal_slot_cache::stale();
+    prep::resource_gone(resource);
     super::metal_texture::forget_resource_textures(resource);
     let Some(Some(b)) = BACKEND.get() else { return };
     b.textures.lock().unwrap_or_else(|e| e.into_inner()).remove(&resource);
@@ -1852,8 +1856,23 @@ impl MetalBackend {
     /// The heap entry for the view at `handle`, its stride table words (stride word, buffer
     /// view title address) and why the entry was left empty if it was.
     fn resolve_slot(&self, handle: u64) -> (DescriptorEntry, (u32, u64), Option<super::metal_heap::Missing>) {
+        let (entry, stride_word, missing, view) = self.resolve_view(handle);
+        if missing.is_some()
+            && let Some(v) = &view
+        {
+            EMPTY[empty_kind(v)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        (entry, stride_word, missing)
+    }
+
+    /// As [`Self::resolve_slot`], uncounted, with the view it read
+    /// (shared with the P1 binding layer, [`prep`]).
+    fn resolve_view(
+        &self,
+        handle: u64,
+    ) -> (DescriptorEntry, (u32, u64), Option<super::metal_heap::Missing>, Option<crate::descriptor::View>) {
         if handle == 0 {
-            return (DescriptorEntry::NULL, (0, 0), None);
+            return (DescriptorEntry::NULL, (0, 0), None, None);
         }
         let view = crate::descriptor::view(handle);
         let stride_word = view.as_ref().map_or((0, 0), |v| {
@@ -1916,12 +1935,7 @@ impl MetalBackend {
             None => Ok(DescriptorEntry::NULL),
         };
         let missing = entry.err();
-        if missing.is_some()
-            && let Some(v) = &view
-        {
-            EMPTY[empty_kind(v)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        (entry.unwrap_or(DescriptorEntry::NULL), stride_word, missing)
+        (entry.unwrap_or(DescriptorEntry::NULL), stride_word, missing, view)
     }
 
     fn ensure_heap(&self, heap: usize, count: u32, samplers: bool) -> bool {
@@ -2714,6 +2728,10 @@ pub(super) mod work;
 
 #[path = "metal_completion.rs"]
 mod completion;
+
+/// Stage P1: the independent binding layer (`VICTORY_METAL_PREP`).
+#[path = "metal_prep.rs"]
+pub(crate) mod prep;
 
 /// Stage 4 start: compute ops as execution-timeline segments.
 #[path = "metal_exec_compute.rs"]
