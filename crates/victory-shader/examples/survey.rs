@@ -3,6 +3,7 @@
 //! `<file>\tok\t<wave>\t<DXIL hash>` or `<file>\terr\t<error>`.
 //!
 //! `cargo run --release -p victory-shader --example survey -- <dir> [filter]`
+//! (`SURVEY_METAL=1`: the Metal backend's settings, `emit::set_metal_host`).
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +16,15 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
     victory_shader::emit::set_host_max_wave(wave);
+    // `SURVEY_METAL=1`: with the Metal backend's settings (what the game and
+    // `warm --metal` translate with), instead of only the wave width.
+    if std::env::var("SURVEY_METAL").is_ok_and(|v| v == "1") {
+        victory_shader::emit::set_metal_host();
+        // `SURVEY_F64=1`: and doubles on (what `warm --metal` cached before).
+        if std::env::var("SURVEY_F64").is_ok_and(|v| v == "1") {
+            victory_shader::emit::set_host_f64(true);
+        }
+    }
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .expect("read dir")
         .filter_map(|e| e.ok().map(|e| e.path()))

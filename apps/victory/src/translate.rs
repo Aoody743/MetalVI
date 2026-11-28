@@ -323,10 +323,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool, metal: bo
         }
         // Match `victory_gpu::host::Host::new` for Metal mode so cache keys in
         // `shader_cache::build` (wave 32, no 64-bit image atomics, no
-        // attributeAtVertex) match live Metal runs.
-        victory_shader::emit::set_host_max_wave(32);
-        victory_shader::emit::set_host_image_atomic64(false);
-        victory_shader::emit::set_host_attribute_at_vertex(false);
+        // attributeAtVertex, no doubles) match live Metal runs.
+        victory_shader::emit::set_metal_host();
     }
     victory_hle::modules::d3d12x::use_shader_cache(shader_cache_dir.clone());
     let threads = jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));

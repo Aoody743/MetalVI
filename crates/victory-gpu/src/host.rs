@@ -695,6 +695,8 @@ fn create() -> windows::core::Result<Host> {
         if crate::backend::metal::mode() == crate::backend::metal::Mode::Compute {
             tracing::info!("Metal backend: shaders translated for waves of 32");
             victory_shader::emit::set_host_max_wave(32);
+            // And without doubles (`emit::set_metal_host`, as `warm --metal`).
+            victory_shader::emit::set_host_f64(false);
             // Apple7 has no 64-bit image atomics in fragment functions:
             // pixel-stage ones become rasterizer-ordered loads and stores
             // (F38; the pipelines Metal refused as "float atomic").
@@ -709,7 +711,11 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(f64_ops = o0.DoublePrecisionFloatShaderOps.as_bool(), "host f64 shader ops");
-            victory_shader::emit::set_host_f64(o0.DoublePrecisionFloatShaderOps.as_bool());
+            // Metal has no doubles whatever D3DMetal says (MSC aborts the
+            // process on a wave sum of them): `set_metal_host` above.
+            if crate::backend::metal::mode() != crate::backend::metal::Mode::Compute {
+                victory_shader::emit::set_host_f64(o0.DoublePrecisionFloatShaderOps.as_bool());
+            }
         }
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())

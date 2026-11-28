@@ -2331,6 +2331,9 @@ impl MetalBackend {
             return Err("not a compute pipeline".into());
         }
         let stage = p.stages.first().ok_or("no stage")?;
+        if let Some(why) = msc_known_crash(&stage.shader.hash) {
+            return Err(why);
+        }
         let host = &stage.translated().host;
         let _pool = victory_metal::Pool::new();
         let params = root_params(host);
@@ -2360,6 +2363,25 @@ impl MetalBackend {
     }
 }
 
+
+/// Compute shaders whose Metal translation Metal Shader Converter 4.0.3
+/// crashes on (a bus error in its own optimizer, `InstCombinerImpl::
+/// visitPHINode`, with or without bounds checks; `metal-shaderconverter`
+/// natively and under Wine alike). A crash inside MSC can end the process,
+/// so they are not converted and their dispatches are dropped ("no Metal
+/// pipeline"). By the console shader's hash, which no translator change
+/// moves. `VICTORY_MSC_TRY_KNOWN_CRASHES=1` converts them anyway (after an
+/// MSC update, say); `metal_msc_check_tests` checks them one a process.
+const MSC_KNOWN_CRASHES: [&str; 2] = ["926c46bab3b86bd6", "a10179ab7eda0dc3"];
+
+pub(crate) fn msc_known_crash(shader: &str) -> Option<String> {
+    static TRY: OnceLock<bool> = OnceLock::new();
+    let known = MSC_KNOWN_CRASHES.iter().find(|h| shader.len() >= 8 && (h.starts_with(shader) || shader.starts_with(**h)))?;
+    if *TRY.get_or_init(|| std::env::var("VICTORY_MSC_TRY_KNOWN_CRASHES").is_ok_and(|v| v == "1")) {
+        return None;
+    }
+    Some(format!("Metal Shader Converter crashes on compute {known} (InstCombine): not converted"))
+}
 
 /// Where Metal Shader Converter's output for a shader and root signature is
 /// kept between runs: `VICTORY_METAL_CACHE`, else `<VICTORY_CACHE_DIR>/metal`.

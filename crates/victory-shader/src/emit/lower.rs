@@ -1026,7 +1026,7 @@ pub fn set_host_f64(supported: bool) {
     HOST_F64.store(supported, std::sync::atomic::Ordering::Relaxed);
 }
 
-pub(crate) fn host_has_f64() -> bool {
+pub fn host_has_f64() -> bool {
     HOST_F64.load(std::sync::atomic::Ordering::Relaxed)
 }
 

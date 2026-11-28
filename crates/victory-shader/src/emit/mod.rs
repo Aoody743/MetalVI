@@ -123,8 +123,21 @@ pub use lower::{
     RECT_PRIMITIVE_VARYING, host_attribute_at_vertex, host_has_image_atomic64, host_max_wave, rect_primitive_varying,
     set_host_attribute_at_vertex, set_host_f64, set_rect_primitive_varying, set_mesh_outputs_keep, mesh_outputs_keep_active,
     input_reads, set_mesh_output_reads, last_clip_alias, set_mesh_drop_clip, set_pixel_clip_inputs,
-    set_host_image_atomic64, set_host_max_wave,
+    set_host_image_atomic64, set_host_max_wave, host_has_f64,
 };
+
+/// The translation settings of the Metal backend (Metal Shader Converter, Apple GPUs), as
+/// `victory_gpu::host` sets them for a run, `victory warm --metal` for the cache it fills
+/// and the MSC checks for what they convert: waves of 32, no pixel-stage 64-bit image
+/// atomics, no `attributeAtVertex`, and no `double` (Apple GPUs have none; MSC aborts the
+/// whole process on a `WaveActiveSum` of doubles: "Unhandled LLVM type for
+/// getMinMaxConstants").
+pub fn set_metal_host() {
+    set_host_max_wave(32);
+    set_host_image_atomic64(false);
+    set_host_attribute_at_vertex(false);
+    set_host_f64(false);
+}
 pub use rect::rect_list_gs;
 pub use shader::{
     ATTR_TABLE_ROWS, ATTR_TABLE_VERTEX_STRIDE, DIAG_DWORDS, DIAG_HALF_SYNC_TIMEOUTS, DIAG_LOOP_BUDGET,
@@ -2502,6 +2515,10 @@ mod barycentric_tests {
 fn dump_translated() {
     let input = std::env::var("VICTORY_DUMP_IN").expect("VICTORY_DUMP_IN");
     let out = std::env::var("VICTORY_DUMP_OUT").expect("VICTORY_DUMP_OUT");
+    // `VICTORY_DUMP_METAL=1`: with the Metal backend's settings ([`set_metal_host`]).
+    if std::env::var("VICTORY_DUMP_METAL").is_ok_and(|v| v == "1") {
+        set_metal_host();
+    }
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     bitcode::LLVM_DIS_LAYOUT.set(true);
     let shader = translate(&std::fs::read(input).unwrap());
