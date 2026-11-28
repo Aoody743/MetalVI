@@ -153,6 +153,9 @@ pub(crate) struct MetalAmbient {
     pub(crate) size: [u32; 2],
     /// The linear colour written.
     pub(crate) colour: [f32; 3],
+    /// The texture `view` is of, and the view's level and slice (for the
+    /// frame package, which rebuilds the view).
+    pub(crate) parent: (Texture, u32, u32),
 }
 
 impl MetalAmbient {
@@ -196,7 +199,7 @@ impl MetalAmbient {
         };
         let view = Texture::from_object(victory_metal::Object::adopt(view)?);
         let size = [view.width() as u32, view.height() as u32];
-        Some(MetalAmbient { view, size, colour: TINT.map(|c| c * level) })
+        Some(MetalAmbient { view, size, colour: TINT.map(|c| c * level), parent: (t.texture.clone(), mip, slice) })
     }
 
     /// Records the kernel into `cb`, in a compute pass of its own.

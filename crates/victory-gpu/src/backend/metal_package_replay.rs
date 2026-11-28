@@ -17,7 +17,35 @@ use super::{
     get_params, get_runs, get_samplers, resolve_entry, resolve_top, PAGE, POp, PCompute, Reader, Ref, Resolver, TEntry,
     MEMORY_RECORD, SPECIAL_DIAG, SPECIAL_WAVE_SCRATCH,
 };
+use super::draw::{self, GraphicsDef, PAttachment, PDraw, PDrawKind, TexDef, VIEW_COMPANION, VIEW_SELF, VIEW_TARGET};
 use crate::backend::metal::{self as metal, MetalBackend, MetalCmd, MetalCompute, MetalDispatchIndirect, MetalOp};
+use crate::backend::metal_draw::{Attachment, DrawKind, MetalClear, MetalDraw, MetalGraphics, MetalResolve, MetalTexCopy, StageBind, Targets, VertexFetch};
+use crate::backend::metal_texture::MetalTexture;
+use victory_metal::texture::Texture;
+
+/// One stored texture version (`textures.idx`, `reference/textures.idx`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TexRecord {
+    pub(crate) id: u32,
+    pub(crate) epoch: u32,
+    pub(crate) offset: u64,
+    pub(crate) len: u64,
+}
+
+fn tex_records(b: &[u8], name: &str) -> Result<Vec<TexRecord>, String> {
+    if !b.len().is_multiple_of(draw::TEXTURE_RECORD) {
+        return Err(format!("{name}: not a whole number of records"));
+    }
+    let mut r = Reader::new(b);
+    let mut out = Vec::new();
+    while !r.done() {
+        let (Some(id), Some(epoch), Some(offset), Some(len)) = (r.u32(), r.u32(), r.u64(), r.u64()) else {
+            return Err(format!("{name}: truncated"));
+        };
+        out.push(TexRecord { id, epoch, offset, len });
+    }
+    Ok(out)
+}
 
 /// One stored page (`memory.idx`, `reference/memory.idx`).
 #[derive(Clone, Copy, Debug)]
@@ -68,6 +96,10 @@ pub(crate) struct Package {
     pub(crate) samplers: HashMap<u32, [u32; 13]>,
     pub(crate) typed: HashMap<u32, (u64, u64, u32)>,
     pub(crate) textures: HashMap<u32, (u64, [u32; 10], bool)>,
+    pub(crate) graphics: Vec<GraphicsDef>,
+    pub(crate) texture_defs: Vec<TexDef>,
+    pub(crate) texture_versions: Vec<TexRecord>,
+    pub(crate) texture_reference: Vec<TexRecord>,
 }
 
 fn read(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
@@ -197,7 +229,47 @@ impl Package {
                 t => return Err(format!("resources.bin: record {t}")),
             }
         }
-        Ok(Self { dir: dir.to_path_buf(), pipelines, runs, memory, reference, heaps, updates, samplers, typed, textures })
+        // F4 files (a compute-only package of F3 has none).
+        let mut graphics = Vec::new();
+        if let Ok(b) = crate::read_file(&dir.join("graphics.bin")) {
+            let mut r = Reader::new(&b);
+            if r.bytes(8) != Some(b"VPKGFX01".as_slice()) {
+                return Err("graphics.bin: bad magic".into());
+            }
+            let n = r.u32().ok_or("graphics.bin: truncated")?;
+            for _ in 0..n {
+                graphics.push(draw::get_graphics(&mut r).ok_or("graphics.bin: truncated")?);
+            }
+        }
+        let mut texture_defs = Vec::new();
+        if let Ok(b) = crate::read_file(&dir.join("textures.defs")) {
+            let mut r = Reader::new(&b);
+            if r.bytes(8) != Some(draw::TEXTURES_MAGIC.as_slice()) {
+                return Err("textures.defs: bad magic".into());
+            }
+            while !r.done() {
+                texture_defs.push(TexDef::get(&mut r).ok_or("textures.defs: truncated")?);
+            }
+        }
+        let texture_versions = crate::read_file(&dir.join("textures.idx")).map_or(Ok(Vec::new()), |b| tex_records(&b, "textures.idx"))?;
+        let texture_reference =
+            crate::read_file(&dir.join("reference").join("textures.idx")).map_or(Ok(Vec::new()), |b| tex_records(&b, "reference/textures.idx"))?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            pipelines,
+            runs,
+            memory,
+            reference,
+            heaps,
+            updates,
+            samplers,
+            typed,
+            textures,
+            graphics,
+            texture_defs,
+            texture_versions,
+            texture_reference,
+        })
     }
 
     /// The page-aligned ranges a replay needs at their own addresses
@@ -304,6 +376,13 @@ pub(crate) struct Report {
     pub(crate) heap_capacity_mismatches: u32,
     pub(crate) pages_written: u64,
     pub(crate) failed_run: Option<u32>,
+    pub(crate) graphics_built: u32,
+    pub(crate) graphics_errors: Vec<String>,
+    pub(crate) textures_made: u32,
+    pub(crate) texture_errors: Vec<String>,
+    pub(crate) texture_uploads: u64,
+    /// Texture references that could not be had (draw-side ops skipped).
+    pub(crate) skipped_texture: u64,
 }
 
 /// Fake title-heap keys for the replayed heaps in `MetalBackend::heaps`.
@@ -313,6 +392,8 @@ struct Replayer<'a> {
     m: &'a MetalBackend,
     pkg: &'a Package,
     heaps: HashMap<u32, (Buffer, Option<Buffer>)>,
+    textures: HashMap<u32, Arc<MetalTexture>>,
+    nulls: HashMap<(u32, u32), Texture>,
     report: Report,
 }
 
@@ -333,10 +414,14 @@ impl Resolver for Replayer<'_> {
             Ref::Typed { id } => self.typed(id).map_or(0, |e| e.texture_view_id),
             Ref::Special { kind: SPECIAL_WAVE_SCRATCH, offset } => self.m.wave_scratch_gpu() + offset,
             Ref::Special { kind: SPECIAL_DIAG, offset } => metal::diag::gpu(self.m) + offset,
-            Ref::Texture { .. } => {
-                self.report.zeroed_texture += 1;
-                0
-            }
+            Ref::Texture { id } => match self.heap_view(id) {
+                Some(v) => v,
+                None => {
+                    self.report.zeroed_texture += 1;
+                    0
+                }
+            },
+            Ref::Tex { .. } => self.texture(r).map_or(0, |t| t.gpu_resource_id()),
             Ref::Special { .. } | Ref::Unknown { .. } => {
                 self.report.zeroed_unknown += 1;
                 0
@@ -351,6 +436,248 @@ impl Resolver for Replayer<'_> {
 }
 
 impl Replayer<'_> {
+    /// The `gpuResourceID` of heap texture view `id`, made anew on the
+    /// rebuilt texture (or a null texture's, for resource 0).
+    fn heap_view(&mut self, id: u32) -> Option<u64> {
+        let &(resource, words, unordered) = self.pkg.textures.get(&id)?;
+        if resource == 0 {
+            return self.null_view(words[0], words[1]);
+        }
+        let n = words.iter().rposition(|&w| w != u32::MAX).map_or(0, |i| i + 1);
+        let words = (n > 0).then(|| &words[..n]);
+        self.m.texture_entry(resource as crate::object::This, words, unordered).map(|e| e.texture_view_id)
+    }
+
+    /// A zeroed 1x1 texture of Metal type `type_` and format `pixel`, as the
+    /// backend's null views are.
+    fn null_view(&mut self, type_: u32, pixel: u32) -> Option<u64> {
+        use victory_metal::sys::{WMTPixelFormat, WMTTextureType, WMTTextureUsage};
+        if let Some(t) = self.nulls.get(&(type_, pixel)) {
+            return Some(t.gpu_resource_id());
+        }
+        let cube = type_ == WMTTextureType::WMTTextureTypeCube.0 || type_ == WMTTextureType::WMTTextureTypeCubeArray.0;
+        let t = self
+            .m
+            .device
+            .new_texture(&victory_metal::texture::TextureDescriptor {
+                pixel_format: WMTPixelFormat(pixel),
+                type_: WMTTextureType(type_),
+                usage: WMTTextureUsage(1 | 2),
+                options: victory_metal::sys::WMTResourceOptions(0x20),
+                ..Default::default()
+            })
+            .ok()?;
+        let zeros = self.m.device.shared_buffer(&[0; 256]).ok()?;
+        let cb = self.m.queue.command_buffer().ok()?;
+        let mut blit = cb.blit_encoder().ok()?;
+        for slice in 0..if cube { 6 } else { 1 } {
+            blit.copy_from_buffer_to_texture(&zeros, 0, 256, 256, [1, 1, 1], &t, slice, 0, [0; 3]);
+        }
+        blit.finish();
+        metal::submit_checked(&cb, &[], true, "frame package null texture").ok()?;
+        self.m.add_resident(&[t.handle()]);
+        let id = t.gpu_resource_id();
+        self.nulls.insert((type_, pixel), t);
+        Some(id)
+    }
+
+    fn metal_texture(&self, r: &Ref) -> Option<Arc<MetalTexture>> {
+        match r {
+            Ref::Tex { id, .. } => self.textures.get(id).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The Metal texture a [`Ref::Tex`] names: the texture, a target view
+    /// of it (made as `MetalBackend::attachment` makes it), its companion.
+    fn texture(&mut self, r: &Ref) -> Option<Texture> {
+        let &Ref::Tex { id, view } = r else { return None };
+        let t = self.textures.get(&id)?.clone();
+        match view {
+            VIEW_SELF => Some(t.texture.clone()),
+            VIEW_COMPANION => t.depth_companion(&self.m.device, 0).map(|c| c.texture),
+            v if v & !0xffff_ffff == VIEW_TARGET => {
+                let pixel = (v & 0xffff_ffff) as u32;
+                let key = (self.pkg.texture_defs.get(id as usize)?.key as usize, pixel);
+                let mut views = self.m.target_views.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(v) = views.get(&key) {
+                    return Some(v.clone());
+                }
+                let _pool = victory_metal::Pool::new();
+                let mut gpu_id = 0u64;
+                // SAFETY: a live texture; every level and slice, its own type.
+                let made = unsafe {
+                    victory_metal::sys::MTLTexture_newTextureView(
+                        t.texture.handle(),
+                        victory_metal::sys::WMTPixelFormat(pixel),
+                        crate::backend::metal_texture::base_type(&t),
+                        0,
+                        t.mips as u16,
+                        0,
+                        t.slices.max(1) as u16,
+                        crate::backend::metal_texture::identity(),
+                        &mut gpu_id,
+                    )
+                };
+                let view = Texture::from_object(victory_metal::Object::adopt(made)?);
+                views.insert(key, view.clone());
+                Some(view)
+            }
+            _ => None,
+        }
+    }
+
+    fn attachment(&mut self, a: &PAttachment) -> Option<Attachment> {
+        let t = self.metal_texture(&a.tex)?;
+        let texture = self.texture(&a.tex)?;
+        let &Ref::Tex { id, .. } = &a.tex else { return None };
+        Some(Attachment {
+            resource: self.pkg.texture_defs.get(id as usize).map_or(0, |d| d.key as usize),
+            texture,
+            pixel: a.pixel,
+            level: a.level,
+            slice: a.slice,
+            width: a.width,
+            height: a.height,
+            samples: a.samples,
+            companion: if a.companion { t.depth_companion(&self.m.device, 0) } else { None },
+            twin: if a.twin { t.twin.clone() } else { None },
+        })
+    }
+
+    fn window(&self, r: &Ref) -> Option<(Buffer, u64)> {
+        match *r {
+            Ref::Title { va, len } => self.m.chunks().window_buffer(va, u64::from(len.max(1))),
+            _ => None,
+        }
+    }
+
+    fn draw(&mut self, d: &PDraw, graphics: &[Option<Arc<MetalGraphics>>]) -> Option<MetalOp> {
+        let Some(pso) = graphics.get(d.pipeline as usize).cloned().flatten() else {
+            self.report.skipped_no_pipeline += 1;
+            return None;
+        };
+        let mut targets = Targets { stencil: d.targets.stencil, width: d.targets.width, height: d.targets.height, samples: d.targets.samples, ..Default::default() };
+        for (i, c) in d.targets.colors.iter().enumerate() {
+            if let Some(a) = c {
+                let Some(a) = self.attachment(a) else {
+                    self.report.skipped_texture += 1;
+                    return None;
+                };
+                targets.colors[i] = Some(a);
+            }
+        }
+        if let Some(a) = &d.targets.depth {
+            let Some(a) = self.attachment(a) else {
+                self.report.skipped_texture += 1;
+                return None;
+            };
+            targets.depth = Some(a);
+        }
+        let mut stages = Vec::new();
+        for s in &d.stages {
+            if s.top.refs.iter().any(|(_, r)| matches!(r, Ref::Special { kind: super::SPECIAL_MEMORY_DIRECTORY | super::SPECIAL_FAULTS, .. })) {
+                self.report.skipped_memory_directory += 1;
+                return None;
+            }
+            let template = pso.stages.iter().find(|(_, b)| *b == s.bind).map(|(t, _)| t.bytes.clone()).unwrap_or_default();
+            let top = resolve_top(self, &s.top, &template);
+            let tables = s.tables.iter().map(|(at, e)| (*at, resolve_entry(self, e))).collect();
+            stages.push(StageBind { bind: s.bind, top, tables, heap: self.heap_buffer(s.heap), sampler_heap: self.heap_buffer(s.sampler_heap) });
+        }
+        let vertex = d.vertex.as_ref().map(|v| {
+            let mut table = [0u8; victory_metal::msc::VERTEX_TABLE_SLOTS * 16];
+            let mut buffers = Vec::new();
+            for ((r, length, stride), out) in v.iter().zip(table.chunks_exact_mut(16)) {
+                let address = match self.window(r) {
+                    Some((b, o)) => {
+                        let a = b.gpu_address + o;
+                        buffers.push(b);
+                        a
+                    }
+                    None => {
+                        if matches!(r, Ref::Unknown { .. }) {
+                            self.report.zeroed_unknown += 1;
+                        }
+                        0
+                    }
+                };
+                out[..8].copy_from_slice(&address.to_le_bytes());
+                out[8..12].copy_from_slice(&length.to_le_bytes());
+                out[12..].copy_from_slice(&stride.to_le_bytes());
+            }
+            Box::new(VertexFetch { table, _buffers: buffers })
+        });
+        let kind = match &d.kind {
+            PDrawKind::Vertices { count, instances, first, first_instance } => {
+                DrawKind::Vertices { count: *count, instances: *instances, first: *first, first_instance: *first_instance }
+            }
+            PDrawKind::Indexed { count, instances, base, first_instance, buffer, index_type } => {
+                let Some((b, o)) = self.window(buffer).filter(|(_, o)| *o <= u64::from(u32::MAX)) else {
+                    self.report.skipped_unmapped += 1;
+                    return None;
+                };
+                DrawKind::Indexed { count: *count, instances: *instances, base: *base, first_instance: *first_instance, buffer: b, offset: o as u32, index_type: *index_type }
+            }
+            PDrawKind::Mesh { groups } => DrawKind::Mesh { groups: *groups },
+            PDrawKind::Generated { indices, instances, base, first_instance } => {
+                DrawKind::Generated { indices: indices.clone(), instances: *instances, base: *base, first_instance: *first_instance }
+            }
+            PDrawKind::Indirect { records, records_va, stride, max, count, count_va, index } => {
+                let Some((records, records_offset)) = self.window(records) else {
+                    self.report.skipped_unmapped += 1;
+                    return None;
+                };
+                let count = match count {
+                    Some(c) => Some(self.window(c).or_else(|| {
+                        self.report.skipped_unmapped += 1;
+                        None
+                    })?),
+                    None => None,
+                };
+                let index = match index {
+                    Some((r, t, cap)) => {
+                        let (b, o) = self.window(r).or_else(|| {
+                            self.report.skipped_unmapped += 1;
+                            None
+                        })?;
+                        Some((b, o, *t, *cap))
+                    }
+                    None => None,
+                };
+                DrawKind::Indirect { records, records_offset, records_va: *records_va, stride: *stride, max: *max, count, count_va: *count_va, index }
+            }
+        };
+        let v = d.viewport;
+        let s = d.scissor;
+        Some(MetalOp::Draw(MetalDraw {
+            trace_inputs: Vec::new(),
+            pso,
+            targets: Arc::new(targets),
+            stages,
+            vertex,
+            viewport: victory_metal::sys::WMTViewport { originX: v[0], originY: v[1], width: v[2], height: v[3], znear: v[4], zfar: v[5] },
+            scissor: victory_metal::sys::WMTScissorRect { x: s[0], y: s[1], width: s[2], height: s[3] },
+            blend: d.blend,
+            stencil_ref: d.stencil_ref,
+            primitive: d.primitive,
+            kind,
+        }))
+    }
+
+    fn graphics(&mut self, def: &GraphicsDef) -> Option<Arc<MetalGraphics>> {
+        match draw::build_graphics(self.m, def) {
+            Ok(g) => {
+                self.report.graphics_built += 1;
+                Some(Arc::new(g))
+            }
+            Err(e) => {
+                self.report.graphics_errors.push(format!("{} ({}): {e}", def.id, def.name));
+                None
+            }
+        }
+    }
+
     fn pipeline(&mut self, def: &PipelineDef) -> Option<Arc<MetalCompute>> {
         let made = match def.source.as_ref() {
             None => Err("no source recorded".to_string()),
@@ -445,7 +772,7 @@ impl Replayer<'_> {
         Some((pso, top, tables))
     }
 
-    fn op(&mut self, op: &POp, pipelines: &[Option<Arc<MetalCompute>>]) -> Option<MetalOp> {
+    fn op(&mut self, op: &POp, pipelines: &[Option<Arc<MetalCompute>>], graphics: &[Option<Arc<MetalGraphics>>]) -> Option<MetalOp> {
         match op {
             POp::Dispatch { c, groups, after_barrier, loop_counts } => {
                 let (pso, top, tables) = self.compute(c, pipelines)?;
@@ -502,6 +829,71 @@ impl Replayer<'_> {
                 }))
             }
             POp::BufferCopy { dst, src, bytes } => Some(MetalOp::BufferCopy { dst: *dst as usize, src: *src as usize, bytes: *bytes as usize }),
+            POp::Draw(d) => self.draw(d, graphics),
+            POp::Clear(c) => {
+                let Some(target) = self.attachment(&c.target) else {
+                    self.report.skipped_texture += 1;
+                    return None;
+                };
+                Some(MetalOp::Clear(MetalClear {
+                    target,
+                    color: c.color,
+                    depth: c.depth,
+                    stencil: c.stencil,
+                    has_stencil: c.has_stencil,
+                    rects: c.rects.iter().map(|r| victory_metal::clear_resolve::ClearRect { left: r[0], top: r[1], right: r[2], bottom: r[3] }).collect(),
+                }))
+            }
+            POp::Copy(c) => {
+                let (Some(src), Some(dst)) = (self.metal_texture(&c.src), self.metal_texture(&c.dst)) else {
+                    self.report.skipped_texture += 1;
+                    return None;
+                };
+                Some(MetalOp::Copy(MetalTexCopy {
+                    src,
+                    dst,
+                    whole: c.whole,
+                    src_slice: c.src_slice,
+                    src_level: c.src_level,
+                    src_origin: c.src_origin,
+                    size: c.size,
+                    dst_slice: c.dst_slice,
+                    dst_level: c.dst_level,
+                    dst_origin: c.dst_origin,
+                }))
+            }
+            POp::Readback { src, dst, width } => {
+                let (Some(src), Some((dst, offset))) = (self.texture(src), self.window(dst)) else {
+                    self.report.skipped_texture += 1;
+                    return None;
+                };
+                Some(MetalOp::FloatRowReadback { src, dst, offset, width: *width })
+            }
+            POp::Resolve(c) => {
+                let (Some(src), Some(dst)) = (self.texture(&c.src), self.texture(&c.dst)) else {
+                    self.report.skipped_texture += 1;
+                    return None;
+                };
+                Some(MetalOp::Resolve(MetalResolve {
+                    src,
+                    src_slice: c.src_slice,
+                    dst,
+                    dst_level: c.dst_level,
+                    dst_slice: c.dst_slice,
+                    format: victory_metal::sys::WMTPixelFormat(c.format),
+                    region: c.region.map(|r| victory_metal::clear_resolve::ResolveRegion { src_origin: [r[0], r[1]], dst_origin: [r[2], r[3]], size: [r[4], r[5]] }),
+                }))
+            }
+            POp::Ambient { tex, mip, slice, size, colour } => {
+                const UAV_TEXTURE2D_ARRAY: u32 = 5;
+                let made = self.metal_texture(tex).and_then(|t| crate::backend::metal_ambient::MetalAmbient::new(&t, Some(&[0, UAV_TEXTURE2D_ARRAY, *mip, *slice, 1]), 1.0));
+                let Some(mut a) = made.filter(|a| a.size == *size) else {
+                    self.report.skipped_texture += 1;
+                    return None;
+                };
+                a.colour = *colour;
+                Some(MetalOp::Ambient(a))
+            }
             POp::Unsupported { .. } => {
                 self.report.skipped_unsupported += 1;
                 None
@@ -513,7 +905,7 @@ impl Replayer<'_> {
 /// Replays `pkg` on `m`; its memory must have been placed ([`place`]).
 pub(crate) fn replay(m: &MetalBackend, pkg: &Package, opts: &Options) -> Result<Report, String> {
     let _pool = victory_metal::Pool::new();
-    let mut r = Replayer { m, pkg, heaps: HashMap::new(), report: Report::default() };
+    let mut r = Replayer { m, pkg, heaps: HashMap::new(), textures: HashMap::new(), nulls: HashMap::new(), report: Report::default() };
     let mut pipelines: Vec<Option<Arc<MetalCompute>>> = Vec::new();
     for def in &pkg.pipelines {
         let p = r.pipeline(def);
@@ -523,6 +915,28 @@ pub(crate) fn replay(m: &MetalBackend, pkg: &Package, opts: &Options) -> Result<
         }
         pipelines[at] = p;
     }
+    let mut graphics: Vec<Option<Arc<MetalGraphics>>> = Vec::new();
+    for def in &pkg.graphics {
+        let g = r.graphics(def);
+        let at = def.id as usize;
+        if graphics.len() <= at {
+            graphics.resize(at + 1, None);
+        }
+        graphics[at] = g;
+    }
+    // Textures before the heaps: heap views are made on them.
+    for def in &pkg.texture_defs {
+        match draw::make_texture(m, def) {
+            Ok(t) => {
+                let t = Arc::new(t);
+                m.textures.lock().unwrap_or_else(|e| e.into_inner()).insert(def.key as usize, Some(t.clone()));
+                r.textures.insert(def.id, t);
+                r.report.textures_made += 1;
+            }
+            Err(e) => r.report.texture_errors.push(format!("texture {}: {e}", def.id)),
+        }
+    }
+    let mut texture_file = std::fs::File::open(pkg.dir.join("textures.bin")).ok();
     for def in &pkg.heaps {
         let h = m.new_heap(def.count, def.samplers).ok_or_else(|| format!("heap {}: could not be made", def.id))?;
         if h.capacity != def.capacity {
@@ -534,11 +948,20 @@ pub(crate) fn replay(m: &MetalBackend, pkg: &Package, opts: &Options) -> Result<
     let mut file = std::fs::File::open(pkg.dir.join("memory.bin")).map_err(|e| format!("memory.bin: {e}"))?;
     for (run, ops) in &pkg.runs {
         r.report.pages_written += write_epoch(pkg, &mut file, *run)? as u64;
+        for v in pkg.texture_versions.iter().filter(|v| v.epoch == *run) {
+            let (Some(f), Some(def), Some(t)) = (texture_file.as_mut(), pkg.texture_defs.get(v.id as usize), r.textures.get(&v.id)) else { continue };
+            let bytes = read_blob(f, v.offset, v.len)?;
+            if draw::write_texture(m, &t.texture, def, &bytes) {
+                r.report.texture_uploads += 1;
+            } else {
+                r.report.texture_errors.push(format!("texture {}: upload failed", v.id));
+            }
+        }
         r.apply_updates(*run);
         if opts.runs.is_some_and(|(a, b)| *run < a || *run >= b) {
             continue;
         }
-        let ops: Vec<Arc<MetalOp>> = ops.iter().filter_map(|op| r.op(op, &pipelines)).map(Arc::new).collect();
+        let ops: Vec<Arc<MetalOp>> = ops.iter().filter_map(|op| r.op(op, &pipelines, &graphics)).map(Arc::new).collect();
         r.report.ops_run += ops.len() as u64;
         r.report.runs += 1;
         if !m.run(&ops) {
@@ -572,6 +995,38 @@ pub(crate) fn compare_reference(pkg: &Package) -> Result<Compare, String> {
         } else {
             let first = want.iter().zip(got).position(|(a, b)| a != b).unwrap_or(0);
             out.differing.push((m.va, first, diff));
+        }
+    }
+    Ok(out)
+}
+
+fn read_blob(file: &mut std::fs::File, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+    let mut bytes = vec![0u8; len as usize];
+    file.seek(SeekFrom::Start(offset)).and_then(|_| file.read_exact(&mut bytes)).map_err(|e| format!("blob at {offset:#x}: {e}"))?;
+    Ok(bytes)
+}
+
+/// The textures the frame wrote, read back from the replay's own textures
+/// and compared with the reference: (texture id, first differing byte,
+/// differing bytes) in `differing`.
+pub(crate) fn compare_textures(m: &MetalBackend, pkg: &Package) -> Result<Compare, String> {
+    let mut file = std::fs::File::open(pkg.dir.join("reference").join("textures.bin")).map_err(|e| format!("reference/textures.bin: {e}"))?;
+    let mut out = Compare::default();
+    for v in &pkg.texture_reference {
+        let want = read_blob(&mut file, v.offset, v.len)?;
+        let def = pkg.texture_defs.get(v.id as usize).ok_or("reference names an unknown texture")?;
+        let t = m.textures.lock().unwrap_or_else(|e| e.into_inner()).get(&(def.key as usize)).cloned().flatten();
+        out.pages += 1;
+        let Some(got) = t.and_then(|t| draw::read_texture(m, &t.texture, def)) else {
+            out.differing.push((u64::from(v.id), 0, want.len()));
+            continue;
+        };
+        let diff = want.iter().zip(&got).filter(|(a, b)| a != b).count() + want.len().abs_diff(got.len());
+        if diff == 0 {
+            out.identical += 1;
+        } else {
+            let first = want.iter().zip(&got).position(|(a, b)| a != b).unwrap_or(0);
+            out.differing.push((u64::from(v.id), first, diff));
         }
     }
     Ok(out)

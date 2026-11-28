@@ -40,6 +40,9 @@ use super::{MetalBackend, MetalCompute, MetalOp};
 #[path = "metal_package_replay.rs"]
 pub(crate) mod replay;
 
+#[path = "metal_package_draw.rs"]
+pub(crate) mod draw;
+
 #[cfg(test)]
 #[path = "metal_package_tests.rs"]
 mod tests;
@@ -68,8 +71,11 @@ pub(crate) enum Ref {
     Heap { id: u32, offset: u64 },
     /// Byte `offset` in package heap `id`'s stride table.
     HeapStrides { id: u32, offset: u64 },
-    /// A texture view's `gpuResourceID` (F4: not rebuilt yet).
+    /// A heap texture view's `gpuResourceID`: view `id` of `resources.bin`.
     Texture { id: u32 },
+    /// Texture `id` of `textures.defs` itself, a target view of it or its
+    /// depth companion ([`draw::VIEW_SELF`], ...).
+    Tex { id: u32, view: u64 },
     /// A sampler state's `gpuResourceID`.
     Sampler { id: u32 },
     /// A typed buffer view (texture buffer view of title memory).
@@ -104,6 +110,7 @@ impl Ref {
             Ref::Template => (8, 0, 0),
             Ref::Special { kind, offset } => (9, kind, offset),
             Ref::RingTable => (10, 0, 0),
+            Ref::Tex { id, view } => (11, id, view),
             Ref::Unknown { raw } => (255, 0, raw),
         }
     }
@@ -131,6 +138,7 @@ impl Ref {
             8 => Ref::Template,
             9 => Ref::Special { kind: id, offset },
             10 => Ref::RingTable,
+            11 => Ref::Tex { id, view: offset },
             255 => Ref::Unknown { raw: offset },
             _ => return None,
         })
@@ -177,7 +185,7 @@ pub(crate) struct PCompute {
     pub(crate) tables: Vec<(u32, TEntry)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum POp {
     Dispatch { c: PCompute, groups: [u64; 3], after_barrier: bool, loop_counts: Option<[u64; 2]> },
     DispatchIndirect {
@@ -191,7 +199,15 @@ pub(crate) enum POp {
         group_base_at: Option<u64>,
     },
     BufferCopy { dst: u64, src: u64, bytes: u64 },
-    /// An op kind not recorded yet (F4): [`KIND_DRAW`] ...
+    Draw(Box<draw::PDraw>),
+    Clear(Box<draw::PClear>),
+    Copy(Box<draw::PCopy>),
+    /// One row of `width` RGBA32 floats of `src` into title memory `dst`.
+    Readback { src: Ref, dst: Ref, width: u32 },
+    Resolve(Box<draw::PResolve>),
+    /// The ambient stand-in on level `mip`, slice `slice` of texture `tex`.
+    Ambient { tex: Ref, mip: u32, slice: u32, size: [u32; 2], colour: [f32; 3] },
+    /// An op not recorded (rectangle-emulation draws): [`KIND_DRAW`] ...
     Unsupported { kind: u16 },
 }
 
@@ -204,6 +220,8 @@ pub(crate) const KIND_COPY: u16 = 18;
 pub(crate) const KIND_READBACK: u16 = 19;
 pub(crate) const KIND_RESOLVE: u16 = 20;
 pub(crate) const KIND_AMBIENT: u16 = 21;
+/// An op not recorded; its payload is the op's own kind.
+pub(crate) const KIND_UNSUPPORTED: u16 = 255;
 
 /// A little-endian reader over a file's bytes.
 pub(crate) struct Reader<'a> {
@@ -309,6 +327,12 @@ impl POp {
             POp::Dispatch { .. } => KIND_DISPATCH,
             POp::DispatchIndirect { .. } => KIND_INDIRECT,
             POp::BufferCopy { .. } => KIND_BUFFER_COPY,
+            POp::Draw(_) => KIND_DRAW,
+            POp::Clear(_) => KIND_CLEAR,
+            POp::Copy(_) => KIND_COPY,
+            POp::Readback { .. } => KIND_READBACK,
+            POp::Resolve(_) => KIND_RESOLVE,
+            POp::Ambient { .. } => KIND_AMBIENT,
             POp::Unsupported { kind } => *kind,
         }
     }
@@ -344,9 +368,28 @@ impl POp {
                 put_u64(&mut p, *src);
                 put_u64(&mut p, *bytes);
             }
-            POp::Unsupported { .. } => {}
+            POp::Draw(d) => draw::put_draw(&mut p, d),
+            POp::Clear(c) => draw::put_clear(&mut p, c),
+            POp::Copy(c) => draw::put_copy(&mut p, c),
+            POp::Readback { src, dst, width } => {
+                src.put(&mut p);
+                dst.put(&mut p);
+                put_u32(&mut p, *width);
+            }
+            POp::Resolve(c) => draw::put_resolve(&mut p, c),
+            POp::Ambient { tex, mip, slice, size, colour } => {
+                tex.put(&mut p);
+                for v in [*mip, *slice, size[0], size[1]] {
+                    put_u32(&mut p, v);
+                }
+                for c in colour {
+                    put_u32(&mut p, c.to_bits());
+                }
+            }
+            POp::Unsupported { kind } => p.extend_from_slice(&kind.to_le_bytes()),
         }
-        w.extend_from_slice(&self.kind().to_le_bytes());
+        let kind = if matches!(self, POp::Unsupported { .. }) { KIND_UNSUPPORTED } else { self.kind() };
+        w.extend_from_slice(&kind.to_le_bytes());
         put_blob(w, &p);
     }
 
@@ -375,7 +418,19 @@ impl POp {
                 POp::DispatchIndirect { c, records, stride, max, count: some.then_some(count), records_va, count_va, group_base_at }
             }
             KIND_BUFFER_COPY => POp::BufferCopy { dst: p.u64()?, src: p.u64()?, bytes: p.u64()? },
-            kind => POp::Unsupported { kind },
+            KIND_DRAW => POp::Draw(Box::new(draw::get_draw(&mut p)?)),
+            KIND_CLEAR => POp::Clear(Box::new(draw::get_clear(&mut p)?)),
+            KIND_COPY => POp::Copy(Box::new(draw::get_copy(&mut p)?)),
+            KIND_READBACK => POp::Readback { src: Ref::get(&mut p)?, dst: Ref::get(&mut p)?, width: p.u32()? },
+            KIND_RESOLVE => POp::Resolve(Box::new(draw::get_resolve(&mut p)?)),
+            KIND_AMBIENT => {
+                let tex = Ref::get(&mut p)?;
+                let (mip, slice, w, h) = (p.u32()?, p.u32()?, p.u32()?, p.u32()?);
+                let colour = [f32::from_bits(p.u32()?), f32::from_bits(p.u32()?), f32::from_bits(p.u32()?)];
+                POp::Ambient { tex, mip, slice, size: [w, h], colour }
+            }
+            KIND_UNSUPPORTED => POp::Unsupported { kind: p.u16()? },
+            _ => return None,
         };
         p.done().then_some(op)
     }
@@ -399,6 +454,12 @@ impl POp {
                 out.push(*records);
                 out.extend(*count);
             }
+            POp::Draw(d) => draw::draw_refs(d, &mut out),
+            POp::Clear(c) => out.push(c.target.tex),
+            POp::Copy(c) => out.extend([c.src, c.dst]),
+            POp::Readback { src, dst, .. } => out.extend([*src, *dst]),
+            POp::Resolve(c) => out.extend([c.src, c.dst]),
+            POp::Ambient { tex, .. } => out.push(*tex),
             POp::BufferCopy { .. } | POp::Unsupported { .. } => {}
         }
         out
@@ -675,7 +736,7 @@ pub(crate) fn get_params(r: &mut Reader<'_>) -> Option<Vec<RootParam>> {
     Some(out)
 }
 
-fn put_samplers(w: &mut Vec<u8>, samplers: &[StaticSampler]) {
+pub(crate) fn put_samplers(w: &mut Vec<u8>, samplers: &[StaticSampler]) {
     put_u32(w, samplers.len() as u32);
     for s in samplers {
         for v in [
@@ -824,6 +885,8 @@ pub(crate) struct Stats {
     pub(crate) buffer_copies: u64,
     /// Ops left out (F4) by kind.
     pub(crate) unsupported: HashMap<u16, u64>,
+    /// Recorded ops by kind ([`KIND_DISPATCH`] ...).
+    pub(crate) kinds: HashMap<u16, u64>,
     pub(crate) unknown: u64,
     /// Heap entries whose address or view id nothing known holds.
     pub(crate) heap_unknown: u64,
@@ -841,6 +904,9 @@ pub(crate) struct Stats {
     pub(crate) cpu_changed_after: u64,
     pub(crate) remaps: u64,
     pub(crate) stopped: Option<String>,
+    pub(crate) graphics_pipelines: u32,
+    pub(crate) graphics_without_source: u32,
+    pub(crate) textures: draw::TexStats,
 }
 
 pub(crate) struct Recorder {
@@ -863,8 +929,16 @@ pub(crate) struct Recorder {
     samplers: HashMap<[u32; 13], u32>,
     typed: HashMap<(u64, u64, u32), u32>,
     textures: HashMap<(usize, [u32; 10], bool), u32>,
+    /// Heap texture view id → (title resource, unordered).
+    view_keys: Vec<(usize, bool)>,
     remaps_at_start: Option<u64>,
     stats: Stats,
+    tex: draw::TextureRecorder,
+    tex_stats: draw::TexStats,
+    graphics: HashMap<usize, u32>,
+    graphics_bin: Vec<u8>,
+    /// Textures the run being recorded may write.
+    pending_written: BTreeSet<u32>,
 }
 
 /// `memory.idx` record: `va u64 | len u32 | epoch u32 | offset u64 | flags u32`.
@@ -909,8 +983,14 @@ impl Recorder {
             samplers: HashMap::new(),
             typed: HashMap::new(),
             textures: HashMap::new(),
+            view_keys: Vec::new(),
             remaps_at_start: None,
             stats: Stats::default(),
+            tex: draw::TextureRecorder::new(dir)?,
+            tex_stats: draw::TexStats::default(),
+            graphics: HashMap::new(),
+            graphics_bin: Vec::new(),
+            pending_written: BTreeSet::new(),
         })
     }
 
@@ -987,6 +1067,7 @@ impl Recorder {
                     put_u32(&mut self.resources_bin, w);
                 }
                 self.resources_bin.push(key.2 as u8);
+                self.view_keys.push((key.0, key.2));
                 next
             });
             map.textures.insert(e.texture_view_id, id);
@@ -1064,10 +1145,28 @@ impl Recorder {
         }
     }
 
-    /// `ops` as package ops (F2).
-    pub(crate) fn translate(&mut self, map: &AddressMap, ops: &[Arc<MetalOp>]) -> Vec<POp> {
-        ops.iter()
-            .map(|op| match &**op {
+    /// `ops` as package ops (F2, F4).
+    pub(crate) fn translate(&mut self, map: &AddressMap, texmap: &draw::TexMap, ops: &[Arc<MetalOp>]) -> Vec<POp> {
+        let mut out = Vec::with_capacity(ops.len());
+        for op in ops {
+            let mut ctx = draw::DrawCtx {
+                map,
+                texmap,
+                textures: &mut self.tex,
+                stats: &mut self.tex_stats,
+                graphics: &mut self.graphics,
+                graphics_bin: &mut self.graphics_bin,
+                graphics_without_source: &mut self.stats.graphics_without_source,
+            };
+            let p = match &**op {
+                MetalOp::Draw(d) => ctx.draw(d).map_or(POp::Unsupported { kind: KIND_DRAW }, |d| POp::Draw(Box::new(d))),
+                MetalOp::Clear(c) => POp::Clear(Box::new(ctx.clear(c))),
+                MetalOp::Copy(c) => POp::Copy(Box::new(ctx.copy(c))),
+                MetalOp::FloatRowReadback { src, dst, offset, width } => {
+                    POp::Readback { src: ctx.tex(src), dst: map.address(dst.gpu_address + offset, Some(u64::from(*width) * 16)), width: *width }
+                }
+                MetalOp::Resolve(c) => POp::Resolve(Box::new(ctx.resolve(c))),
+                MetalOp::Ambient(a) => POp::Ambient { tex: ctx.tex(&a.parent.0), mip: a.parent.1, slice: a.parent.2, size: a.size, colour: a.colour },
                 MetalOp::Dispatch(c) => POp::Dispatch {
                     c: self.compute(map, &c.pso, c.heap.as_ref(), c.sampler_heap.as_ref(), &c.top, &c.tables),
                     groups: c.groups,
@@ -1085,36 +1184,26 @@ impl Recorder {
                     group_base_at: c.group_base_at.map(|v| v as u64),
                 },
                 MetalOp::BufferCopy { dst, src, bytes } => POp::BufferCopy { dst: *dst as u64, src: *src as u64, bytes: *bytes as u64 },
-                MetalOp::Draw(_) => POp::Unsupported { kind: KIND_DRAW },
-                MetalOp::Clear(_) => POp::Unsupported { kind: KIND_CLEAR },
-                MetalOp::Copy(_) => POp::Unsupported { kind: KIND_COPY },
-                MetalOp::FloatRowReadback { .. } => POp::Unsupported { kind: KIND_READBACK },
-                MetalOp::Resolve(_) => POp::Unsupported { kind: KIND_RESOLVE },
-                MetalOp::Ambient(_) => POp::Unsupported { kind: KIND_AMBIENT },
-            })
-            .collect()
+            };
+            out.push(p);
+        }
+        out
     }
 
     /// Snapshots the heaps `ops` bind: their layout once, then the entries
     /// and stride words that changed. Returns the title ranges their buffer
     /// entries name.
-    fn snapshot_heaps(&mut self, m: &MetalBackend, map: &AddressMap, ops: &[POp]) -> Vec<(u64, u64)> {
+    fn snapshot_heaps(&mut self, m: &MetalBackend, map: &AddressMap, ops: &[POp]) -> (Vec<(u64, u64)>, BTreeSet<u32>) {
         let mut wanted = BTreeSet::new();
         for op in ops {
-            if let POp::Dispatch { c, .. } | POp::DispatchIndirect { c, .. } = op {
-                for r in [c.heap, c.sampler_heap] {
-                    if let Ref::Heap { id, .. } = r {
-                        wanted.insert(id);
-                    }
-                }
-                for (_, r) in &c.top.refs {
-                    if let Ref::HeapStrides { id, .. } = r {
-                        wanted.insert(*id);
-                    }
+            for r in op.refs() {
+                if let Ref::Heap { id, .. } | Ref::HeapStrides { id, .. } = r {
+                    wanted.insert(id);
                 }
             }
         }
         let mut ranges = Vec::new();
+        let mut views = BTreeSet::new();
         let heaps = m.heaps.lock().unwrap_or_else(|e| e.into_inner());
         for (&key, h) in heaps.iter() {
             let Some(&id) = self.heap_ids.get(&key) else { continue };
@@ -1198,9 +1287,12 @@ impl Recorder {
                 if let Ref::Title { va, len } = e.gpu {
                     ranges.push((va, u64::from(len)));
                 }
+                if let Ref::Texture { id } = e.view {
+                    views.insert(id);
+                }
             }
         }
-        ranges
+        (ranges, views)
     }
 
     /// Before `ops` run: translates them, snapshots the heaps they bind and
@@ -1212,8 +1304,24 @@ impl Recorder {
             return Vec::new();
         }
         let map = self.address_map(m);
-        let pops = self.translate(&map, ops);
-        let mut ranges = self.snapshot_heaps(m, &map, &pops);
+        let texmap = draw::TexMap::of(m);
+        let pops = self.translate(&map, &texmap, ops);
+        let (mut ranges, views) = self.snapshot_heaps(m, &map, &pops);
+        // Textures: the ops' own, and those of the heap views they may read.
+        let mut texture_ids = BTreeSet::new();
+        let mut written = BTreeSet::new();
+        for op in &pops {
+            draw::op_textures(op, &mut texture_ids, &mut written);
+        }
+        for v in views {
+            let Some(&(key, unordered)) = self.view_keys.get(v as usize) else { continue };
+            let Some(t) = texmap.textures.get(&key) else { continue };
+            let id = self.tex.id(key, t, &mut self.tex_stats);
+            texture_ids.insert(id);
+            if unordered {
+                written.insert(id);
+            }
+        }
         for op in &pops {
             for r in op.refs() {
                 if let Ref::Title { va, len } = r {
@@ -1258,7 +1366,7 @@ impl Recorder {
                 Some(page) => page.hash != hash,
             };
             if store {
-                if self.stats.memory_bytes + len > self.cap {
+                if self.stats.memory_bytes + self.tex_stats.bytes + len > self.cap {
                     self.stats.stopped = Some(format!("memory cap ({} MiB) reached at run {}", self.cap >> 20, self.run));
                     return Vec::new();
                 }
@@ -1269,6 +1377,12 @@ impl Recorder {
             }
             seen.push((p, hash));
         }
+        let room = self.cap.saturating_sub(self.stats.memory_bytes);
+        if !self.tex.snapshot(m, &texmap, &texture_ids, self.run, room, &mut self.tex_stats) {
+            self.stats.stopped = Some(format!("cap ({} MiB) reached by textures at run {}", self.cap >> 20, self.run));
+            return Vec::new();
+        }
+        self.pending_written = written;
         self.count(&pops);
         put_run(&mut self.ops, self.run, &pops);
         self.run += 1;
@@ -1300,7 +1414,9 @@ impl Recorder {
                 POp::DispatchIndirect { .. } => self.stats.indirect += 1,
                 POp::BufferCopy { .. } => self.stats.buffer_copies += 1,
                 POp::Unsupported { kind } => *self.stats.unsupported.entry(*kind).or_default() += 1,
+                _ => {}
             }
+            *self.stats.kinds.entry(op.kind()).or_default() += 1;
         }
     }
 
@@ -1333,6 +1449,8 @@ impl Recorder {
                 page.hash = hash;
             }
         }
+        let written = std::mem::take(&mut self.pending_written);
+        self.tex.mark_written(&written);
     }
 
     /// Writes the reference (pages the GPU wrote, unchanged by the CPU
@@ -1371,7 +1489,17 @@ impl Recorder {
         let mut pipelines = b"VPKPIP01".to_vec();
         put_u32(&mut pipelines, self.stats.pipelines);
         pipelines.extend_from_slice(&self.pipelines_bin);
-        let files: [(&str, &[u8]); 6] = [
+        let mut graphics = b"VPKGFX01".to_vec();
+        put_u32(&mut graphics, self.graphics.len() as u32);
+        graphics.extend_from_slice(&self.graphics_bin);
+        self.stats.graphics_pipelines = self.graphics.len() as u32;
+        let texture_files = self.tex.finish(m, &self.dir, &mut self.tex_stats)?;
+        self.stats.textures = self.tex_stats;
+        let files: [(&str, &[u8]); 10] = [
+            ("graphics.bin", &graphics),
+            (texture_files[0].0, &texture_files[0].1),
+            (texture_files[1].0, &texture_files[1].1),
+            (texture_files[2].0, &texture_files[2].1),
             ("ops.bin", &self.ops),
             ("memory.idx", &self.memory_idx),
             ("heaps.bin", &self.heaps_bin),
@@ -1406,10 +1534,13 @@ impl Recorder {
         let mut unsupported: Vec<_> = s.unsupported.iter().collect();
         unsupported.sort();
         let unsupported = unsupported.iter().map(|(k, v)| format!("\"{k}\": {v}")).collect::<Vec<_>>().join(", ");
+        let mut kinds: Vec<_> = s.kinds.iter().collect();
+        kinds.sort();
+        let kinds = kinds.iter().map(|(k, v)| format!("\"{k}\": {v}")).collect::<Vec<_>>().join(", ");
         let samples = s.unknown_samples.iter().map(|v| format!("\"{v:#x}\"")).collect::<Vec<_>>().join(", ");
         let hashes = hashes.iter().map(|(n, h)| format!("    \"{n}\": \"{h}\"")).collect::<Vec<_>>().join(",\n");
         format!(
-            "{{\n  \"format\": \"victory-frame-package\",\n  \"version\": {VERSION},\n  \"frame\": {},\n  \"crate_version\": \"{}\",\n  \"commit\": \"{}\",\n  \"debug_assertions\": {},\n  \"diagnostics\": {},\n  \"msc_cache_key\": \"msc-4.0.3/bounds-check/v1\",\n  \"runs\": {},\n  \"ops\": {},\n  \"dispatches\": {},\n  \"indirect_dispatches\": {},\n  \"buffer_copies\": {},\n  \"unsupported_ops_by_kind\": {{{unsupported}}},\n  \"unknown_addresses\": {},\n  \"heap_unknown\": {},\n  \"unknown_samples\": [{samples}],\n  \"texture_refs_not_recorded\": {},\n  \"memory_directory_refs\": {},\n  \"pipelines\": {},\n  \"pipelines_without_source\": {},\n  \"pages\": {},\n  \"page_versions\": {},\n  \"unreadable_pages\": {},\n  \"memory_bytes\": {},\n  \"cap_bytes\": {},\n  \"heap_entries_written\": {},\n  \"reference_pages\": {},\n  \"pages_changed_by_cpu_after_last_run\": {},\n  \"remaps_under_spans_during_frame\": {},\n  \"stopped\": {},\n  \"files\": {{\n{hashes}\n  }},\n  \"env\": {{\n{env}\n  }}\n}}\n",
+            "{{\n  \"format\": \"victory-frame-package\",\n  \"version\": {VERSION},\n  \"frame\": {},\n  \"crate_version\": \"{}\",\n  \"commit\": \"{}\",\n  \"debug_assertions\": {},\n  \"diagnostics\": {},\n  \"msc_cache_key\": \"msc-4.0.3/bounds-check/v1\",\n  \"runs\": {},\n  \"ops\": {},\n  \"dispatches\": {},\n  \"indirect_dispatches\": {},\n  \"buffer_copies\": {},\n  \"ops_by_kind\": {{{kinds}}},\n  \"unsupported_ops_by_kind\": {{{unsupported}}},\n  \"unknown_addresses\": {},\n  \"heap_unknown\": {},\n  \"unknown_samples\": [{samples}],\n  \"heap_texture_view_refs\": {},\n  \"memory_directory_refs\": {},\n  \"pipelines\": {},\n  \"pipelines_without_source\": {},\n  \"pages\": {},\n  \"page_versions\": {},\n  \"unreadable_pages\": {},\n  \"memory_bytes\": {},\n  \"cap_bytes\": {},\n  \"heap_entries_written\": {},\n  \"reference_pages\": {},\n  \"pages_changed_by_cpu_after_last_run\": {},\n  \"remaps_under_spans_during_frame\": {},\n  \"stopped\": {},\n  \"graphics_pipelines\": {},\n  \"graphics_pipelines_without_source\": {},\n  \"textures\": {},\n  \"texture_versions\": {},\n  \"texture_bytes\": {},\n  \"textures_not_read\": {},\n  \"textures_with_stencil_twins\": {},\n  \"reference_textures\": {},\n  \"files\": {{\n{hashes}\n  }},\n  \"env\": {{\n{env}\n  }}\n}}\n",
             self.frame,
             env!("CARGO_PKG_VERSION"),
             option_env!("VICTORY_GIT_COMMIT").unwrap_or("unknown"),
@@ -1436,6 +1567,14 @@ impl Recorder {
             s.cpu_changed_after,
             s.remaps,
             s.stopped.as_deref().map_or_else(|| "null".to_string(), |r| format!("\"{}\"", esc(r))),
+            s.graphics_pipelines,
+            s.graphics_without_source,
+            s.textures.textures,
+            s.textures.versions,
+            s.textures.bytes,
+            s.textures.unread,
+            s.textures.twins,
+            s.textures.reference,
         )
     }
 }

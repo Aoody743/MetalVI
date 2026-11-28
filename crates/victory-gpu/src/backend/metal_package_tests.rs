@@ -5,7 +5,7 @@
 
 use super::replay::{self, Options, Package};
 use super::*;
-use crate::backend::metal::{MetalCmd, MetalDispatchIndirect};
+use crate::backend::metal::{MetalCmd, MetalDispatchIndirect, submit_checked};
 use victory_metal::ir::{DescriptorEntry, Location, ResourceType, TopLevel};
 
 // --- CPU: the format -------------------------------------------------------
@@ -487,4 +487,438 @@ fn replay_package() {
         println!("  page {va:#x}: {n} bytes differ, first at {first:#x}");
     }
     assert_eq!(report.failed_run, None);
+}
+
+// --- F4: the draw-side ops ---------------------------------------------------
+
+fn sample_attachment(id: u32, pixel: u32) -> draw::PAttachment {
+    draw::PAttachment { tex: Ref::Tex { id, view: draw::VIEW_SELF }, pixel, level: 1, slice: 2, width: 64, height: 32, samples: 1, companion: id == 2, twin: false }
+}
+
+#[test]
+fn draw_ops_round_trip() {
+    use draw::{PClear, PCopy, PDraw, PDrawKind, PResolve, PStage, PTargets};
+    let stage = PStage {
+        bind: 1,
+        top: PTop { raw: vec![1, 2, 3, 4, 0, 0, 0, 0], refs: vec![(4, Ref::Template)] },
+        tables: vec![(8, TEntry { gpu: Ref::Title { va: 0x5000, len: 64 }, view: Ref::Null, metadata: 64 })],
+        heap: Ref::Heap { id: 0, offset: 0 },
+        sampler_heap: Ref::Heap { id: 1, offset: 0 },
+    };
+    let kinds = [
+        PDrawKind::Vertices { count: 3, instances: 1, first: 0, first_instance: 0 },
+        PDrawKind::Indexed { count: 6, instances: 2, base: -4, first_instance: 1, buffer: Ref::Title { va: 0x6000, len: 12 }, index_type: 0 },
+        PDrawKind::Mesh { groups: [4, 1, 1] },
+        PDrawKind::Generated { indices: vec![0, 1, 2, 0, 2, 3], instances: 1, base: 7, first_instance: 0 },
+        PDrawKind::Indirect {
+            records: Ref::Title { va: 0x7000, len: 40 },
+            records_va: 0x7000,
+            stride: 20,
+            max: 2,
+            count: Some(Ref::Title { va: 0x7100, len: 4 }),
+            count_va: Some(0x7100),
+            index: Some((Ref::Title { va: 0x8000, len: 1024 }, 1, 256)),
+        },
+    ];
+    let mut ops: Vec<POp> = kinds
+        .into_iter()
+        .map(|kind| {
+            let mut targets = PTargets { stencil: true, width: 64, height: 32, samples: 1, ..Default::default() };
+            targets.colors[0] = Some(sample_attachment(0, 70));
+            targets.colors[3] = Some(draw::PAttachment { tex: Ref::Tex { id: 1, view: draw::VIEW_TARGET | 71 }, ..sample_attachment(1, 71) });
+            targets.depth = Some(draw::PAttachment { tex: Ref::Tex { id: 2, view: draw::VIEW_COMPANION }, ..sample_attachment(2, 252) });
+            POp::Draw(Box::new(PDraw {
+                pipeline: 3,
+                targets,
+                stages: vec![stage.clone()],
+                vertex: Some(vec![(Ref::Title { va: 0x9000, len: 48 }, 48, 16), (Ref::Null, 0, 0)]),
+                viewport: [0.0, 0.0, 64.0, 32.0, 0.0, 1.0],
+                scissor: [0, 0, 64, 32],
+                blend: [0.5, 0.25, 1.0, 0.0],
+                stencil_ref: 3,
+                primitive: 3,
+                kind,
+            }))
+        })
+        .collect();
+    ops.push(POp::Clear(Box::new(PClear { target: sample_attachment(0, 70), color: Some([0.1, 0.2, 0.3, 1.0]), depth: None, stencil: None, has_stencil: false, rects: vec![[0, 0, 8, 8], [8, 8, 16, 16]] })));
+    ops.push(POp::Clear(Box::new(PClear { target: sample_attachment(2, 260), color: None, depth: Some(1.0), stencil: Some(5), has_stencil: true, rects: Vec::new() })));
+    ops.push(POp::Copy(Box::new(PCopy {
+        src: Ref::Tex { id: 0, view: 0 },
+        dst: Ref::Tex { id: 4, view: 0 },
+        whole: false,
+        src_slice: 1,
+        src_level: 2,
+        src_origin: [1, 2, 0],
+        size: [8, 8, 1],
+        dst_slice: 0,
+        dst_level: 0,
+        dst_origin: [4, 4, 0],
+    })));
+    ops.push(POp::Readback { src: Ref::Tex { id: 5, view: 0 }, dst: Ref::Title { va: 0xa000, len: 80 }, width: 5 });
+    ops.push(POp::Resolve(Box::new(PResolve { src: Ref::Tex { id: 6, view: 0 }, src_slice: 0, dst: Ref::Tex { id: 0, view: 0 }, dst_level: 0, dst_slice: 1, format: 70, region: Some([0, 0, 2, 2, 8, 8]) })));
+    ops.push(POp::Ambient { tex: Ref::Tex { id: 7, view: 0 }, mip: 1, slice: 0, size: [32, 16], colour: [0.1, 0.2, 0.3] });
+    ops.push(POp::Unsupported { kind: KIND_DRAW });
+    let mut file = OPS_MAGIC.to_vec();
+    put_u32(&mut file, VERSION);
+    put_run(&mut file, 0, &ops);
+    let runs = get_runs(&file).unwrap();
+    assert_eq!(runs[0].1, ops);
+    // Their references are all seen (heap snapshots and texture lists use them).
+    let refs: Vec<Ref> = ops.iter().flat_map(|o| o.refs()).collect();
+    assert!(refs.contains(&Ref::Tex { id: 2, view: draw::VIEW_COMPANION }));
+    assert!(refs.contains(&Ref::Title { va: 0x8000, len: 1024 }));
+    assert!(refs.contains(&Ref::Title { va: 0x9000, len: 48 }));
+    let (mut ids, mut written) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    for op in &ops {
+        draw::op_textures(op, &mut ids, &mut written);
+    }
+    assert_eq!(ids.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 4, 5, 6, 7]);
+    assert_eq!(written.into_iter().collect::<Vec<_>>(), vec![0, 1, 2, 4, 7]);
+}
+
+/// A position-from-vertex-table vertex shader and a flat colour fragment
+/// shader, with MSC's bindings (top level at 2, vertex table at 6).
+const FLAT: &str = "#include <metal_stdlib>
+using namespace metal;
+struct VTop { float4 color; float z; float x0; float y0; float size; };
+struct VEntry { const device float2 *pos; uint length; uint stride; };
+struct VOut { float4 pos [[position]]; float4 color; };
+vertex VOut vs_flat(uint vid [[vertex_id]], constant VTop &top [[buffer(2)]], constant VEntry *vt [[buffer(6)]]) {
+    float2 p = vt[0].pos[vid] * top.size + float2(top.x0, top.y0);
+    VOut o; o.pos = float4(p, top.z, 1.0); o.color = top.color; return o;
+}
+fragment float4 fs_flat(VOut in [[stage_in]]) { return in.color; }";
+
+const K_RT: usize = 0x7e57_1001;
+const K_DEPTH: usize = 0x7e57_1002;
+const K_COPY: usize = 0x7e57_1003;
+const K_SRC: usize = 0x7e57_1004;
+const K_AMB: usize = 0x7e57_1005;
+
+/// A title texture the way `make_texture` makes one (DXGI `format`, D3D12
+/// `flags`), in the backend's table under `key`.
+fn title_texture(backend: &MetalBackend, key: usize, format: u32, flags: u32, pixel: victory_metal::sys::WMTPixelFormat, size: u32) -> Arc<crate::backend::metal_texture::MetalTexture> {
+    // SAFETY: an integer-only C record.
+    let mut desc: crate::resource::ResourceDesc = unsafe { std::mem::zeroed() };
+    desc.dimension = 3;
+    desc.width = u64::from(size);
+    desc.height = size;
+    desc.depth_or_array_size = 1;
+    desc.mip_levels = 1;
+    desc.format = format;
+    desc.sample_count = 1;
+    desc.flags = flags;
+    let mut usage = 1 | 0x10;
+    if flags & 4 != 0 {
+        usage |= 2;
+    }
+    if flags & 3 != 0 {
+        usage |= 4;
+    }
+    let texture = backend
+        .device
+        .new_texture(&victory_metal::texture::TextureDescriptor {
+            pixel_format: pixel,
+            width: size,
+            height: size,
+            usage: victory_metal::sys::WMTTextureUsage(usage),
+            options: victory_metal::sys::WMTResourceOptions(0x20),
+            ..Default::default()
+        })
+        .unwrap();
+    backend.add_resident(&[texture.handle()]);
+    let t = Arc::new(crate::backend::metal_texture::MetalTexture { texture, pixel, desc, mips: 1, slices: 1, companion: Default::default(), twin: None });
+    backend.textures.lock().unwrap().insert(key, Some(t.clone()));
+    t
+}
+
+fn fill_r8(backend: &MetalBackend, t: &victory_metal::texture::Texture, value: u8) {
+    let staging = backend.device.shared_buffer(&[value; 256 * 4]).unwrap();
+    let cb = backend.queue.command_buffer().unwrap();
+    let mut blit = cb.blit_encoder().unwrap();
+    blit.copy_from_buffer_to_texture(&staging, 0, 256, 256 * 4, [4, 4, 1], t, 0, 0, [0, 0, 0]);
+    blit.finish();
+    submit_checked(&cb, &[], true, "test fill").unwrap();
+}
+
+/// F4: two runs of clears, draws (an MSC pipeline sampling a heap texture
+/// view through a static sampler; a Metal one reading positions from title
+/// memory through the vertex table, direct and indexed, depth tested), a
+/// texture copy and the ambient stand-in, recorded, freed, and replayed in a
+/// new backend: every texture the frame wrote must come out identical.
+#[test]
+fn synthetic_draw_package_replays_pixel_identical() {
+    use crate::backend::metal_draw::{Attachment, DrawKind, MetalClear, MetalDraw, MetalGraphics, MetalTexCopy, STAGE_FRAGMENT, STAGE_VERTEX, StageBind, Targets, VertexFetch};
+    use victory_metal::msc::{self, RootParam, Stage, StaticSampler};
+    use victory_metal::render::{ColorDesc, DepthStencilDesc, RenderPipelineDesc};
+    use victory_metal::sys::{WMTPixelFormat as P, WMTScissorRect, WMTViewport};
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+    let dir_dxil = dxil_dir().expect("F85 DXIL fixtures required");
+    let _pool = victory_metal::Pool::new();
+    let dir = std::env::temp_dir().join(format!("t3-framepkg-draw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Title memory (positions, indices) in the middle of a reservation.
+    // SAFETY: a fresh reservation, released before the replay.
+    let reserved = unsafe { VirtualAlloc(std::ptr::null(), 32 << 20, MEM_RESERVE, PAGE_READWRITE) } as u64;
+    assert_ne!(reserved, 0);
+    let title = reserved + (16 << 20);
+    // SAFETY: inside the reservation.
+    assert_eq!(unsafe { VirtualAlloc(title as *const core::ffi::c_void, (2 * PAGE) as usize, MEM_COMMIT, PAGE_READWRITE) } as u64, title);
+    let positions = title as *mut [f32; 2];
+    let indices = (title + PAGE) as *mut u16;
+    // SAFETY: inside the committed pages.
+    unsafe {
+        positions.cast::<[[f32; 2]; 3]>().write([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]]);
+        indices.cast::<[u16; 3]>().write([2, 1, 0]);
+    }
+    let stats;
+    {
+        let backend = MetalBackend::new().unwrap();
+        let rt = title_texture(&backend, K_RT, 28, 1, P::WMTPixelFormatRGBA8Unorm, 16);
+        let depth = title_texture(&backend, K_DEPTH, 40, 2, P::WMTPixelFormatDepth32Float, 16);
+        let copy = title_texture(&backend, K_COPY, 28, 1, P::WMTPixelFormatRGBA8Unorm, 16);
+        let src = title_texture(&backend, K_SRC, 61, 0, P::WMTPixelFormatR8Unorm, 4);
+        let amb = title_texture(&backend, K_AMB, 42, 4, P::WMTPixelFormatR32Uint, 16);
+        fill_r8(&backend, &src.texture, 200);
+        let attach = |t: &crate::backend::metal_texture::MetalTexture, key: usize| Attachment {
+            resource: key,
+            texture: t.texture.clone(),
+            pixel: t.pixel.0,
+            level: 0,
+            slice: 0,
+            width: 16,
+            height: 16,
+            samples: 1,
+            companion: None,
+            twin: None,
+        };
+        let mut targets = Targets::default();
+        targets.colors[0] = Some(attach(&rt, K_RT));
+        targets.depth = Some(attach(&depth, K_DEPTH));
+        targets.finish();
+        let targets = Arc::new(targets);
+        let mut desc = RenderPipelineDesc { sample_count: 1, topology_class: 3, depth_format: P::WMTPixelFormatDepth32Float.0, ..Default::default() };
+        desc.colors[0] = ColorDesc { pixel_format: P::WMTPixelFormatRGBA8Unorm.0, write_mask: 0xf, ..Default::default() };
+
+        // The MSC pipeline: full-target triangle sampling heap slot 5.
+        let vs = msc::convert(&std::fs::read(dir_dxil.join("vs_main.dxil")).unwrap(), Stage::Vertex, &[], &[]).unwrap();
+        let ps_params = [RootParam::Constants { register: 0, space: 0, num: 4 }];
+        let point = StaticSampler { filter: 0, address_u: 3, address_v: 3, address_w: 3, max_anisotropy: 1, comparison_func: 1, max_lod: 1000.0, ..Default::default() };
+        let ps = msc::convert(&std::fs::read(dir_dxil.join("ps_static.dxil")).unwrap(), Stage::Fragment, &ps_params, &[point]).unwrap();
+        let mut ps_top = ps.top_level.clone();
+        backend.bind_static_samplers(&mut ps_top, ps_params.len(), &[point]).unwrap();
+        let always = DepthStencilDesc { depth_compare: 7, depth_write: false, ..Default::default() };
+        let sample_pso = {
+            let (vl, pl) = (backend.device.library(&vs.metallib).unwrap(), backend.device.library(&ps.metallib).unwrap());
+            backend.device.render_pipeline_desc((&vl, &vs.entry), Some((&pl, &ps.entry)), &desc).unwrap()
+        };
+        let sample = Arc::new(MetalGraphics {
+            cost_ns: Default::default(),
+            name: "sample heap view".into(),
+            pso: sample_pso,
+            dss: backend.device.depth_stencil_state(&always).unwrap(),
+            depth_write: false,
+            raster: [0, 0, 0, 1],
+            bias: [0.0; 3],
+            stages: vec![(vs.top_level.clone(), STAGE_VERTEX), (ps_top.clone(), STAGE_FRAGMENT)],
+            vertex_slots: 0,
+            mesh: false,
+            mesh_threads: [1; 3],
+            geometry: None,
+            colors: [P::WMTPixelFormatRGBA8Unorm.0, 0, 0, 0, 0, 0, 0, 0],
+            depth: P::WMTPixelFormatDepth32Float.0,
+            stencil: 0,
+            samples: 1,
+        });
+        draw::register_graphics(&sample, draw::GraphicsSource {
+            vertex: Some((draw::Lib::Metallib(vs.metallib.clone()), vs.entry.clone())),
+            fragment: Some((draw::Lib::Metallib(ps.metallib.clone()), ps.entry.clone())),
+            mesh: None,
+            stage_in: None,
+            desc,
+            dss: always,
+            static_samplers: vec![(STAGE_FRAGMENT, ps_params.len() as u32, vec![point])],
+        });
+        // The flat pipeline: depth tested and written.
+        let less = DepthStencilDesc { depth_compare: 1, depth_write: true, ..Default::default() };
+        let flat_lib = backend.device.library_msl(FLAT).unwrap();
+        let vtop = TopLevel::new(vec![Location { kind: ResourceType::Constant, space: 0, slot: 0, offset: 0, size: 32 }], 32);
+        let flat = Arc::new(MetalGraphics {
+            cost_ns: Default::default(),
+            name: "flat".into(),
+            pso: backend.device.render_pipeline_desc((&flat_lib, "vs_flat"), Some((&flat_lib, "fs_flat")), &desc).unwrap(),
+            dss: backend.device.depth_stencil_state(&less).unwrap(),
+            depth_write: true,
+            raster: [0, 0, 0, 1],
+            bias: [0.0; 3],
+            stages: vec![(vtop.clone(), STAGE_VERTEX)],
+            vertex_slots: 1,
+            mesh: false,
+            mesh_threads: [1; 3],
+            geometry: None,
+            colors: [P::WMTPixelFormatRGBA8Unorm.0, 0, 0, 0, 0, 0, 0, 0],
+            depth: P::WMTPixelFormatDepth32Float.0,
+            stencil: 0,
+            samples: 1,
+        });
+        draw::register_graphics(&flat, draw::GraphicsSource {
+            vertex: Some((draw::Lib::Msl(FLAT.into()), "vs_flat".into())),
+            fragment: Some((draw::Lib::Msl(FLAT.into()), "fs_flat".into())),
+            mesh: None,
+            stage_in: None,
+            desc,
+            dss: less,
+            static_samplers: Vec::new(),
+        });
+
+        // The heaps: slot 5 a view of the source texture; one sampler.
+        let srv_words = [61u32, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        let view = backend.texture_entry(K_SRC as crate::object::This, Some(&srv_words), false).unwrap();
+        let heap = backend.new_heap(16, false).unwrap();
+        let sheap = backend.new_heap(4, true).unwrap();
+        let sampler = backend.sampler_entry(&[0u32, 3, 3, 3, 0, 1, 1, 0, 0, 0, 0, 0, 1000f32.to_bits()]).unwrap();
+        // SAFETY: inside the heaps' entries.
+        unsafe {
+            heap.entries.add(5).write(view);
+            sheap.entries.add(0).write(sampler);
+        }
+        let (heap_buf, sheap_buf) = (heap.buffer.clone(), sheap.buffer.clone());
+        backend.heaps.lock().unwrap().insert(0x7e57_0b01, heap);
+        backend.heaps.lock().unwrap().insert(0x7e57_0b02, sheap);
+
+        let viewport = WMTViewport { originX: 0.0, originY: 0.0, width: 16.0, height: 16.0, znear: 0.0, zfar: 1.0 };
+        let scissor = WMTScissorRect { x: 0, y: 0, width: 16, height: 16 };
+        let sample_draw = || {
+            let mut top = ps_top.clone();
+            assert!(top.set_constants(0, 0, &[5, 0, 0, 0]));
+            let stage = |bind, top: Vec<u8>| StageBind { bind, top, tables: Vec::new(), heap: Some(heap_buf.clone()), sampler_heap: Some(sheap_buf.clone()) };
+            Arc::new(MetalOp::Draw(MetalDraw {
+                trace_inputs: Vec::new(),
+                pso: sample.clone(),
+                targets: targets.clone(),
+                stages: vec![stage(STAGE_VERTEX, vs.top_level.bytes.clone()), stage(STAGE_FRAGMENT, top.bytes)],
+                vertex: None,
+                viewport,
+                scissor,
+                blend: [1.0; 4],
+                stencil_ref: 0,
+                primitive: 3,
+                kind: DrawKind::Vertices { count: 3, instances: 1, first: 0, first_instance: 0 },
+            }))
+        };
+        let flat_draw = |color: [f32; 4], z: f32, at: [f32; 2], size: f32, indexed: bool| {
+            let mut top = vtop.clone();
+            let words: Vec<u32> = color.iter().chain(&[z, at[0], at[1], size]).map(|f| f.to_bits()).collect();
+            assert!(top.set_constants(0, 0, &words));
+            let (vb, vo) = backend.chunks().window_buffer(title, 24).unwrap();
+            let mut table = [0u8; msc::VERTEX_TABLE_SLOTS * 16];
+            table[..8].copy_from_slice(&(vb.gpu_address + vo).to_le_bytes());
+            table[8..12].copy_from_slice(&24u32.to_le_bytes());
+            table[12..16].copy_from_slice(&8u32.to_le_bytes());
+            let kind = if indexed {
+                let (ib, io) = backend.chunks().window_buffer(title + PAGE, 6).unwrap();
+                DrawKind::Indexed { count: 3, instances: 1, base: 0, first_instance: 0, buffer: ib, offset: io as u32, index_type: 0 }
+            } else {
+                DrawKind::Vertices { count: 3, instances: 1, first: 0, first_instance: 0 }
+            };
+            Arc::new(MetalOp::Draw(MetalDraw {
+                trace_inputs: Vec::new(),
+                pso: flat.clone(),
+                targets: targets.clone(),
+                stages: vec![StageBind { bind: STAGE_VERTEX, top: top.bytes, tables: Vec::new(), heap: None, sampler_heap: None }],
+                vertex: Some(Box::new(VertexFetch { table, _buffers: vec![vb] })),
+                viewport,
+                scissor,
+                blend: [1.0; 4],
+                stencil_ref: 0,
+                primitive: 3,
+                kind,
+            }))
+        };
+        let clear_colour = Arc::new(MetalOp::Clear(MetalClear { target: attach(&rt, K_RT), color: Some([0.1, 0.2, 0.3, 1.0]), depth: None, stencil: None, has_stencil: false, rects: Vec::new() }));
+        let clear_depth = Arc::new(MetalOp::Clear(MetalClear { target: attach(&depth, K_DEPTH), color: None, depth: Some(1.0), stencil: None, has_stencil: false, rects: Vec::new() }));
+        let run1 = vec![
+            clear_colour,
+            clear_depth,
+            sample_draw(),
+            flat_draw([1.0, 0.0, 0.0, 1.0], 0.5, [-1.0, -1.0], 1.5, false),
+            flat_draw([0.0, 1.0, 0.0, 1.0], 0.7, [-0.5, -0.5], 1.5, true),
+        ];
+        let ambient = crate::backend::metal_ambient::MetalAmbient::new(&amb, None, 0.5).expect("R32Uint UAV ambient view");
+        let run2 = vec![
+            sample_draw(),
+            flat_draw([0.0, 0.0, 1.0, 1.0], 0.2, [0.0, -1.0], 1.0, false),
+            Arc::new(MetalOp::Copy(MetalTexCopy {
+                src: rt.clone(),
+                dst: copy.clone(),
+                whole: true,
+                src_slice: 0,
+                src_level: 0,
+                src_origin: [0; 3],
+                size: [16, 16, 1],
+                dst_slice: 0,
+                dst_level: 0,
+                dst_origin: [0; 3],
+            })),
+            Arc::new(MetalOp::Ambient(ambient)),
+        ];
+        let mut rec = Recorder::new(&dir, 9, 64 << 20).unwrap();
+        let seen = rec.before(&backend, &run1);
+        assert!(backend.run(&run1));
+        rec.after(&seen);
+        // The CPU between the runs: the title-filled source texture and a
+        // vertex change.
+        fill_r8(&backend, &src.texture, 90);
+        // SAFETY: inside the committed page; the GPU is idle.
+        unsafe { positions.add(1).write([0.5, 0.0]) };
+        let seen = rec.before(&backend, &run2);
+        assert!(backend.run(&run2));
+        rec.after(&seen);
+        stats = rec.finish(Some(&backend)).unwrap();
+        println!("recorded: {stats:?}");
+        drop((run1, run2));
+    }
+    // SAFETY: nothing uses the reservation any more.
+    assert_ne!(unsafe { VirtualFree(reserved as *mut core::ffi::c_void, 0, MEM_RELEASE) }, 0);
+
+    assert_eq!((stats.runs, stats.ops), (2, 9));
+    assert_eq!(stats.kinds.get(&KIND_DRAW), Some(&5));
+    assert_eq!(stats.kinds.get(&KIND_CLEAR), Some(&2));
+    assert_eq!((stats.kinds.get(&KIND_COPY), stats.kinds.get(&KIND_AMBIENT)), (Some(&1), Some(&1)));
+    assert!(stats.unsupported.is_empty());
+    assert_eq!(stats.unknown + stats.heap_unknown, 0, "unknown: {:x?}", stats.unknown_samples);
+    assert_eq!((stats.graphics_pipelines, stats.graphics_without_source), (2, 0));
+    assert_eq!(stats.textures.textures, 5);
+    assert_eq!(stats.textures.unread, 0);
+    assert_eq!(stats.textures.versions, 6, "five textures, and the source again after the CPU changed it");
+    assert_eq!(stats.textures.reference, 4, "target, depth, copy and ambient textures");
+    assert!(stats.stopped.is_none());
+
+    let pkg = Package::open(&dir).unwrap();
+    // The reference target: run 2's full-target draw sampled the source as
+    // the CPU left it (90), the blue triangle in front of it.
+    {
+        let rt_id = pkg.texture_defs.iter().find(|d| d.key == K_RT as u64).unwrap().id;
+        let r = pkg.texture_reference.iter().find(|r| r.id == rt_id).unwrap();
+        let bin = std::fs::read(dir.join("reference").join("textures.bin")).unwrap();
+        let px: std::collections::BTreeSet<[u8; 4]> = bin[r.offset as usize..(r.offset + r.len) as usize].chunks_exact(4).map(|p| p.try_into().unwrap()).collect();
+        println!("reference target colours: {px:?}");
+        assert!(px.contains(&[90, 0, 0, 255]) && px.contains(&[0, 0, 255, 255]), "{px:?}");
+    }
+    replay::place(&pkg).unwrap_or_else(|e| panic!("cannot place the title memory: {e}"));
+    let backend = MetalBackend::new().unwrap();
+    let report = replay::replay(&backend, &pkg, &Options::default()).unwrap();
+    println!("replay: {report:?}");
+    assert_eq!(report.failed_run, None);
+    assert_eq!((report.runs, report.ops_run), (2, 9));
+    assert_eq!((report.graphics_built, report.textures_made, report.texture_uploads), (2, 5, 6));
+    assert!(report.graphics_errors.is_empty() && report.texture_errors.is_empty(), "{report:?}");
+    assert_eq!(report.skipped_unsupported + report.skipped_no_pipeline + report.skipped_memory_directory + report.skipped_unmapped + report.skipped_texture, 0);
+    assert_eq!(report.zeroed_unknown + report.zeroed_texture + report.unmapped_title, 0);
+    let cmp = replay::compare_textures(&backend, &pkg).unwrap();
+    println!("textures: {cmp:?}");
+    assert_eq!(cmp.pages, 4);
+    assert!(cmp.differing.is_empty(), "textures differ (id, first byte, bytes): {:?}", cmp.differing);
+    let _ = std::fs::remove_dir_all(&dir);
 }

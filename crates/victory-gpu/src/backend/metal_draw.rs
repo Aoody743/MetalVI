@@ -110,6 +110,7 @@ impl MetalBackend {
             }
         }
         let made = made.ok().map(Arc::new);
+        super::metal::package::draw::note_graphics(&made, p, rects);
         self.graphics.lock().unwrap_or_else(|e| e.into_inner()).insert((key, rects), made.clone());
         made
     }
