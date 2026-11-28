@@ -17,7 +17,7 @@ use victory_metal::msc::{Converted, Stage, convert};
 use victory_shader::HwStage;
 use victory_shader::emit::HostShader;
 
-use super::metal::{convert_cached, msc_cache_path, root_params, static_samplers};
+use super::metal::{cached_usable, convert_cached, msc_cache_path, root_params, static_samplers};
 
 /// Shader stages that the Metal backend caches as `.vmsc` files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,6 +37,16 @@ impl WarmStage {
             HwStage::Ps => Some(Self::Fragment),
             HwStage::Ms => Some(Self::Mesh),
             HwStage::Ls | HwStage::Hs | HwStage::Es | HwStage::Gs => None,
+        }
+    }
+
+    /// The converter stage.
+    pub fn msc(self) -> Stage {
+        match self {
+            Self::Compute => Stage::Compute,
+            Self::Vertex => Stage::Vertex,
+            Self::Fragment => Stage::Fragment,
+            Self::Mesh => Stage::Mesh,
         }
     }
 
@@ -168,9 +178,7 @@ pub fn warm_host_shader(host: &HostShader, thread_id: usize) -> Result<WarmOutco
     let path = stage
         .cache_path(host)
         .ok_or_else(|| "no Metal cache directory configured (set VICTORY_METAL_CACHE or VICTORY_CACHE_DIR)".to_owned())?;
-    if let Ok(bytes) = crate::read_file(&path)
-        && Converted::from_bytes(&bytes).is_some()
-    {
+    if already_cached(stage, &path) {
         return Ok(WarmOutcome::AlreadyCached(path));
     }
     match stage {
@@ -196,6 +204,17 @@ pub fn warm_host_shader(host: &HostShader, thread_id: usize) -> Result<WarmOutco
         }
     }
     Ok(WarmOutcome::Converted(path))
+}
+
+/// Whether `path` holds a conversion the game would use as it is (the
+/// rule of `convert_cached`): a `.Mesh.vmsc` without its threadgroup size,
+/// left by an older converter library, is converted again. Warm used to
+/// count any readable file as cached, so the game redid those at run time.
+fn already_cached(stage: WarmStage, path: &Path) -> bool {
+    crate::read_file(path)
+        .ok()
+        .and_then(|bytes| Converted::from_bytes(&bytes))
+        .is_some_and(|c| cached_usable(stage.msc(), &c))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -463,6 +482,29 @@ mod tests {
 
         let base_ms = msc_cache_path(&ms.dxil, &root_params(&ms), &static_samplers(&ms)).unwrap();
         assert_eq!(WarmStage::Mesh.cache_path(&ms).unwrap(), base_ms.with_extension("Mesh.vmsc"));
+    }
+
+    /// A mesh conversion without its threadgroup size (older converter
+    /// library) is not "already cached": warm converts it again, as the
+    /// game would. Other stages keep a zero threadgroup (they have none).
+    #[test]
+    fn stale_mesh_conversions_are_not_cached() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = |threadgroup: [u32; 3]| Converted {
+            metallib: vec![1, 2, 3],
+            entry: "main".into(),
+            threadgroup,
+            top_level: victory_metal::ir::TopLevel::new(Vec::new(), 0),
+        };
+        let path = dir.path().join("a.Mesh.vmsc");
+        std::fs::write(&path, entry([0, 0, 0]).to_bytes()).unwrap();
+        assert!(!already_cached(WarmStage::Mesh, &path), "stale mesh entry");
+        assert!(already_cached(WarmStage::Fragment, &path), "fragment stages have no threadgroup");
+        std::fs::write(&path, entry([128, 1, 1]).to_bytes()).unwrap();
+        assert!(already_cached(WarmStage::Mesh, &path));
+        std::fs::write(&path, b"VMSC0001 broken").unwrap();
+        assert!(!already_cached(WarmStage::Vertex, &path));
+        assert!(!already_cached(WarmStage::Compute, &dir.path().join("missing.vmsc")));
     }
 
     #[test]
