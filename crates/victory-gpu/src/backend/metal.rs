@@ -1386,7 +1386,7 @@ impl MetalBackend {
                 let Ok(next) = self.queue.command_buffer() else { return false };
                 next.encode_wait_for_event(split_event, value);
                 let total = work::SPLITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                tracing::info!(total, reason, ops = i - cb_start, "Metal: command buffer split");
+                tracing::info!(total, reason, ops = i - cb_start, first = work::kind(&ops[cb_start]), "Metal: command buffer split");
                 cb = next;
                 cb_start = i;
             }

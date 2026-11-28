@@ -55,31 +55,75 @@ fn indirect(op: &MetalOp) -> bool {
     matches!(op, MetalOp::DispatchIndirect(_)) || matches!(op, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }))
 }
 
-/// Indirect operations whose GPU time was measured alone in a command buffer: the
-/// longest such time by pipeline (its `cost_ns` cell's address). An indirect
-/// operation's count comes from the GPU, so no per-unit cost is learnt from it;
-/// without this it kept the bootstrap estimate (a whole window) for ever and ran
-/// alone, waited for, every time: ~3400 of 4150 command buffers of a 3D stall
-/// batch, at ~0.65 ms each (submit-overhead-20261128). The estimate is twice the
-/// longest time seen; the clamp bounds its records and the fuse its measured time.
-/// Off unless `VICTORY_METAL_INDIRECT_LEARN=1`: one run with it
-/// (stage-r-m3c-learn-20261128-041531) halved the stall batches (4225 ops in
-/// 1.16 s against 2.37 s) but stalled elsewhere before 3D; not yet shown better.
-static INDIRECT_MAX_NS: std::sync::Mutex<Option<HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+/// A short name of an operation's kind, for the split log.
+pub(super) fn kind(op: &MetalOp) -> &'static str {
+    match op {
+        MetalOp::Dispatch(_) => "dispatch",
+        MetalOp::DispatchIndirect(_) => "dispatch indirect",
+        MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }) => "draw indirect",
+        MetalOp::Draw(_) => "draw",
+        MetalOp::Clear(_) => "clear",
+        MetalOp::Copy(_) => "texture copy",
+        MetalOp::FloatRowReadback { .. } => "readback",
+        MetalOp::BufferCopy { .. } => "CPU buffer copy",
+        MetalOp::Resolve(_) => "resolve",
+    }
+}
 
-fn indirect_learn() -> bool {
+/// Operations whose cost is not a per-unit time: indirect ones (their count
+/// comes from the GPU) by pipeline (its `cost_ns` cell's address), and
+/// clears, texture copies, resolves and readbacks by kind (small keys no
+/// address takes). Their longest GPU time seen alone in a command buffer.
+///
+/// Without this they kept the bootstrap estimate (a whole window) for ever
+/// and each ran alone in a command buffer, waited for: ~250,000 one-operation
+/// command buffers at ~0.6 ms each made the 150 s loading stalls before 3D
+/// (stage-r-m4-trace1200-20261128-042456: 76 slow batches, 75 s encoding and
+/// waiting, 0.26 s GPU). The estimate is twice the longest time seen; the
+/// clamp bounds indirect records and the fuse every measured time.
+/// `VICTORY_METAL_INDIRECT_LEARN=0` restores the old estimates.
+static SOLO_MAX_NS: std::sync::Mutex<Option<HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+
+fn solo_learn() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_LEARN").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_LEARN").as_deref() != Ok("0"))
+}
+
+fn solo_key(op: &MetalOp) -> Option<usize> {
+    if indirect(op) {
+        return profile(op).map(|(cost, _)| std::ptr::from_ref(cost) as usize);
+    }
+    match op {
+        MetalOp::Clear(_) => Some(1),
+        MetalOp::Copy(_) => Some(2),
+        MetalOp::Resolve(_) => Some(3),
+        MetalOp::FloatRowReadback { .. } => Some(4),
+        _ => None,
+    }
+}
+
+fn solo_estimate(op: &MetalOp) -> Option<u64> {
+    solo_key(op).map(solo_estimate_of)
+}
+
+fn solo_estimate_of(key: usize) -> u64 {
+    let seen = solo_learn()
+        .then(|| SOLO_MAX_NS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&key).copied())
+        .flatten();
+    seen.map_or(WINDOW_NS, |ns| ns.saturating_mul(2).max(100_000))
+}
+
+fn solo_learn_time(key: usize, ns: u64) {
+    let mut map = SOLO_MAX_NS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry(key).or_insert(0);
+    *e = (*e).max(ns);
 }
 
 fn estimate(op: &MetalOp) -> Option<u64> {
-    let (cost, units) = profile(op)?;
-    if indirect(op) {
-        let seen = indirect_learn()
-            .then(|| INDIRECT_MAX_NS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&(std::ptr::from_ref(cost) as usize)).copied())
-            .flatten();
-        return Some(seen.map_or(WINDOW_NS, |ns| ns.saturating_mul(2).max(100_000)));
+    if let Some(ns) = solo_estimate(op) {
+        return Some(ns);
     }
+    let (cost, units) = profile(op)?;
     let measured = cost.load(Ordering::Relaxed);
     // Bootstrap only. Neither an estimate nor an observed time is a WCET.
     Some(if measured == 0 { WINDOW_NS } else { units.saturating_mul(measured).max(100_000) })
@@ -91,18 +135,16 @@ pub(super) fn reservation(ops: &[Arc<MetalOp>]) -> u64 {
 }
 
 pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
-    let Some((cost, _)) = ops.first().and_then(|op| profile(op)) else { return };
-    // An indirect operation alone in its command buffer: its whole time.
+    // An operation without a per-unit cost alone in its command buffer: its whole time.
     if let [op] = ops
-        && indirect(op)
         && ns != 0
-        && indirect_learn()
+        && solo_learn()
+        && let Some(key) = solo_key(op)
     {
-        let mut map = INDIRECT_MAX_NS.lock().unwrap_or_else(|e| e.into_inner());
-        let e = map.get_or_insert_with(HashMap::new).entry(std::ptr::from_ref(cost) as usize).or_insert(0);
-        *e = (*e).max(ns);
+        solo_learn_time(key, ns);
         return;
     }
+    let Some((cost, _)) = ops.first().and_then(|op| profile(op)) else { return };
     // Do not attribute a mixed command buffer's time to a particular pipeline,
     // or learn from a GPU argument count that was only a reserved maximum.
     let units = ops.iter().try_fold(0u64, |sum, op| {
@@ -271,6 +313,20 @@ pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_
             }
         }
     }
+}
+
+#[test]
+fn an_operation_seen_alone_is_estimated_from_its_longest_time() {
+    // A key no operation kind or pipeline address uses.
+    const KEY: usize = 99;
+    assert_eq!(solo_estimate_of(KEY), WINDOW_NS);
+    solo_learn_time(KEY, 30_000);
+    solo_learn_time(KEY, 20_000);
+    // Twice the longest, at least 100 us: many such operations share a window.
+    assert_eq!(solo_estimate_of(KEY), 100_000);
+    solo_learn_time(KEY, 1_000_000);
+    assert_eq!(solo_estimate_of(KEY), 2_000_000);
+    assert_eq!(fit(std::iter::repeat_n(solo_estimate_of(KEY), 40)), 25);
 }
 
 #[test]
