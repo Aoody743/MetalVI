@@ -64,3 +64,73 @@ impl CommandBuffer {
         unsafe { sys::MTLCommandBuffer_encodeWaitForEvent(self.handle(), event.handle(), value) };
     }
 }
+
+/// A GPU-only event (`newEvent`): orders command buffers of one queue (or
+/// across queues) without CPU visibility (plan v2 D3). Its value is set by
+/// [`CommandBuffer::encode_signal`] and waited on by
+/// [`CommandBuffer::encode_wait`].
+#[derive(Clone, Debug)]
+pub struct Event(Object);
+
+impl Event {
+    pub fn new(device: &Device) -> Result<Self> {
+        let _pool = Pool::new();
+        // SAFETY: `newEvent` returns an owned (+1) object.
+        let event = Object::adopt(unsafe { sys::MTLDevice_newEvent(device.handle()) })
+            .ok_or(Error("newEvent".into()))?;
+        Ok(Self(event))
+    }
+
+    pub fn handle(&self) -> obj_handle_t {
+        self.0.handle()
+    }
+}
+
+/// A fence between encoders (`newFence`): a compute encoder updates it at
+/// its end, a later encoder waits for it (plan v2 D3).
+#[derive(Clone, Debug)]
+pub struct Fence(Object);
+
+impl Fence {
+    pub fn new(device: &Device) -> Result<Self> {
+        let _pool = Pool::new();
+        // SAFETY: `newFence` returns an owned (+1) object.
+        let fence = Object::adopt(unsafe { sys::MTLDevice_newFence(device.handle()) })
+            .ok_or(Error("newFence".into()))?;
+        Ok(Self(fence))
+    }
+
+    pub fn handle(&self) -> obj_handle_t {
+        self.0.handle()
+    }
+}
+
+/// Something a command buffer can signal or wait on: a [`SharedEvent`] or
+/// an [`Event`] (both are `MTLEvent`s on the Metal side).
+pub trait AnyEvent {
+    fn event_handle(&self) -> obj_handle_t;
+}
+impl AnyEvent for SharedEvent {
+    fn event_handle(&self) -> obj_handle_t {
+        self.handle()
+    }
+}
+impl AnyEvent for Event {
+    fn event_handle(&self) -> obj_handle_t {
+        self.handle()
+    }
+}
+
+impl CommandBuffer {
+    /// `encodeSignalEvent:value:` for either kind of event.
+    pub fn encode_signal(&self, event: &impl AnyEvent, value: u64) {
+        // SAFETY: live command buffer and event.
+        unsafe { sys::MTLCommandBuffer_encodeSignalEvent(self.handle(), event.event_handle(), value) };
+    }
+
+    /// `encodeWaitForEvent:value:` for either kind of event.
+    pub fn encode_wait(&self, event: &impl AnyEvent, value: u64) {
+        // SAFETY: live command buffer and event.
+        unsafe { sys::MTLCommandBuffer_encodeWaitForEvent(self.handle(), event.event_handle(), value) };
+    }
+}

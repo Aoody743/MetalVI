@@ -153,6 +153,16 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// The title ordered what comes next after what came before (a barrier, a
+/// copy, a wait, a bottom-of-pipe write, a reset): the next Metal dispatch
+/// does not overlap the ones before it.
+#[cfg(windows)]
+fn metal_ordered(this: This) {
+    if crate::backend::metal::mode() == crate::backend::metal::Mode::Compute && !this.is_null() {
+        with_state(this, |_, s| s.metal_since_barrier = false);
+    }
+}
+
 /// The Metal dispatches recorded into a title list (`VICTORY_METAL`).
 #[cfg(windows)]
 pub(crate) fn metal_commands(this: This) -> Vec<std::sync::Arc<crate::backend::metal::MetalOp>> {
@@ -636,6 +646,8 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    #[cfg(windows)]
+    metal_ordered(this);
     if allocator.is_null() {
         return E_INVALIDARG;
     }
@@ -750,6 +762,8 @@ const UAV_BARRIER: Barrier = Barrier {
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
+    metal_ordered(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
@@ -826,6 +840,8 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    metal_ordered(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -863,6 +879,8 @@ fn unlike(dst: This, src: This) -> bool {
 }
 
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
+    #[cfg(windows)]
+    metal_ordered(this);
     #[cfg(windows)]
     {
         let Some(list) = host_list(this) else {
@@ -905,6 +923,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
 }
 
 extern "system" fn copy_resource_x(this: This, dst: This, src: This, _flags: u32) {
+    #[cfg(windows)]
+    metal_ordered(this);
     copy_resource(this, dst, src);
 }
 
@@ -930,6 +950,8 @@ extern "system" fn copy_texture_region(
     src: *const CopyLocation,
     source_box: *const [u32; 6],
 ) {
+    #[cfg(windows)]
+    metal_ordered(this);
     #[cfg(windows)]
     {
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
@@ -1233,6 +1255,8 @@ extern "system" fn copy_texture_region_x(
     source_box: *const [u32; 6],
     _flags: u32,
 ) {
+    #[cfg(windows)]
+    metal_ordered(this);
     copy_texture_region(this, dst, x, y, z, src, source_box);
 }
 
@@ -1244,6 +1268,8 @@ extern "system" fn resolve(
     src_sub: u32,
     format: u32,
 ) {
+    #[cfg(windows)]
+    metal_ordered(this);
     #[cfg(windows)]
     if crate::backend::metal_draw::draws_on() && metal_resolve(this, dst, dst_sub, src, src_sub, format).is_none() {
         crate::backend::metal_draw::note_write(dst as usize, 3);
@@ -1514,6 +1540,8 @@ extern "system" fn clear_dsv(
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    metal_ordered(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -2032,6 +2060,15 @@ impl ValueWait {
         self.holds_for(u64::from_le_bytes(raw))
     }
 
+    /// The wait as an execution-timeline tag: address, reference, and
+    /// whether it is "at least" (the one comparison a GPU event wait can
+    /// stand for).
+    #[cfg(windows)]
+    pub(crate) fn as_tag(&self) -> (u64, u64, bool) {
+        let reference = if self.wide { self.reference } else { self.reference & 0xFFFF_FFFF };
+        (self.address, reference, self.comparison == 7)
+    }
+
     /// Where the value waited for is: address and bytes.
     #[cfg(windows)]
     pub(crate) fn place(&self) -> (usize, usize) {
@@ -2104,6 +2141,8 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    #[cfg(windows)]
+    metal_ordered(this);
     let wait = ValueWait {
         address,
         comparison,
@@ -2154,6 +2193,8 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    metal_ordered(this);
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
@@ -2254,6 +2295,8 @@ fn value_written(this: This, address: u64, value: u64) {
 }
 
 fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
+    #[cfg(windows)]
+    metal_ordered(this);
     if address == 0 {
         return;
     }
