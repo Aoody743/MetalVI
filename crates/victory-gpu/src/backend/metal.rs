@@ -1521,12 +1521,16 @@ impl MetalBackend {
         res
     }
 
-    fn resolve_slot(&self, handle: u64) -> (DescriptorEntry, u32, Option<super::metal_heap::Missing>) {
+    /// The heap entry for the view at `handle`, its stride table words (stride word, buffer
+    /// view title address) and why the entry was left empty if it was.
+    fn resolve_slot(&self, handle: u64) -> (DescriptorEntry, (u32, u64), Option<super::metal_heap::Missing>) {
         if handle == 0 {
-            return (DescriptorEntry::NULL, 0, None);
+            return (DescriptorEntry::NULL, (0, 0), None);
         }
         let view = crate::descriptor::view(handle);
-        let stride_word = view.as_ref().map_or(0, crate::descriptor::host::view_stride_word);
+        let stride_word = view.as_ref().map_or((0, 0), |v| {
+            (crate::descriptor::host::view_stride_word(v), crate::descriptor::host::view_address_word(v))
+        });
         let entry = match view.clone() {
             Some(crate::descriptor::View::Sampler(words)) => self.sampler_entry(&words).ok_or(super::metal_heap::Missing::NotYet),
             Some(crate::descriptor::View::ConsoleSampler(console)) => {
@@ -1650,11 +1654,9 @@ impl MetalBackend {
         }
         // SAFETY: index < count, the entries' memory holds >= count entries.
         unsafe { h.entries.add(index as usize).write(entry) };
-        if let Some((_, strides_ptr)) = h.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: index < SLOT_STRIDES_COUNT, the strides table holds SLOT_STRIDES_COUNT dwords.
-            unsafe { strides_ptr.add(index as usize).write(stride_word) };
+        if let Some((_, strides_ptr)) = h.strides {
+            // SAFETY: the strides table holds SLOT_STRIDES_DWORDS dwords (`new_heap`).
+            unsafe { crate::descriptor::host::write_stride_slot(strides_ptr, index, stride_word.0, stride_word.1) };
         }
         let strides_gpu = h.strides.as_ref().map_or(0, |(b, _)| b.gpu_address);
         Some((h.buffer.clone(), strides_gpu, missing))
@@ -1673,7 +1675,7 @@ impl MetalBackend {
             .unwrap_or_default();
         let started = (!dirty.is_empty()).then(std::time::Instant::now);
         let slots = dirty.len();
-        let resolved: Vec<(u32, DescriptorEntry, u32)> = dirty
+        let resolved: Vec<(u32, DescriptorEntry, (u32, u64))> = dirty
             .into_iter()
             .filter(|&(idx, _)| idx < count)
             .map(|(idx, handle)| {
@@ -1693,11 +1695,9 @@ impl MetalBackend {
             if idx < h.count {
                 // SAFETY: idx < h.count.
                 unsafe { h.entries.add(idx as usize).write(entry) };
-                if let Some((_, strides_ptr)) = h.strides
-                    && idx < victory_shader::emit::SLOT_STRIDES_COUNT
-                {
-                    // SAFETY: idx < SLOT_STRIDES_COUNT.
-                    unsafe { strides_ptr.add(idx as usize).write(stride_word) };
+                if let Some((_, strides_ptr)) = h.strides {
+                    // SAFETY: the strides table holds SLOT_STRIDES_DWORDS dwords (`new_heap`).
+                    unsafe { crate::descriptor::host::write_stride_slot(strides_ptr, idx, stride_word.0, stride_word.1) };
                 }
             }
         }
@@ -1967,8 +1967,9 @@ impl MetalBackend {
         let strides = if samplers {
             None
         } else {
-            let sbytes = (victory_shader::emit::SLOT_STRIDES_COUNT as usize * 4).next_multiple_of(64 << 10);
-            // SAFETY: fresh allocation for SLOT_STRIDES table (zero-initialized).
+            let sbytes = (victory_shader::emit::SLOT_STRIDES_DWORDS as usize * 4).next_multiple_of(64 << 10);
+            // SAFETY: fresh allocation for the SLOT_STRIDES table: strides, then view addresses
+            // (zero-initialized).
             let smem = unsafe { VirtualAlloc(std::ptr::null(), sbytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
             if smem.is_null() {
                 return None;
@@ -2339,6 +2340,10 @@ mod append_idiom_repro_tests;
 #[cfg(test)]
 #[path = "metal_submit_tests.rs"]
 mod submit_tests;
+
+#[cfg(test)]
+#[path = "metal_msc_check_tests.rs"]
+mod msc_check_tests;
 
 /// Names what a command buffer that does not complete was running: a
 /// GPU-side hang (a shader that never ends) blocks `cb.wait()` with no

@@ -34,6 +34,14 @@ pub const VIEW_INTEGER: u32 = 1 << 31;
 pub const VIEW_SIGNED: u32 = 1 << 30;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// From this dword of the [`SLOT_STRIDES`] buffer on, two dwords a heap slot: the title
+/// address (low 32 bits, then the bits from 32 up) of the buffer view at slot `i`, 0 for none.
+/// Console code that picks a buffer from the heap by an index and reads the address out of its
+/// descriptor (the shadow rays' BVH, `CS_TraceShadowRays_*`) takes it from here, as
+/// [`USER_VIEW_ADDRESS`] gives it for a table's view.
+pub const STRIDES_VIEW_ADDRESSES: u32 = SLOT_STRIDES_COUNT;
+/// Dwords the host's [`SLOT_STRIDES`] buffer holds: the strides and the view addresses.
+pub const SLOT_STRIDES_DWORDS: u32 = STRIDES_VIEW_ADDRESSES + 2 * SLOT_STRIDES_COUNT;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

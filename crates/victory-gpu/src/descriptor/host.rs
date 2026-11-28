@@ -58,7 +58,7 @@ pub(crate) struct HostHeap {
     /// View heaps: the bytes per element of the buffer view at each title
     /// slot, for shaders that pick a buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// `SLOT_STRIDES_DWORDS` dwords (strides, then view addresses), its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
@@ -643,6 +643,35 @@ pub(crate) fn view_stride_word(view: &View) -> u32 {
     view_stride(view).unwrap_or(0) | view_kind(view)
 }
 
+/// The title address of a buffer view, for the address half of the stride table
+/// (`victory_shader::emit::STRIDES_VIEW_ADDRESSES`): 0 for a view that is not a buffer's.
+pub(crate) fn view_address_word(view: &View) -> u64 {
+    buffer_range(view).map_or(0, |range| range.0)
+}
+
+/// Writes heap slot `index` of a stride table: its stride word and the title address of its
+/// buffer view (`victory_shader::emit::STRIDES_VIEW_ADDRESSES`). Indices past the table are
+/// left alone. Shaders read the table while it is written: a reader may see the address half
+/// old, half new for a slot the title rewrites under a running pass, as it may see any value
+/// the slot had.
+///
+/// # Safety
+/// `data` maps `victory_shader::emit::SLOT_STRIDES_DWORDS` writable dwords.
+pub(crate) unsafe fn write_stride_slot(data: *mut u32, index: u32, stride: u32, address: u64) {
+    use victory_shader::emit::{SLOT_STRIDES_COUNT, STRIDES_VIEW_ADDRESSES};
+    if index >= SLOT_STRIDES_COUNT {
+        return;
+    }
+    let at = (STRIDES_VIEW_ADDRESSES + 2 * index) as usize;
+    // SAFETY: index < SLOT_STRIDES_COUNT; the caller's mapping holds SLOT_STRIDES_DWORDS dwords,
+    // so `index` and `at + 1` are inside it.
+    unsafe {
+        data.add(index as usize).write_volatile(stride);
+        data.add(at).write_volatile(address as u32);
+        data.add(at + 1).write_volatile((address >> 32) as u32);
+    }
+}
+
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
 static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
@@ -814,7 +843,7 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_DWORDS) * 4;
                 let (buffer, data) = host.upload_buffer(bytes)?;
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
@@ -1479,12 +1508,11 @@ impl HostHeap {
         }
         let stride = view.and_then(view_stride);
         let kind = view.map_or(0, view_kind);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+        if let Some((_, _, data)) = &self.strides {
+            let address = view.map_or(0, view_address_word);
+            // SAFETY: the mapping holds SLOT_STRIDES_DWORDS dwords; shaders read it while we
+            // write (each dword is one the slot had).
+            unsafe { write_stride_slot(*data as *mut u32, index, stride.unwrap_or(0) | kind, address) };
         }
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let slots = &mut buffers[buffer_bucket(index)];

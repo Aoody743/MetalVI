@@ -357,6 +357,10 @@ struct Lower<'a> {
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
+#[path = "heap_address.rs"]
+mod heap_address;
+#[path = "mask_numbers.rs"]
+mod mask_numbers;
 #[path = "lds_start.rs"]
 mod lds_start_impl;
 pub(super) use lds_start_impl::lds_start;
@@ -5701,7 +5705,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) && !self.of_numbers(inst) {
             return Err(LANE_MASK);
         }
         if matches!(
@@ -6511,7 +6515,7 @@ impl<'a> Lower<'a> {
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
             if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
+                && let Some((lo, hi)) = self.view_address(site).or_else(|| self.heap_view_address(site))
             {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
