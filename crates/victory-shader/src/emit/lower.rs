@@ -341,6 +341,9 @@ struct Lower<'a> {
     /// `half_sync` sites emitted so far (each its own counter in
     /// [`super::shader::SLOT_DIAG`]).
     sync_sites: u32,
+    /// [`Self::sync_sites`] when each loop header was lowered: a loop whose back edge
+    /// finds more has half-wave meetings inside.
+    loop_sites: HashMap<usize, u32>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -351,6 +354,9 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+#[path = "lower_diag.rs"]
+mod diag;
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -482,6 +488,12 @@ pub(super) fn needs_every_lane(what: &str) -> bool {
 /// (its "... where not every lane runs" refusals), which it forgets.
 pub(super) fn take_needs() -> Vec<usize> {
     NEEDS.take()
+}
+
+/// Blocks whose own closing branch the last lowering on this thread wanted taken by the whole
+/// wave (a loop's back edge on a lane mask, with half-wave meetings inside), which it forgets.
+pub(super) fn take_widen() -> Vec<usize> {
+    WIDEN.take()
 }
 
 fn need(block: usize) {
@@ -1079,6 +1091,8 @@ pub fn host_has_image_atomic64() -> bool {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// See [`take_widen`].
+    static WIDEN: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
@@ -1769,6 +1783,7 @@ impl<'a> Lower<'a> {
             counters: HashMap::new(),
             abort: None,
             sync_sites: 0,
+            loop_sites: HashMap::new(),
             budget: None,
             pops: false,
         }
@@ -2425,6 +2440,9 @@ impl<'a> Lower<'a> {
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
+            if self.counters.contains_key(&b) {
+                self.loop_sites.insert(b, self.sync_sites);
+            }
             let preds: Vec<usize> = p.blocks[b]
                 .preds
                 .iter()
@@ -4326,7 +4344,7 @@ impl<'a> Lower<'a> {
             let offset = self.x.p.blocks.get(self.cur_ir).map_or(0, |b| b.offset);
             eprintln!("WAVE64-SYNC-SITE {site}: IR block {} at {offset:#x}", self.cur_ir);
         }
-        let site_dword = (super::shader::DIAG_SITES + site).min(super::shader::DIAG_DWORDS - 1);
+        let site_dword = (super::shader::DIAG_SITES + site).min(super::shader::DIAG_LOOPS - 1);
         self.diag_bump(timed_bump, &[super::shader::DIAG_HALF_SYNC_TIMEOUTS, site_dword]);
         self.s.m.terminate(timed_bump, Term::Br(spin_done));
 
@@ -4355,17 +4373,6 @@ impl<'a> Lower<'a> {
             self.cur = spin_done;
         }
         spin_done
-    }
-
-    /// Adds 1 to each of `dwords` of the diagnostic counters (`shader.rs` `SLOT_DIAG`) in `block`.
-    fn diag_bump(&mut self, block: usize, dwords: &[u32]) {
-        let uav = self.s.root_uav_handle(super::shader::SLOT_DIAG);
-        let (add, one) = (self.s.m.i32(0), self.s.m.i32(1));
-        let iu = self.s.m.undef(self.s.t.i32);
-        for &d in dwords {
-            let byte = self.s.m.i32(d * 4);
-            self.s.op(block, "atomicBinOp.i32", Attr::NoUnwind, self.s.t.i32, 78, &[uav, add, byte, iu, iu, one]);
-        }
     }
 
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
@@ -11451,9 +11458,13 @@ impl<'a> Lower<'a> {
             .insts
             .last()
             .map_or(self.x.p.blocks[b].offset, |i| i.machine.offset);
+        // A back edge the loop budget may cut: (cut here, the loop's header).
+        let mut cut: Option<(V, usize)> = None;
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
+                let tr = self.s.m.bool(true);
+                cut = Some((self.s.m.bin(self.cur, Bin::Xor, ok, tr), t));
                 let abort = self.abort_block();
                 Term::CondBr(ok, self.block[t].expect("reachable"), abort)
             }
@@ -11466,6 +11477,34 @@ impl<'a> Lower<'a> {
                 taken,
                 not_taken,
             } => {
+                // A loop's back edge on a lane mask (`s_cbranch_scc1` on "some lane left",
+                // `vccz`, ...) is the wave's decision on the console. Two host waves that
+                // meet inside the loop must take it together, or each half leaves after its
+                // own lanes and the other waits at every meeting until the poll limit
+                // (a1bf269d5b19f025: timeouts at its loop headers 0xe0, 0x2a0, 0x350, 0x4d0).
+                if !self.x.st.wide.contains(&b)
+                    && self.x.st.wave_any.get(b).copied().flatten().is_some()
+                    && self.half_sync_slot.is_some()
+                    && !self.local
+                    && std::env::var_os("VICTORY_WAVE_LOOP_EXITS").is_none_or(|v| v != "0")
+                {
+                    // (straight to the header, or through a latch that only jumps there)
+                    let to_header = |l: &Self, t: usize| {
+                        let h = match l.x.st.exits[t] {
+                            LaneExit::Jump(h) if !l.counters.contains_key(&t) => h,
+                            _ => t,
+                        };
+                        (l.counters.contains_key(&h) && l.rpo[h] <= l.rpo[b]).then_some(h)
+                    };
+                    let header = to_header(self, taken).or_else(|| to_header(self, not_taken));
+                    if let Some(h) = header
+                        && self.sync_sites > self.loop_sites.get(&h).copied().unwrap_or(u32::MAX)
+                    {
+                        WIDEN.with_borrow_mut(|w| if !w.contains(&b) { w.push(b) });
+                        need(b);
+                        return Err(unsupported(offset, "a loop exit each half-wave takes alone where not every lane runs"));
+                    }
+                }
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     _ if self.x.st.wide.contains(&b) => {
@@ -11492,9 +11531,15 @@ impl<'a> Lower<'a> {
                 // AMD driver.)
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
+                    let tr = self.s.m.bool(true);
+                    let over = self.s.m.bin(self.cur, Bin::Xor, ok, tr);
+                    cut = Some((self.s.m.bin(self.cur, Bin::And, cond, over), taken));
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
+                    let tr = self.s.m.bool(true);
+                    let stays = self.s.m.bin(self.cur, Bin::Xor, cond, tr);
+                    cut = Some((self.s.m.bin(self.cur, Bin::And, stays, stop), not_taken));
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
@@ -11528,6 +11573,9 @@ impl<'a> Lower<'a> {
         };
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
+        if let Some((cut, header)) = cut {
+            self.count_cut(cut, header);
+        }
         Ok(())
     }
 
@@ -11618,19 +11666,6 @@ impl<'a> Lower<'a> {
             let t = self.s.m.bool(true);
             self.s
                 .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
-        }
-        if self.s.threads.is_some() && self.s.mesh.is_none() && !self.s.pixel {
-            // A compute wave a loop budget stops: counted (`SLOT_DIAG`) by its first lane.
-            let (bump, ret) = (self.s.m.new_block(), self.s.m.new_block());
-            let i1t = self.s.t.i1;
-            let first = self.s.op(a, "waveIsFirstLane", Attr::NoUnwind, i1t, 110, &[]);
-            self.s.flags |= flags::WAVE_OPS;
-            self.s.m.terminate(a, Term::CondBr(first, bump, ret));
-            self.diag_bump(bump, &[super::shader::DIAG_LOOP_BUDGET]);
-            self.s.m.terminate(bump, Term::Br(ret));
-            self.s.m.terminate(ret, Term::Ret);
-            self.abort = Some(a);
-            return a;
         }
         self.s.m.terminate(a, Term::Ret);
         self.abort = Some(a);

@@ -114,9 +114,39 @@ impl TextureDescriptor {
     }
 }
 
+impl TextureDescriptor {
+    /// Metal's size limits for a device-allocated texture (Apple GPUs:
+    /// 16384 for 1D/2D, 2048 for 3D and array layers).
+    pub fn check_limits(&self) -> Result<()> {
+        use sys::WMTTextureType as T;
+        let three_d = self.type_ == T::WMTTextureType3D;
+        let side = if three_d { 2048 } else { 16384 };
+        let bad = self.width == 0
+            || self.width > side
+            || self.height > side
+            || (three_d && self.depth > 2048)
+            || self.array_length > 2048
+            || self.mipmap_level_count == 0
+            || self.mipmap_level_count > 15
+            || !matches!(self.sample_count, 1 | 2 | 4 | 8);
+        if bad {
+            return Err(Error(format!(
+                "texture past Metal's limits: {}x{}x{} x{} layers, {} mips, {} samples, type {}",
+                self.width, self.height, self.depth, self.array_length, self.mipmap_level_count, self.sample_count, self.type_.0
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Device {
     /// A new texture allocated by the device (`newTextureWithDescriptor:`).
     pub fn new_texture(&self, desc: &TextureDescriptor) -> Result<Texture> {
+        // Metal aborts the process on a descriptor past its limits (a failed
+        // assertion, not an error): refused here instead. A size read from a
+        // title resource the title already freed reached it once (759916560
+        // wide, a frame capture, stage-r-m3-fix-20261128-023844).
+        desc.check_limits()?;
         let _pool = Pool::new();
         let mut info = desc.into_info();
         // SAFETY: `info` is valid for the call; `newTexture` returns owned (+1).
@@ -150,5 +180,28 @@ impl Buffer {
         })
         .ok_or_else(|| Error(format!("newTexture over buffer offset {offset:#x}")))?;
         Ok(Texture(texture))
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::TextureDescriptor;
+    use crate::sys::WMTTextureType as T;
+
+    #[test]
+    fn sizes_past_metals_limits_are_refused_before_metal_sees_them() {
+        let ok = TextureDescriptor { width: 1920, height: 1080, type_: T::WMTTextureType2D, ..Default::default() };
+        assert!(ok.check_limits().is_ok());
+        for bad in [
+            TextureDescriptor { width: 759_916_560, ..ok },
+            TextureDescriptor { height: 16385, ..ok },
+            TextureDescriptor { width: 0, ..ok },
+            TextureDescriptor { type_: T::WMTTextureType3D, width: 4096, depth: 4, ..ok },
+            TextureDescriptor { array_length: 4096, ..ok },
+            TextureDescriptor { sample_count: 3, ..ok },
+            TextureDescriptor { mipmap_level_count: 0, ..ok },
+        ] {
+            assert!(bad.check_limits().is_err(), "{bad:?}");
+        }
     }
 }

@@ -658,12 +658,16 @@ impl Module {
         w.exit();
 
         w.record(2, &chars("dxil-ms-dx"));
-        w.record(
-            3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
-        );
+        // (a current `llvm-dis` refuses `i8:32`: the dump tool asks for a layout it reads)
+        #[cfg(test)]
+        let layout = if LLVM_DIS_LAYOUT.get() {
+            "e-m:e-p:32:32-i1:32-n8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+        } else {
+            "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+        };
+        #[cfg(not(test))]
+        let layout = "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64";
+        w.record(3, &chars(layout));
         let first_const = (self.globals.len() + self.funcs.len()) as u64;
         for g in &self.globals {
             // [type, address space << 2 | explicit type | constant, init id
@@ -1288,4 +1292,10 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The module's data layout as a current `llvm-dis` reads it (the dump tool).
+    pub(crate) static LLVM_DIS_LAYOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

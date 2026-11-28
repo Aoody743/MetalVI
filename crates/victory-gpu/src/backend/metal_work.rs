@@ -1,5 +1,6 @@
 use crate::backend::metal_draw::DrawKind;
 use super::MetalOp;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,15 +34,15 @@ pub(super) fn reject(reason: &'static str) -> bool {
 }
 
 fn profile(op: &MetalOp) -> Option<(&AtomicU64, u64)> {
-    use victory_metal::indirect::{GROUPS_PER_RECORD, INPUTS_PER_RECORD};
+    let (groups_per_record, inputs_per_record) = victory_metal::indirect::record_budget();
     let product = |g: &[u64; 3]| g.iter().copied().fold(1u64, u64::saturating_mul);
     let (cost, units) = match op {
         MetalOp::Dispatch(c) => (&c.pso.cost_ns, product(&c.groups)),
-        MetalOp::DispatchIndirect(c) => (&c.pso.cost_ns, u64::from(c.max) * u64::from(GROUPS_PER_RECORD)),
+        MetalOp::DispatchIndirect(c) => (&c.pso.cost_ns, u64::from(c.max) * u64::from(groups_per_record)),
         MetalOp::Draw(d) => (&d.pso.cost_ns, match &d.kind {
             DrawKind::Mesh { groups } => product(groups),
             DrawKind::Geometry { draw, .. } => product(&draw.groups),
-            DrawKind::Indirect { max, .. } => u64::from(*max) * u64::from(if d.pso.mesh || d.pso.geometry.is_some() { GROUPS_PER_RECORD } else { INPUTS_PER_RECORD }),
+            DrawKind::Indirect { max, .. } => u64::from(*max) * u64::from(if d.pso.mesh || d.pso.geometry.is_some() { groups_per_record } else { inputs_per_record }),
             DrawKind::Vertices { count, instances, .. } | DrawKind::Indexed { count, instances, .. } => u64::from(*count) * u64::from(*instances),
             DrawKind::Generated { indices, instances, .. } => (indices.len() as u64).saturating_mul(u64::from(*instances)),
         }),
@@ -50,7 +51,78 @@ fn profile(op: &MetalOp) -> Option<(&AtomicU64, u64)> {
     Some((cost, units.max(1)))
 }
 
+fn indirect(op: &MetalOp) -> bool {
+    matches!(op, MetalOp::DispatchIndirect(_)) || matches!(op, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }))
+}
+
+/// A short name of an operation's kind, for the split log.
+pub(super) fn kind(op: &MetalOp) -> &'static str {
+    match op {
+        MetalOp::Dispatch(_) => "dispatch",
+        MetalOp::DispatchIndirect(_) => "dispatch indirect",
+        MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. }) => "draw indirect",
+        MetalOp::Draw(_) => "draw",
+        MetalOp::Clear(_) => "clear",
+        MetalOp::Copy(_) => "texture copy",
+        MetalOp::FloatRowReadback { .. } => "readback",
+        MetalOp::BufferCopy { .. } => "CPU buffer copy",
+        MetalOp::Resolve(_) => "resolve",
+    }
+}
+
+/// Operations whose cost is not a per-unit time: indirect ones (their count
+/// comes from the GPU) by pipeline (its `cost_ns` cell's address), and
+/// clears, texture copies, resolves and readbacks by kind (small keys no
+/// address takes). Their longest GPU time seen alone in a command buffer.
+///
+/// Without this they kept the bootstrap estimate (a whole window) for ever
+/// and each ran alone in a command buffer, waited for: ~250,000 one-operation
+/// command buffers at ~0.6 ms each made the 150 s loading stalls before 3D
+/// (stage-r-m4-trace1200-20261128-042456: 76 slow batches, 75 s encoding and
+/// waiting, 0.26 s GPU). The estimate is twice the longest time seen; the
+/// clamp bounds indirect records and the fuse every measured time.
+/// `VICTORY_METAL_INDIRECT_LEARN=0` restores the old estimates.
+static SOLO_MAX_NS: std::sync::Mutex<Option<HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+
+fn solo_learn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_INDIRECT_LEARN").as_deref() != Ok("0"))
+}
+
+fn solo_key(op: &MetalOp) -> Option<usize> {
+    if indirect(op) {
+        return profile(op).map(|(cost, _)| std::ptr::from_ref(cost) as usize);
+    }
+    match op {
+        MetalOp::Clear(_) => Some(1),
+        MetalOp::Copy(_) => Some(2),
+        MetalOp::Resolve(_) => Some(3),
+        MetalOp::FloatRowReadback { .. } => Some(4),
+        _ => None,
+    }
+}
+
+fn solo_estimate(op: &MetalOp) -> Option<u64> {
+    solo_key(op).map(solo_estimate_of)
+}
+
+fn solo_estimate_of(key: usize) -> u64 {
+    let seen = solo_learn()
+        .then(|| SOLO_MAX_NS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&key).copied())
+        .flatten();
+    seen.map_or(WINDOW_NS, |ns| ns.saturating_mul(2).max(100_000))
+}
+
+fn solo_learn_time(key: usize, ns: u64) {
+    let mut map = SOLO_MAX_NS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = map.get_or_insert_with(HashMap::new).entry(key).or_insert(0);
+    *e = (*e).max(ns);
+}
+
 fn estimate(op: &MetalOp) -> Option<u64> {
+    if let Some(ns) = solo_estimate(op) {
+        return Some(ns);
+    }
     let (cost, units) = profile(op)?;
     let measured = cost.load(Ordering::Relaxed);
     // Bootstrap only. Neither an estimate nor an observed time is a WCET.
@@ -63,17 +135,124 @@ pub(super) fn reservation(ops: &[Arc<MetalOp>]) -> u64 {
 }
 
 pub(super) fn observe(ops: &[Arc<MetalOp>], ns: u64) {
+    // An operation without a per-unit cost alone in its command buffer: its whole time.
+    if let [op] = ops
+        && ns != 0
+        && solo_learn()
+        && let Some(key) = solo_key(op)
+    {
+        solo_learn_time(key, ns);
+        return;
+    }
     let Some((cost, _)) = ops.first().and_then(|op| profile(op)) else { return };
     // Do not attribute a mixed command buffer's time to a particular pipeline,
     // or learn from a GPU argument count that was only a reserved maximum.
     let units = ops.iter().try_fold(0u64, |sum, op| {
-        if matches!(&**op, MetalOp::DispatchIndirect(_)) || matches!(&**op, MetalOp::Draw(d) if matches!(d.kind, DrawKind::Indirect { .. })) {
+        if indirect(op) {
             return None;
         }
         let (key, n) = profile(op)?;
         std::ptr::eq(key, cost).then(|| sum.saturating_add(n))
     });
     if let Some(n) = units && ns != 0 { cost.store(ns.div_ceil(n), Ordering::Relaxed); }
+}
+
+/// GPU time against wall time, logged every 5 s: whether a slow stretch is
+/// the GPU's work or time spent elsewhere (encoding, waiting, the title).
+/// Wall time spent in `run_batch` (encoding, submitting, waiting).
+pub(super) static RUN_NS: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn gpu_busy(gpu_ns: u64, ops: &[Arc<MetalOp>]) {
+    struct Busy { since: std::time::Instant, gpu_ns: u64, buffers: u64, ops: u64, top: HashMap<&'static str, u64> }
+    static BUSY: std::sync::Mutex<Option<Busy>> = std::sync::Mutex::new(None);
+    let mut guard = BUSY.lock().unwrap_or_else(|e| e.into_inner());
+    let b = guard.get_or_insert_with(|| Busy { since: std::time::Instant::now(), gpu_ns: 0, buffers: 0, ops: 0, top: HashMap::new() });
+    b.gpu_ns = b.gpu_ns.saturating_add(gpu_ns);
+    b.buffers += 1;
+    b.ops += ops.len() as u64;
+    // A buffer's time by the kind of its first operation.
+    if let Some(op) = ops.first() {
+        *b.top.entry(kind(op)).or_insert(0) += gpu_ns;
+    }
+    let wall = b.since.elapsed();
+    if wall >= std::time::Duration::from_secs(5) {
+        let mut top: Vec<_> = b.top.iter().map(|(k, ns)| format!("{k}:{}ms", ns / 1_000_000)).collect();
+        top.sort();
+        tracing::info!(wall_ms = wall.as_millis() as u64, gpu_ms = b.gpu_ns / 1_000_000,
+            busy_pct = (b.gpu_ns as f64 / wall.as_nanos().max(1) as f64 * 100.0) as u64,
+            run_batch_ms = RUN_NS.swap(0, Ordering::Relaxed) / 1_000_000, buffers = b.buffers, ops = b.ops, by_first = %top.join(","), frame = crate::frame::current(),
+            "Metal: GPU busy share");
+        *guard = None;
+    }
+}
+
+/// Host phases by lane, lock-free, for the hang watch: what a thread is
+/// doing (a `&'static str`) and since when (ms after the first phase). Lane 0
+/// is submission (`run`), lane 1 captures and presents.
+pub(super) const LANES: usize = 2;
+pub(super) const LANE_RUN: usize = 0;
+pub(super) const LANE_CAPTURE: usize = 1;
+static PHASE_PTR: [std::sync::atomic::AtomicPtr<u8>; LANES] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; LANES];
+static PHASE_LEN: [AtomicU64; LANES] = [const { AtomicU64::new(0) }; LANES];
+static PHASE_AT: [AtomicU64; LANES] = [const { AtomicU64::new(0) }; LANES];
+static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn now_ms() -> u64 {
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Marks `lane` as in `phase` (`""`: idle) from now on.
+pub(super) fn phase(lane: usize, phase: &'static str) {
+    PHASE_LEN[lane].store(phase.len() as u64, Ordering::Relaxed);
+    PHASE_PTR[lane].store(phase.as_ptr().cast_mut(), Ordering::Relaxed);
+    PHASE_AT[lane].store(now_ms(), Ordering::Release);
+}
+
+/// The phase `lane` has been in for over `ms`, its age, and when it began.
+pub(super) fn stuck_phase(lane: usize, ms: u64) -> Option<(&'static str, u64, u64)> {
+    let at = PHASE_AT[lane].load(Ordering::Acquire);
+    let (ptr, len) = (PHASE_PTR[lane].load(Ordering::Relaxed), PHASE_LEN[lane].load(Ordering::Relaxed) as usize);
+    if at == 0 || ptr.is_null() || len == 0 { return None; }
+    let age = now_ms().saturating_sub(at);
+    // SAFETY: only `&'static str`s are stored; a torn pair is re-read next second.
+    let phase = std::str::from_utf8(unsafe { std::slice::from_raw_parts(ptr, len) }).ok()?;
+    (age > ms && PHASE_AT[lane].load(Ordering::Acquire) == at).then_some((phase, age, at))
+}
+
+thread_local! {
+    static LANE: std::cell::Cell<usize> = const { std::cell::Cell::new(LANE_CAPTURE) };
+}
+
+/// This thread's lane until the guard drops (then idle and back to captures).
+pub(super) fn lane(lane: usize) -> impl Drop {
+    struct Lane(usize);
+    impl Drop for Lane {
+        fn drop(&mut self) {
+            phase(self.0, "");
+            LANE.set(LANE_CAPTURE);
+        }
+    }
+    LANE.set(lane);
+    Lane(lane)
+}
+
+/// Marks this thread's lane as in `p`.
+pub(in crate::backend) fn here(p: &'static str) {
+    phase(LANE.get(), p);
+}
+
+/// After a wait or a capture: idle on the capture lane, encoding on the run lane.
+pub(in crate::backend) fn after_wait() {
+    let lane = LANE.get();
+    phase(lane, if lane == LANE_RUN { "run_batch encode" } else { "" });
+}
+
+/// `VICTORY_METAL_CUT_EVERY_PASS=1`: cut a bounded command buffer after
+/// every compute pass, as before 0056e07 (an A/B switch for the 2026-11-28
+/// freezes).
+pub(super) fn cut_every_pass() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_METAL_CUT_EVERY_PASS").as_deref() == Ok("1"))
 }
 
 /// An over-window operation runs alone. Replan after each completion so
@@ -232,6 +411,20 @@ pub(super) fn report(cb: &victory_metal::CommandBuffer, counter: Option<victory_
             }
         }
     }
+}
+
+#[test]
+fn an_operation_seen_alone_is_estimated_from_its_longest_time() {
+    // A key no operation kind or pipeline address uses.
+    const KEY: usize = 99;
+    assert_eq!(solo_estimate_of(KEY), WINDOW_NS);
+    solo_learn_time(KEY, 30_000);
+    solo_learn_time(KEY, 20_000);
+    // Twice the longest, at least 100 us: many such operations share a window.
+    assert_eq!(solo_estimate_of(KEY), 100_000);
+    solo_learn_time(KEY, 1_000_000);
+    assert_eq!(solo_estimate_of(KEY), 2_000_000);
+    assert_eq!(fit(std::iter::repeat_n(solo_estimate_of(KEY), 40)), 25);
 }
 
 #[test]

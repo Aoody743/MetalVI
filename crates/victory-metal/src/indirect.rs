@@ -14,6 +14,26 @@ pub const RECORD_LIMIT: u32 = 64;
 pub const GROUPS_PER_RECORD: u32 = 32;
 pub const INPUTS_PER_RECORD: u32 = 512;
 
+/// The per-record budget the clamp applies: `GROUPS_PER_RECORD` and
+/// `INPUTS_PER_RECORD` unless `VICTORY_METAL_INDIRECT_GROUPS` /
+/// `VICTORY_METAL_INDIRECT_INPUTS` give larger finite values (at most 2^20
+/// groups and 2^26 inputs, the ABI bounds the kernel applies anyway). The
+/// clamp stays on either way; the fuse bounds the measured GPU time.
+///
+/// At 32 groups every indirect dispatch and rectangle draw of the 3D frames
+/// was cut short (~15,000 clamp lines a run from frame ~1040): tiles of
+/// the lighting and post passes left undrawn, the blue blocks of the window.
+pub fn record_budget() -> (u32, u32) {
+    static BUDGET: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let var = |name: &str, default: u32, max: u32| {
+            std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()).map_or(default, |v| v.clamp(default, max))
+        };
+        (var("VICTORY_METAL_INDIRECT_GROUPS", GROUPS_PER_RECORD, 1 << 20),
+         var("VICTORY_METAL_INDIRECT_INPUTS", INPUTS_PER_RECORD, 1 << 26))
+    })
+}
+
 pub struct ClampCounter(Buffer, *mut u8);
 
 impl ClampCounter {
@@ -161,8 +181,8 @@ impl IndirectTranslator {
             index_limit,
             rect.map_or(0, |r| r.0),
             rect.map_or(0, |r| r.1),
-            if counter.is_some() { GROUPS_PER_RECORD } else { 0 },
-            INPUTS_PER_RECORD,
+            if counter.is_some() { record_budget().0 } else { 0 },
+            record_budget().1,
             u32::from(trace),
         ];
         let mut options = [0; 40];

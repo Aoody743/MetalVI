@@ -580,6 +580,50 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// Whether a loop lies in the code reachable from `first` without passing
+/// `stop` (blocks `stop` excluded). A skip or early-out over a loop must stay:
+/// with no lane left the console never runs the loop, but a host wave walking
+/// it with EXEC clear does, and a loop whose exit asks the lanes (`s_cbranch_vccz`
+/// on a compare ANDed with EXEC, a first-lane read of an empty EXEC giving a
+/// stale lane) then never meets its exit and runs to the loop budget
+/// (2561af9577c47289's light loops, ~0.5 s a dispatch in its tail groups).
+/// `VICTORY_WAVE_SKIP_LOOPS=1`: leaves those out anyway (the behaviour before).
+fn loop_beyond(p: &Program, first: usize, stop: Option<usize>) -> bool {
+    if std::env::var_os("VICTORY_WAVE_SKIP_LOOPS").is_some_and(|v| v == "1") {
+        return false;
+    }
+    // iterative DFS with colours: 1 on the stack, 2 done
+    let n = p.blocks.len();
+    let mut colour = vec![0u8; n];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    if Some(first) == stop {
+        return false;
+    }
+    colour[first] = 1;
+    stack.push((first, 0));
+    while let Some(&mut (x, ref mut i)) = stack.last_mut() {
+        let succ = p.blocks[x].exit.successors();
+        if let Some(&y) = succ.get(*i) {
+            *i += 1;
+            if Some(y) == stop {
+                continue;
+            }
+            match colour[y] {
+                0 => {
+                    colour[y] = 1;
+                    stack.push((y, 0));
+                }
+                1 => return true,
+                _ => {}
+            }
+        } else {
+            colour[x] = 2;
+            stack.pop();
+        }
+    }
+    false
+}
+
 /// The program without its early-outs: an `s_cbranch_execz` to a block that
 /// only ends the program (`if (!inBounds) return;`, the outermost branch of
 /// most compute programs) is left out, so the lanes that would have left
@@ -587,8 +631,8 @@ pub(crate) fn thread_edges(
 /// masked by EXEC already, as on the console, where the branch is taken
 /// only when no lane of the wave is left; scalar code has no effects. The
 /// body is then code every lane runs, which a console wave run as two host
-/// waves needs for the barriers of its exchanges and LDS accesses.
-/// `None` if the program has no such branch.
+/// waves needs for the barriers of its exchanges and LDS accesses. Not where a
+/// loop follows ([`loop_beyond`]). `None` if the program has no such branch.
 pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     let ends = |b: usize| {
         p.blocks[b].exit == Exit::End
@@ -600,7 +644,10 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
         let Exit::Branch { taken, not_taken } = block.exit else {
             continue;
         };
-        if ends(taken) && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
+        if ends(taken)
+            && block.insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+            && !loop_beyond(p, not_taken, None)
+        {
             block.insts.pop();
             block.exit = Exit::Jump(not_taken);
             any = true;
@@ -755,7 +802,14 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         if !p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz") {
             continue;
         }
-        if ends(taken) || skipped(b, taken, not_taken).is_some() {
+        // (not over a loop, [`loop_beyond`]: an early-out guards the rest of the
+        // program, a skip its region)
+        let keep = if ends(taken) {
+            loop_beyond(p, not_taken, None)
+        } else {
+            loop_beyond(p, not_taken, Some(taken))
+        };
+        if !keep && (ends(taken) || skipped(b, taken, not_taken).is_some()) {
             blocks[b].insts.pop();
             blocks[b].exit = Exit::Jump(not_taken);
             any = true;
