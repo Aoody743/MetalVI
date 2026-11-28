@@ -453,12 +453,26 @@ impl HostPipeline {
             let outs = ms.translated().and_then(|t| victory_shader::emit::output_semantics(&t.host.dxil));
             tracing::info!(?shaders, ?keep, ?outs, "mesh outputs and what the pixel shader reads");
             let reads = victory_shader::emit::input_reads(&ps.host.dxil);
-            let v = ms.pruned_mesh(keep, reads)?;
+            let (v, alias) = ms.pruned_mesh(keep.clone(), reads.clone(), false)?;
             let after = v.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil));
             tracing::info!(?shaders, bytes, ?after, limit, "mesh outputs the pixel shader does not read left out");
-            Some(v)
+            // Still over, with clip distances the pixel shader gets as an input: the mesh
+            // shader without them, the pixel shader discarding instead
+            // (`victory_shader` `clip_discard`; VICTORY_MESH_CLIP_DISCARD=0: not).
+            if after.is_some_and(|a| a > limit)
+                && let Some(alias) = alias
+                && std::env::var_os("VICTORY_MESH_CLIP_DISCARD").is_none_or(|v| v != "0")
+                && let Some(ps) = find("pixel")?.clip_discarding(vec![alias.clone()])
+                && let Some((v2, _)) = ms.pruned_mesh(keep, reads, true)
+            {
+                let after2 = v2.translated().and_then(|t| metal_mesh_bytes(&t.host.dxil));
+                tracing::info!(?shaders, ?alias, ?after2, limit, "mesh clip distances left to the pixel shader (discard)");
+                return Some((v2, Some(ps)));
+            }
+            Some((v, None))
         });
-        let mesh = pruned.as_ref().or_else(|| find("mesh"));
+        let mesh = pruned.as_ref().map(|p| &p.0).or_else(|| find("mesh"));
+        let pixel = pruned.as_ref().and_then(|p| p.1.as_ref()).or_else(|| find("pixel"));
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
@@ -468,7 +482,7 @@ impl HostPipeline {
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
             };
             let mut stages = vec![first];
-            stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
+            stages.extend(pixel.map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_shaders() {

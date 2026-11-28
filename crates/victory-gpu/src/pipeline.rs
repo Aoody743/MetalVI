@@ -248,23 +248,51 @@ impl Shader {
     /// `reads`: the leading components of each input the pixel shader reads
     /// (`victory_shader::emit::input_reads`), for outputs still over the limit once
     /// ordered.
-    pub(crate) fn pruned_mesh(&self, keep: Vec<(String, u32)>, reads: Option<Vec<(String, u32, u8)>>) -> Option<Arc<Shader>> {
+    /// `drop_clip`: also without its clip distances (their values reach the pixel shader
+    /// as an input, which a [`Shader::clip_discarding`] variant tests).
+    /// The second value: the input (name, index, count) that carries the clip distances,
+    /// if the translation found one (`victory_shader::emit::last_clip_alias`).
+    pub(crate) fn pruned_mesh(
+        &self,
+        keep: Vec<(String, u32)>,
+        reads: Option<Vec<(String, u32, u8)>>,
+        drop_clip: bool,
+    ) -> Option<(Arc<Shader>, Option<(String, u32, u8)>)> {
         let old = victory_shader::emit::set_mesh_outputs_keep(Some(keep));
         let old_reads = victory_shader::emit::set_mesh_output_reads(reads);
+        let old_drop = victory_shader::emit::set_mesh_drop_clip(drop_clip);
         let done = translate(&self.container);
+        let alias = victory_shader::emit::last_clip_alias();
+        victory_shader::emit::set_mesh_drop_clip(old_drop);
         victory_shader::emit::set_mesh_output_reads(old_reads);
         victory_shader::emit::set_mesh_outputs_keep(old);
         let t = done.map_err(|e| tracing::warn!(hash = %self.hash, error = %e, "pruned mesh variant does not translate")).ok()?;
+        let suffix = if drop_clip { "pc" } else { "p" };
+        Some((self.variant(t, suffix), alias))
+    }
+
+    /// This pixel shader discarding where any of the first components of an input is
+    /// below zero (the clip distances of a mesh shader that left them out), as a shader
+    /// of its own. `None` if it does not translate so.
+    pub(crate) fn clip_discarding(&self, inputs: Vec<(String, u32, u8)>) -> Option<Arc<Shader>> {
+        let old = victory_shader::emit::set_pixel_clip_inputs(Some(inputs));
+        let done = translate(&self.container);
+        victory_shader::emit::set_pixel_clip_inputs(old);
+        let t = done.map_err(|e| tracing::warn!(hash = %self.hash, error = %e, "clip-discarding pixel variant does not translate")).ok()?;
+        Some(self.variant(t, "c"))
+    }
+
+    fn variant(&self, t: Translated, suffix: &str) -> Arc<Shader> {
         let translated = OnceLock::new();
         let _ = translated.set(Some(t));
-        Some(Arc::new(Shader {
+        Arc::new(Shader {
             stage: self.stage,
-            hash: format!("{}p", self.hash),
+            hash: format!("{}{suffix}", self.hash),
             container: self.container.clone(),
             translated,
             rect_translated: OnceLock::new(),
             probe_resolve: false,
-        }))
+        })
     }
 }
 

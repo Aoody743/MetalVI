@@ -364,6 +364,9 @@ mod mask_numbers;
 #[path = "mesh_order.rs"]
 pub(super) mod mesh_order;
 pub use mesh_order::{input_reads, set_mesh_output_reads};
+#[path = "clip_discard.rs"]
+mod clip_discard;
+pub use clip_discard::{last_clip_alias, set_mesh_drop_clip, set_pixel_clip_inputs};
 #[path = "lds_start.rs"]
 mod lds_start_impl;
 pub(super) use lds_start_impl::lds_start;
@@ -1643,6 +1646,7 @@ impl<'a> Lower<'a> {
                 let read = |e: &SigElement| e.kind != 0 || keep.iter().any(|(n, i)| n.eq_ignore_ascii_case(&e.name) && *i == e.index);
                 s.outputs.retain(read);
                 s.prims.retain(read);
+                clip_discard::drop_clip(&mut s.outputs);
                 s.renumber_outputs = mesh_order::fit(&mut s.outputs, ms.max_vertices);
             }
             s.threads = Some([ms.threads, 1, 1]);
@@ -2450,6 +2454,8 @@ impl<'a> Lower<'a> {
         self.lds_start();
         self.init_half_sync();
         self.inputs()?;
+        self.note_clip_alias();
+        self.clip_discard().map_err(|w| unsupported(0, w))?;
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
