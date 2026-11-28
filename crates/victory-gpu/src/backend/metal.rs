@@ -537,7 +537,8 @@ impl MetalBackend {
     /// after this returns. False if it failed.
     pub(crate) fn run(&self, ops: &[Arc<MetalOp>]) -> bool {
         static SUBMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        work::here("waiting for the submission lock");
+        // No phase while waiting for the lock: the holder's own phases show
+        // whether it moves (a waiter behind a long batch is not a hang).
         let _submission = SUBMISSION.lock().unwrap_or_else(|e| e.into_inner());
         let _lane = work::lane(work::LANE_RUN);
         work::here("run_batch");
