@@ -5194,6 +5194,13 @@ impl HostList {
         }
     }
 
+    /// The list's bottom-of-pipe writes (address, what, bytes), for the
+    /// stage 3 execution timeline, which does them once the list has run.
+    #[cfg(windows)]
+    pub(crate) fn bottom_writes(&self) -> Vec<(usize, crate::queue::Written, usize)> {
+        self.deferred().writes.clone()
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }

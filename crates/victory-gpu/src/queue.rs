@@ -59,16 +59,16 @@ enum Held {
 /// What a submission's lists recorded for Metal (`VICTORY_METAL`).
 #[cfg(windows)]
 #[derive(Default)]
-struct MetalOps {
-    commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
-    textures: Vec<std::sync::Arc<crate::texture::Staging>>,
+pub(crate) struct MetalOps {
+    pub(crate) commands: Vec<std::sync::Arc<crate::backend::metal::MetalOp>>,
+    pub(crate) textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 #[cfg(not(windows))]
-type MetalOps = Vec<()>;
+pub(crate) type MetalOps = Vec<()>;
 
 /// The Metal ops recorded into `lists`, in order.
 #[allow(unused_variables)]
-fn metal_ops(lists: &[This]) -> MetalOps {
+pub(crate) fn metal_ops(lists: &[This]) -> MetalOps {
     #[cfg(windows)]
     if crate::backend::metal::backend().is_some() {
         let mut ops = MetalOps::default();
@@ -87,25 +87,31 @@ fn metal_ops(lists: &[This]) -> MetalOps {
 }
 
 /// Runs a submission's Metal ops (waited for before returning).
-#[allow(unused_variables)]
 fn run_metal(ops: &MetalOps) {
+    run_metal_checked(ops);
+}
+
+/// [`run_metal`]: false if Metal refused or failed it (submission stopped).
+#[allow(unused_variables)]
+pub(crate) fn run_metal_checked(ops: &MetalOps) -> bool {
     #[cfg(windows)]
     if !ops.commands.is_empty()
         && let Some(m) = crate::backend::metal::backend()
     {
         if m.submissions_stopped() {
-            return;
+            return false;
         }
         // Null D3D12 submissions skip deferred texture checks. Perform those
         // checks after queue waits, before Metal samples the private copies.
         for texture in &ops.textures {
             if m.submissions_stopped() {
-                return;
+                return false;
             }
             texture.refresh();
         }
-        m.run(&ops.commands);
+        return m.run(&ops.commands);
     }
+    true
 }
 
 /// The queues that hold something (their addresses).
@@ -589,6 +595,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        // Stage 3 (`VICTORY_METAL_EXEC=1`): the execution timeline orders
+        // and runs it; this thread does not wait.
+        if !this.is_null() && crate::backend::metal_exec::on() {
+            crate::backend::metal_exec::execute(queue(this).kind, lists);
+            return;
+        }
         if cuts() && !this.is_null() {
             submit_cut(this, lists);
             return;
@@ -658,12 +670,52 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// One present plane, 0x48 bytes (the title passes an array of them): frame
+/// token, the plane's resources, then source rectangles, placement, colour
+/// space, scale filter, extended descriptions and flags (unused here).
+/// Series S presents two: its scene (1920x1080, black in menus) and its UI
+/// (3840x2160) over it; Series X draws its UI into a single plane.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _source_rects: *const u8,
+    _placement: *const u8,
+    _color_space: u32,
+    _scale_filter: u32,
+    _extended_count: u32,
+    _extended: *const u8,
+    _flags: u32,
+}
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
+
+/// Most planes composited at a present (the console shows up to three).
+const MAX_PLANES: usize = 4;
+
+/// The first resource of each of the `planes` planes at `params`, bottom
+/// plane first (planes with no resource are skipped).
+///
+/// # Safety
+/// `params` points at `planes` planes, each listing `count` resources.
+#[cfg_attr(not(windows), allow(dead_code))]
+unsafe fn plane_resources(planes: u32, params: *const Plane) -> Vec<This> {
+    let mut out = Vec::new();
+    if params.is_null() {
+        return out;
+    }
+    for i in 0..(planes as usize).min(MAX_PLANES) {
+        // SAFETY: i < planes (the caller's array).
+        let plane = unsafe { &*params.add(i) };
+        if plane.count > 0 && !plane.resources.is_null() {
+            // SAFETY: the plane lists `count` > 0 resources.
+            let resource = unsafe { *plane.resources };
+            if !resource.is_null() {
+                out.push(resource);
+            }
+        }
+    }
+    out
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -686,6 +738,11 @@ extern "system" fn marker(_: This) {}
 extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if !this.is_null() && crate::backend::metal_exec::on() {
+        crate::backend::metal_exec::signal(queue(this).kind, fence, value);
+        return S_OK;
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
@@ -711,6 +768,11 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
+    }
+    #[cfg(windows)]
+    if !this.is_null() && crate::backend::metal_exec::on() {
+        crate::backend::metal_exec::wait(queue(this).kind, fence, value);
+        return S_OK;
     }
     #[cfg(windows)]
     if !this.is_null() {
@@ -831,7 +893,13 @@ fn frame_interval(frame: u64) {
         return;
     };
     let mut times = TIMES.lock().unwrap_or_else(|e| e.into_inner());
-    times.push(now.duration_since(before).as_secs_f64() * 1000.0);
+    let ms = now.duration_since(before).as_secs_f64() * 1000.0;
+    // Each stall over 1 s on its own line (the 64-frame summary hides how
+    // many there were; in 3D a summary covers minutes).
+    if ms > 1000.0 {
+        tracing::info!(frame, ms = format!("{ms:.0}"), "T8 present stall over 1 s");
+    }
+    times.push(ms);
     if times.len() >= 64 {
         let ms = times.iter().map(|t| format!("{t:.0}")).collect::<Vec<_>>().join(",");
         times.sort_by(f64::total_cmp);
@@ -866,6 +934,10 @@ extern "system" fn present(
     if crate::backend::metal::backend().is_some_and(|m| m.submissions_stopped()) {
         return 0x887a0005u32 as i32; // DXGI_ERROR_DEVICE_REMOVED
     }
+    // Stage 3: what the queues were given runs first (a wait is not kept
+    // across frames when `forces`).
+    #[cfg(windows)]
+    crate::backend::metal_exec::drain(forces(), "present");
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
     // Submissions sent to the card and not waited for are settled first,
@@ -943,6 +1015,11 @@ extern "system" fn present(
         // SAFETY: the plane lists `count` resources.
         let resource = unsafe { *plane.resources };
         m.capture(resource, &format!("frame{frame:06}"));
+        // The planes over it (Series S: the UI), as the window shows them.
+        // SAFETY: the title passes `planes` plane descriptions.
+        for (i, &over) in unsafe { plane_resources(planes, plane_parameters) }.iter().enumerate().skip(1) {
+            m.capture(over, &format!("frame{frame:06}-plane{i}"));
+        }
         // What wrote the presented texture since the last capture.
         let writes = std::mem::take(&mut *crate::backend::metal_draw::WRITES.lock().unwrap_or_else(|e| e.into_inner()));
         let mine = writes.iter().find(|(r, _)| *r == resource as usize).map_or([0; 9], |(_, n)| *n);
@@ -1003,14 +1080,11 @@ extern "system" fn present(
     // the D3D12 present is skipped when it shows.
     #[cfg(windows)]
     if crate::backend::metal_present::present_on()
-        && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
         && let Some(m) = crate::backend::metal::backend()
-        // SAFETY: the plane lists `count` resources.
-        && m.present_metal(unsafe { *plane.resources })
+        // SAFETY: the title passes `planes` plane descriptions.
+        && let resources = unsafe { plane_resources(planes, plane_parameters) }
+        && !resources.is_empty()
+        && m.present_metal(&resources)
     {
         return S_OK;
     }
@@ -1116,6 +1190,9 @@ extern "system" fn copy_page_mappings(
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };
+    // Stage 3: nothing in flight may read pages being remapped.
+    #[cfg(windows)]
+    crate::backend::metal_exec::drain(false, "page mapping");
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
@@ -1209,6 +1286,34 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// PresentX planes come 0x48 bytes apart: the second plane's resource (the
+    /// Series S UI over its black scene plane) is found, planes without a
+    /// resource are skipped, and the bottom plane stays first.
+    #[test]
+    fn present_planes_are_read_at_their_stride() {
+        let scene = 0x1000usize as This;
+        let ui = 0x2000usize as This;
+        let blank = |token, count, resources: *const This| Plane {
+            token,
+            count,
+            resources,
+            _source_rects: std::ptr::null(),
+            _placement: std::ptr::null(),
+            _color_space: 0,
+            _scale_filter: 0,
+            _extended_count: 0,
+            _extended: std::ptr::null(),
+            _flags: 0,
+        };
+        let planes = [blank(7, 1, &scene), blank(7, 0, std::ptr::null()), blank(7, 1, &ui)];
+        // SAFETY: three planes, each listing what its count says.
+        assert_eq!(unsafe { plane_resources(3, planes.as_ptr()) }, vec![scene, ui]);
+        // SAFETY: as above; only the first plane is read.
+        assert_eq!(unsafe { plane_resources(1, planes.as_ptr()) }, vec![scene]);
+        // SAFETY: no planes.
+        assert!(unsafe { plane_resources(2, std::ptr::null()) }.is_empty());
+    }
 
     /// Where a queue's signal is: newer layouts have it two slots later.
     /// Another test may switch layouts while this one runs, so the queue's

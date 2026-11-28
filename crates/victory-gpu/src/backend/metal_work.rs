@@ -207,6 +207,8 @@ fn now_ms() -> u64 {
 
 /// Marks `lane` as in `phase` (`""`: idle) from now on.
 pub(super) fn phase(lane: usize, phase: &'static str) {
+    #[cfg(test)]
+    profile::mark(phase);
     PHASE_LEN[lane].store(phase.len() as u64, Ordering::Relaxed);
     PHASE_PTR[lane].store(phase.as_ptr().cast_mut(), Ordering::Relaxed);
     PHASE_AT[lane].store(now_ms(), Ordering::Release);
@@ -243,6 +245,26 @@ pub(super) fn lane(lane: usize) -> impl Drop {
 /// Marks this thread's lane as in `p`.
 pub(in crate::backend) fn here(p: &'static str) {
     phase(LANE.get(), p);
+}
+
+/// `p` until the guard drops, then the phase before it again (finer labels
+/// for the stuck-phase watchdog and the test profiler, nothing else).
+pub(in crate::backend) fn within(p: &'static str) -> impl Drop {
+    struct Restore(usize, *mut u8, u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if self.1.is_null() {
+                return;
+            }
+            // SAFETY: only `&'static str`s are stored in the phase slots.
+            let before = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.1, self.2 as usize)) };
+            phase(self.0, before);
+        }
+    }
+    let lane = LANE.get();
+    let restore = Restore(lane, PHASE_PTR[lane].load(Ordering::Relaxed), PHASE_LEN[lane].load(Ordering::Relaxed));
+    phase(lane, p);
+    restore
 }
 
 /// After a wait or a capture: idle on the capture lane, encoding on the run lane.
@@ -473,4 +495,43 @@ fn budget_prefix_never_rejects_oversized_first_operation() {
     assert_eq!(fit([u64::MAX, 1].into_iter()), 1);
     assert_eq!(fit([WINDOW_NS / 2, WINDOW_NS / 2, 1].into_iter()), 2);
     assert_eq!(fit([1, WINDOW_NS + 1].into_iter()), 1);
+}
+
+/// Tests only: time spent in each phase on this thread, between
+/// [`profile::start`] and [`profile::take`] (stage 4 encode profiling).
+#[cfg(test)]
+pub(crate) mod profile {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    thread_local! {
+        static P: RefCell<Option<(&'static str, Instant, HashMap<&'static str, (u64, u64)>)>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn start() {
+        P.with_borrow_mut(|p| *p = Some(("", Instant::now(), HashMap::new())));
+    }
+
+    pub(super) fn mark(phase: &'static str) {
+        P.with_borrow_mut(|p| {
+            if let Some((last, at, map)) = p.as_mut() {
+                let now = Instant::now();
+                let e = map.entry(*last).or_default();
+                e.0 += now.duration_since(*at).as_nanos() as u64;
+                e.1 += 1;
+                *last = phase;
+                *at = now;
+            }
+        });
+    }
+
+    /// (phase, ns, times entered), most time first.
+    pub(crate) fn take() -> Vec<(&'static str, u64, u64)> {
+        mark("");
+        let map = P.with_borrow_mut(|p| p.take().map(|(_, _, m)| m)).unwrap_or_default();
+        let mut v: Vec<_> = map.into_iter().map(|(k, (ns, n))| (k, ns, n)).collect();
+        v.sort_by_key(|e| std::cmp::Reverse(e.1));
+        v
+    }
 }

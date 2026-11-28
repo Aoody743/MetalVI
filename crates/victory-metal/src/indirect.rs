@@ -153,7 +153,7 @@ impl IndirectTranslator {
         command: &CommandBuffer,
         source: &IndirectSource<'_>,
     ) -> Result<Option<IndirectBatch>> {
-        self.encode_impl(device, command, source, None, false)
+        self.encode_impl(device, command, source, None, false, 0)
     }
 
     pub fn encode_bounded(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter) -> Result<Option<IndirectBatch>> {
@@ -164,10 +164,21 @@ impl IndirectTranslator {
         if source.max_count > RECORD_LIMIT {
             return Err(Error("indirect record budget exceeded".into()));
         }
-        self.encode_impl(device, command, source, Some(counter), trace)
+        self.encode_impl(device, command, source, Some(counter), trace, 0)
     }
 
-    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>, trace: bool) -> Result<Option<IndirectBatch>> {
+    /// One part of a list of more than [`RECORD_LIMIT`] records: `source`
+    /// names the records from record `first` of the list on (at most
+    /// [`RECORD_LIMIT`] of them), its count (if any) is the whole list's.
+    /// Each part is bounded and clamped like [`Self::encode_bounded`].
+    pub fn encode_bounded_part(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: &ClampCounter, first: u32) -> Result<Option<IndirectBatch>> {
+        if source.max_count > RECORD_LIMIT {
+            return Err(Error("indirect record budget exceeded".into()));
+        }
+        self.encode_impl(device, command, source, Some(counter), false, first)
+    }
+
+    fn encode_impl(&self, device: &Device, command: &CommandBuffer, source: &IndirectSource<'_>, counter: Option<&ClampCounter>, trace: bool, first: u32) -> Result<Option<IndirectBatch>> {
         if source.max_count == 0 {
             return Ok(None);
         }
@@ -208,7 +219,8 @@ impl IndirectTranslator {
         let rect = if let IndirectKind::Rectangles(cfg) = source.kind {
             Some((cfg.object_vertex_stride().ok_or_else(|| Error("invalid MSC geometry stride".into()))?, cfg.max_input_primitives))
         } else { None };
-        let values = [
+        // `Options` in indirect.metal, field by field (13 words, 52 bytes).
+        let values: [u32; OPTION_WORDS] = [
             kind,
             source.stride / 4,
             source.max_count,
@@ -221,8 +233,9 @@ impl IndirectTranslator {
             u32::from(trace),
             segments,
             segment_groups,
+            first,
         ];
-        let mut options = [0; 48];
+        let mut options = [0; OPTION_WORDS * 4];
         for (dst, value) in options.chunks_exact_mut(4).zip(values) {
             dst.copy_from_slice(&value.to_le_bytes());
         }
@@ -279,6 +292,9 @@ impl IndirectTranslator {
         }))
     }
 }
+
+/// Words of the translate kernel's `Options` (indirect.metal).
+const OPTION_WORDS: usize = 13;
 
 #[cfg(test)]
 mod tests;

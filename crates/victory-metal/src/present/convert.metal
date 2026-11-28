@@ -24,13 +24,10 @@ struct Options {
     float exposure;
 };
 
-fragment float4 convert_fragment(Vertex in [[stage_in]], texture2d<float> source [[texture(0)]],
-                                 constant Options &opts [[buffer(0)]]) {
-    constexpr sampler filter(filter::linear, address::clamp_to_edge);
-    float3 rgb = source.sample(filter, in.uv).rgb;
+float3 convert_rgb(float3 rgb, constant Options &opts) {
     if (opts.source_mode == 0) {
         // SDR code values; only decode when the target encodes automatically.
-        return float4(opts.srgb_target ? decode_srgb(rgb) : rgb, 1);
+        return opts.srgb_target ? decode_srgb(rgb) : rgb;
     }
     if (opts.source_mode == 2) {
         rgb = max(rgb, 0.0) * opts.exposure;
@@ -41,5 +38,20 @@ fragment float4 convert_fragment(Vertex in [[stage_in]], texture2d<float> source
         rgb *= gain;
     }
     rgb = clamp(rgb, 0.0, 1.0);
-    return float4(opts.srgb_target ? rgb : encode_srgb(rgb), 1);
+    return opts.srgb_target ? rgb : encode_srgb(rgb);
+}
+
+fragment float4 convert_fragment(Vertex in [[stage_in]], texture2d<float> source [[texture(0)]],
+                                 constant Options &opts [[buffer(0)]]) {
+    constexpr sampler filter(filter::linear, address::clamp_to_edge);
+    return float4(convert_rgb(source.sample(filter, in.uv).rgb, opts), 1);
+}
+
+// An overlay plane (the title's UI over its scene plane): premultiplied
+// alpha, blended ONE / ONE_MINUS_SOURCE_ALPHA over what is there.
+fragment float4 overlay_fragment(Vertex in [[stage_in]], texture2d<float> source [[texture(0)]],
+                                 constant Options &opts [[buffer(0)]]) {
+    constexpr sampler filter(filter::linear, address::clamp_to_edge);
+    float4 texel = source.sample(filter, in.uv);
+    return float4(convert_rgb(texel.rgb, opts), texel.a);
 }

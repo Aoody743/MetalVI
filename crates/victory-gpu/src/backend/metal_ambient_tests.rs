@@ -233,6 +233,7 @@ fn runs_between_the_dispatches_around_it() {
                 groups,
                 tables: Vec::new(),
                 loop_counts: None,
+                after_barrier: true,
             }))
         };
         ops.push(dispatch(&before, 0, round as u32));

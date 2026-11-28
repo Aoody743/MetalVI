@@ -190,6 +190,7 @@ fn run(backend: &MetalBackend, shader: &victory_shader::emit::HostShader, groups
         groups: [groups, 1, 1],
         tables,
         loop_counts: None,
+        after_barrier: true,
     }));
     let before = diag::HALF_SYNC_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed);
     diag::LAST.lock().unwrap().clear();

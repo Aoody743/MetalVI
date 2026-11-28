@@ -124,6 +124,8 @@ pub(crate) fn set(this: This, value: u64) {
 }
 pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
     set(this, value);
+    #[cfg(windows)]
+    crate::backend::metal_exec::cpu_signal(this, value);
     // A queue may have waited for it: what it held runs now.
     #[cfg(windows)]
     crate::queue::release_held(false);
