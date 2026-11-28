@@ -451,12 +451,14 @@ fn physical() -> MutexGuard<'static, Physical> {
 }
 
 /// A mapped view as [`physical_alias`] sees it: its length, its section
-/// (by address), the index of its first page and the section's persistent
-/// view (address and length; 0 for none).
-#[derive(Clone, Copy)]
+/// (by address, and a weak reference for [`physical_mirror`]), the index of
+/// its first page and the section's persistent view (address and length; 0
+/// for none).
+#[derive(Clone)]
 struct AliasView {
     len: usize,
     section: usize,
+    owner: std::sync::Weak<Section>,
     index: usize,
     persistent: usize,
     persistent_len: usize,
@@ -477,6 +479,7 @@ fn alias_insert(base: usize, len: usize, slice: &Slice) {
     let view = AliasView {
         len,
         section: Arc::as_ptr(&slice.section) as usize,
+        owner: Arc::downgrade(&slice.section),
         index: slice.index,
         persistent,
         persistent_len,
@@ -515,6 +518,203 @@ pub fn physical_alias(va: u64, len: u64) -> Option<u64> {
     (offset + len <= first.persistent_len).then(|| (first.persistent + offset) as u64)
 }
 
+/// The most bytes and pieces one mirror maps ([`physical_mirror`]).
+const MIRROR_MAX_BYTES: usize = 64 << 20;
+const MIRROR_MAX_PIECES: usize = 1024;
+
+/// Mirrors made, by what they show: runs of consecutive slices as (section
+/// address, first slice, slices), in title order. Each keeps the sections
+/// it was made of (weakly: a section address can be reused once freed) and
+/// its address. Mirrors are never unmapped: the GPU side keeps no-copy
+/// buffers over them for the process's life.
+struct Mirror {
+    at: usize,
+    owners: Vec<std::sync::Weak<Section>>,
+}
+
+static MIRRORS: LazyLock<Mutex<HashMap<Vec<(usize, usize, usize)>, Mirror>>> = LazyLock::new(Default::default);
+
+/// Mirrors at most (`VICTORY_XMEM_MIRRORS`, default 8192; 0: none, ranges
+/// across discontiguous views then get spans at title addresses as before).
+fn mirror_cap() -> usize {
+    static CAP: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("VICTORY_XMEM_MIRRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(8192)
+    });
+    *CAP
+}
+
+/// Mirrors made, refused at the cap, and failed to map (for the log).
+static MIRROR_COUNTS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
+
+/// Where the bytes of title range `[va, va+len)` lie in a contiguous view
+/// of our own of the same physical pages, when the range runs through
+/// mapped views of slices that do not follow on (pages out of order, or of
+/// several sections), so that [`physical_alias`] has no answer: the GPU
+/// side wraps that view instead of the title addresses, which the title
+/// remaps while streaming (a no-copy buffer there keeps the old pages: the
+/// GPU then reads stale data, 2026-11-28, `stale_uses` 73–5,506 per run).
+///
+/// The mirror shows the views that hold the range whole, in title order,
+/// and is made once per such list of slices: after the title remaps part
+/// of the range, the same call names other slices and gets another mirror.
+/// `None` when the range is in one view (or none), crosses a gap, or is
+/// larger than [`MIRROR_MAX_BYTES`]. Takes [`ALIASES`] (read), then
+/// [`MIRRORS`]; never the page table's lock.
+pub fn physical_mirror(va: u64, len: u64) -> Option<u64> {
+    let (va, len) = (usize::try_from(va).ok()?, usize::try_from(len).ok()?);
+    let end = va.checked_add(len)?;
+    if len == 0 || mirror_cap() == 0 {
+        return None;
+    }
+    let (start, runs, owners) = {
+        let views = ALIASES.read().unwrap_or_else(|e| e.into_inner());
+        let (&start, first) = views.range(..=va).next_back()?;
+        if va >= start + first.len {
+            return None;
+        }
+        let mut runs: Vec<(usize, usize, usize)> = Vec::new();
+        let mut owners: Vec<std::sync::Weak<Section>> = Vec::new();
+        let (mut at, mut view) = (start, first);
+        loop {
+            let pages = view.len / PAGE;
+            match runs.last_mut() {
+                // A view whose slices follow on from the last run's: one run.
+                Some(last) if last.0 == view.section && last.1 + last.2 == view.index => last.2 += pages,
+                _ => {
+                    runs.push((view.section, view.index, pages));
+                    owners.push(view.owner.clone());
+                }
+            }
+            let covered = at + view.len;
+            if covered >= end {
+                break;
+            }
+            if covered - start > MIRROR_MAX_BYTES || runs.len() > MIRROR_MAX_PIECES {
+                return None;
+            }
+            let (&s, v) = views.range(covered..).next()?;
+            if s != covered {
+                return None; // a gap: not all physical memory
+            }
+            (at, view) = (s, v);
+        }
+        // One run: the persistent view's alias (or nothing to mirror).
+        if runs.len() < 2 {
+            return None;
+        }
+        (start, runs, owners)
+    };
+    let total: usize = runs.iter().map(|r| r.2 * PAGE).sum();
+    if total > MIRROR_MAX_BYTES {
+        return None;
+    }
+    let mut mirrors = MIRRORS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = mirrors.get(&runs) {
+        // The same sections still (an address can be a new section's).
+        if m.owners.len() == owners.len()
+            && m.owners.iter().zip(&owners).all(|(a, b)| a.ptr_eq(b) && a.strong_count() > 0)
+        {
+            return Some((m.at + (va - start)) as u64);
+        }
+        // Left mapped: a buffer may still be over it.
+        mirrors.remove(&runs);
+    }
+    if mirrors.len() >= mirror_cap() {
+        let n = MIRROR_COUNTS[1].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, cap = mirror_cap(), "xmem: a range across discontiguous views left at title addresses (mirror cap)");
+        }
+        return None;
+    }
+    let sections: Option<Vec<Arc<Section>>> = owners.iter().map(std::sync::Weak::upgrade).collect();
+    let Some(at) = sections.and_then(|s| map_mirror(&runs, &s, total)) else {
+        let n = MIRROR_COUNTS[2].fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::warn!(n, total, pieces = runs.len(), error = %std::io::Error::last_os_error(), "xmem: mapping a mirror failed");
+        }
+        return None;
+    };
+    let n = MIRROR_COUNTS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        tracing::info!(n, at = format_args!("{at:#x}"), kb = total >> 10, pieces = runs.len(), "xmem: a mirror of discontiguous physical views");
+    }
+    mirrors.insert(runs, Mirror { at, owners });
+    Some((at + (va - start)) as u64)
+}
+
+/// Maps `runs` (slices of `sections`, one each) one after another in a new
+/// reservation of `total` bytes above the title's address space. All or
+/// nothing.
+fn map_mirror(runs: &[(usize, usize, usize)], sections: &[Arc<Section>], total: usize) -> Option<usize> {
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: (1usize << 40) as *mut c_void,
+        ..Default::default()
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: a new placeholder of our own; the parameter outlives the call.
+    let base = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            total,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            &mut parameter,
+            1,
+        )
+    } as usize;
+    if base == 0 {
+        return None;
+    }
+    let mut offset = 0;
+    for (k, (&(_, index, pages), section)) in runs.iter().zip(sections).enumerate() {
+        let (at, len) = (base + offset, pages * PAGE);
+        // SAFETY: splits our placeholder (all but its last piece), then maps
+        // the section's slices in place of the piece.
+        let view = unsafe {
+            if k + 1 < runs.len() {
+                VirtualFree(at as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            }
+            MapViewOfFile3(
+                section.handle,
+                GetCurrentProcess(),
+                at as *const c_void,
+                (index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if view.Value as usize != at || !commit(at, len) {
+            if view.Value as usize == at {
+                // SAFETY: the view just mapped, back to a placeholder.
+                unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            }
+            // SAFETY: the pieces mapped so far, then every placeholder of
+            // our reservation (released piece by piece).
+            unsafe {
+                let mut o = 0;
+                for &(_, _, p) in &runs[..k] {
+                    UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: (base + o) as *mut c_void }, MEM_PRESERVE_PLACEHOLDER);
+                    o += p * PAGE;
+                }
+                let mut o = 0;
+                for &(_, _, p) in runs {
+                    VirtualFree((base + o) as *mut c_void, 0, MEM_RELEASE);
+                    o += p * PAGE;
+                }
+            }
+            return None;
+        }
+        offset += len;
+    }
+    Some(base)
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
@@ -525,6 +725,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         return 0;
     }
     victory_gpu::set_physical_alias(physical_alias);
+    victory_gpu::set_physical_mirror(physical_mirror);
     // SAFETY: checked non-null.
     let n = unsafe { *count };
     let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
@@ -1706,6 +1907,63 @@ mod tests {
         // SAFETY: our own reservation is empty.
         assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// A title range across views of pages that do not follow on gets a
+    /// mirror: one contiguous view of our own of the same pages, in title
+    /// order, made once per list of pages; after the title remaps a page of
+    /// the range, the same range gets another mirror showing the new page,
+    /// and the old mirror still shows the old pages. A range in one view,
+    /// or over a hole, gets none.
+    #[test]
+    fn ranges_across_discontiguous_views_get_a_mirror() {
+        let pages = allocate(6);
+        let title = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!title.is_null());
+        let at = |page: usize| title.wrapping_byte_add(page * PAGE) as u64;
+        // Pages 4, 1, 2 of the allocation at title pages 0..3: two views
+        // (4 | 1 2), so no alias in the section view for the whole range.
+        assert_eq!(XMemMapPhysicalPages(title, 3, [pages[4], pages[1], pages[2]].as_ptr()), title);
+        for (k, fill) in [(0usize, 0x44u8), (1, 0x11), (2, 0x22)] {
+            // SAFETY: mapped read-write.
+            unsafe { std::ptr::write_bytes(at(k) as *mut u8, fill, PAGE) };
+        }
+        let (va, len) = (at(0) + 0x100, 2 * PAGE as u64 + 0x200);
+        assert_eq!(physical_alias(va, len), None);
+        let mirror = physical_mirror(va, len).expect("a mirror");
+        assert!(mirror >= 1 << 40, "above the title's address space: {mirror:#x}");
+        let bytes = |at: u64, len: u64| {
+            // SAFETY: a mirror stays mapped for the process's life.
+            unsafe { std::slice::from_raw_parts(at as *const u8, len as usize).to_vec() }
+        };
+        let shown = bytes(mirror, len);
+        assert_eq!(shown, bytes(va, len), "the mirror shows what the title range shows");
+        // Made once: the same pages, the same mirror (at their offset).
+        assert_eq!(physical_mirror(va, len), Some(mirror));
+        assert_eq!(physical_mirror(va + 0x1000, 0x100), None, "inside one view: the alias's case");
+        assert_eq!(physical_mirror(at(0) + 0x2000, PAGE as u64), Some(mirror - 0x100 + 0x2000));
+        // Writes through the mirror land in the pages.
+        // SAFETY: the mirror is mapped read-write.
+        unsafe { (mirror as *mut u8).add(PAGE).write(0x5a) };
+        // SAFETY: mapped read-write.
+        assert_eq!(unsafe { (at(1) as *const u8).add(0x100).read() }, 0x5a);
+        // The title remaps its second page to page 5.
+        assert_eq!(XMemMapPhysicalPages(at(1) as *mut c_void, 1, [pages[5]].as_ptr()), at(1) as *mut c_void);
+        // SAFETY: mapped read-write.
+        unsafe { std::ptr::write_bytes(at(1) as *mut u8, 0x55, PAGE) };
+        let again = physical_mirror(va, len).expect("a new mirror");
+        assert_ne!(again, mirror);
+        assert_eq!(bytes(again, len), bytes(va, len));
+        assert!(bytes(again + PAGE as u64 - 0x100, 16).iter().all(|&b| b == 0x55));
+        assert_eq!(bytes(mirror, len), {
+            let mut old = shown.clone();
+            old[PAGE] = 0x5a;
+            old
+        }, "the old mirror keeps the old pages");
+        // A hole (title page 3 is not mapped): no mirror.
+        assert_eq!(physical_mirror(at(2), 2 * PAGE as u64), None);
+        assert_eq!(XMemMapPhysicalPages(title, 3, std::ptr::null()), title);
+        assert_eq!(XMemFreePhysicalPages(6, pages.as_ptr()), 1);
     }
 
     #[test]

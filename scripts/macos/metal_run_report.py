@@ -380,8 +380,8 @@ def report(runs, png_limit):
                                          if r.sections else "-"))
     row("prewire 成功/失败/超上限/已释放", lambda r: "{wired}/{failed}/{capped}/{freed}，{prewired_mb} MB".format(**r.prewire)
         if any(r.prewire.values()) else "-")
-    row("span（个/直接/MB/capped/refused/stale）", lambda r: "/".join(
-        str(r.span.get(k, "-")) for k in ("spans", "direct_spans", "span_mb", "capped", "refused", "stale_spans"))
+    row("span（个/直接/镜像/MB/capped/refused/stale/stale_uses）", lambda r: "/".join(
+        str(r.span.get(k, "-")) for k in ("spans", "direct_spans", "mirror_spans", "span_mb", "capped", "refused", "stale_spans", "stale_uses"))
         if r.span else "-")
     row("截图（帧/final-draw）", lambda r: "{} / {}".format(*map(len, r.captures())))
 

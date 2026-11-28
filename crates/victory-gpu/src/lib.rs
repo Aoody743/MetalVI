@@ -66,7 +66,7 @@ pub use host::on_failure;
 #[cfg(windows)]
 pub use backend::metal_warm;
 #[cfg(windows)]
-pub use backend::metal::set_physical_alias;
+pub use backend::metal::{set_physical_alias, set_physical_mirror};
 #[cfg(windows)]
 pub use backend::metal::{title_memory_persistent, title_memory_persistent_gone};
 

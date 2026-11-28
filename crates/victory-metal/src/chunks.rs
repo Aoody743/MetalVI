@@ -73,6 +73,10 @@ pub struct Chunks {
     /// Where else the bytes of a title range are mapped, never remapped
     /// ([`Alias`]): spans are made there instead.
     pub alias: Option<Alias>,
+    /// Where else the bytes of a title range that runs across views of
+    /// pages that do not follow on are shown contiguously, never remapped
+    /// ([`Mirror`]): asked when [`Chunks::alias`] has no answer.
+    pub mirror: Option<Mirror>,
     /// Taken around every wrap and residency commit of title memory
     /// ([`Gate`]).
     pub gate: Option<Gate>,
@@ -98,6 +102,16 @@ pub type Gate = fn(u64, u64, bool) -> Box<dyn core::any::Any>;
 /// shows every page where it always is.
 pub type Alias = fn(u64, u64) -> Option<u64>;
 
+/// The host address of title range `[va, va+len)` in a contiguous mapping
+/// of our own of the same physical pages, made on demand, when the range
+/// runs through title views of pages that do not follow on in their
+/// section (so [`Alias`] has none); `None` to fall back to the title
+/// addresses. The mapping is never remapped or unmapped; after the title
+/// remaps part of the range, the same call gives another mapping (xmem's
+/// `physical_mirror`). A span over the title addresses there would keep
+/// the old pages (`stale_uses`, 2026-11-28).
+pub type Mirror = fn(u64, u64) -> Option<u64>;
+
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Stats {
     pub whole: u64,
@@ -107,6 +121,8 @@ pub struct Stats {
     /// Spans at title addresses (no persistent alias): these pages can be
     /// remapped under them.
     pub direct_spans: u64,
+    /// Spans at a [`Mirror`] (counted in `spans`, not in `direct_spans`).
+    pub mirror_spans: u64,
     /// Whole persistent views wired ahead ([`Chunks::prewire`]) and their bytes.
     pub prewired: u64,
     pub prewired_bytes: u64,
@@ -197,6 +213,7 @@ impl Chunks {
             longest_span: 0,
             stale: std::collections::HashSet::new(),
             alias: None,
+            mirror: None,
             gate: None,
         })
     }
@@ -230,6 +247,7 @@ impl Chunks {
             longest_span: 0,
             stale: std::collections::HashSet::new(),
             alias: None,
+            mirror: None,
             gate: None,
         })
     }
@@ -262,17 +280,24 @@ impl Chunks {
         self.window_buffer(va, len).map_or(0, |(b, off)| b.gpu_address + off)
     }
 
-    /// `[va, va+len)` where spans are made for it: its [`Alias`], else itself.
-    fn home(&self, va: u64, len: u64) -> u64 {
-        self.alias.and_then(|f| f(va, len)).unwrap_or(va)
+    /// `[va, va+len)` where spans are made for it: its [`Alias`], else its
+    /// [`Mirror`], else itself; and whether it is a mirror.
+    fn home(&self, va: u64, len: u64) -> (u64, bool) {
+        if let Some(at) = self.alias.and_then(|f| f(va, len)) {
+            return (at, false);
+        }
+        match self.mirror.and_then(|f| f(va, len)) {
+            Some(at) => (at, true),
+            None => (va, false),
+        }
     }
 
     /// A contiguous range in a buffer already in this residency set.
     pub fn resident_window(&self, va: u64, len: u64) -> Option<(Buffer, u64)> {
-        // The same bytes can have a span at either address: a longer view
-        // that crosses non-consecutive pages has none at the alias.
-        let home = self.home(va, len);
-        self.lookup(home, len).or_else(|| if home != va { self.lookup(va, len) } else { None })
+        // Only at the range's home: where it has an alias or a mirror, a
+        // span over its title addresses (made before, while its pages were
+        // others) may show pages the title has since remapped.
+        self.lookup(self.home(va, len).0, len)
     }
 
     fn lookup(&self, va: u64, len: u64) -> Option<(Buffer, u64)> {
@@ -364,10 +389,10 @@ impl Chunks {
         if len == 0 || va < self.base || end > self.base + self.size {
             return None;
         }
-        if let Some(window) = self.resident_window(va, len) {
+        let (home, mirrored) = self.home(va, len);
+        if let Some(window) = self.lookup(home, len) {
             return Some(window);
         }
-        let home = self.home(va, len);
         let aliased = home != va;
         let va = home;
         let end = va.checked_add(len)?;
@@ -387,6 +412,9 @@ impl Chunks {
                     self.stats.spans += 1;
                     if !aliased {
                         self.stats.direct_spans += 1;
+                    }
+                    if mirrored {
+                        self.stats.mirror_spans += 1;
                     }
                     self.stats.span_bytes += end - start;
                     self.longest_span = self.longest_span.max(end - start);
@@ -719,6 +747,113 @@ mod span_tests {
         assert_eq!(chunks.stats.spans, 1, "both pages are in the section view's one span");
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(second) };
+    }
+
+    /// Mirrors made by [`mirror`]: (section page list) → host address.
+    static MIRRORS: std::sync::Mutex<Vec<(Vec<u64>, u64)>> = std::sync::Mutex::new(Vec::new());
+    /// The section and the pages the title range at `TITLE` shows, one
+    /// 64 KiB page each (out of order: never an alias).
+    static SECTION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static SHOWN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+    /// `n` pages of `section` mapped one after another in a new placeholder
+    /// reservation (as xmem maps physical pages).
+    fn map_pages(section: usize, pages: &[u64]) -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc2, VirtualFree};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let total = pages.len() as u64 * PAGE;
+        // SAFETY: a new placeholder of ours, split and replaced by views
+        // of our section (test; never freed).
+        unsafe {
+            let base = VirtualAlloc2(GetCurrentProcess(), core::ptr::null(), total as usize, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, core::ptr::null_mut(), 0) as u64;
+            assert_ne!(base, 0);
+            for (k, &p) in pages.iter().enumerate() {
+                let at = base + k as u64 * PAGE;
+                if k + 1 < pages.len() {
+                    VirtualFree(at as *mut c_void, PAGE as usize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                }
+                let v = MapViewOfFile3(section as _, GetCurrentProcess(), at as *const c_void, p * PAGE, PAGE as usize, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, core::ptr::null_mut(), 0);
+                assert_eq!(v.Value as u64, at);
+            }
+            base
+        }
+    }
+
+    /// The title range at `TITLE` (pages `SHOWN`) in a contiguous mapping
+    /// of the same pages, one per page list (xmem's `physical_mirror`).
+    fn mirror(va: u64, len: u64) -> Option<u64> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let title = TITLE.load(SeqCst);
+        let shown = SHOWN.lock().unwrap().clone();
+        if va < title || va + len > title + shown.len() as u64 * PAGE {
+            return None;
+        }
+        let mut mirrors = MIRRORS.lock().unwrap();
+        let at = match mirrors.iter().find(|(p, _)| *p == shown) {
+            Some(&(_, at)) => at,
+            None => {
+                let at = map_pages(SECTION.load(SeqCst), &shown);
+                mirrors.push((shown, at));
+                at
+            }
+        };
+        Some(at + (va - title))
+    }
+
+    /// A title range over pages of a section that do not follow on: the
+    /// span is made at its mirror, never at the title addresses; the GPU
+    /// reads what the title shows across the views; after the title remaps
+    /// one of its pages, the same range resolves to a new mirror (the GPU
+    /// reads the new page) while the old span still reads the old one, and
+    /// no direct span is ever made.
+    #[test]
+    fn ranges_across_discontiguous_pages_are_wrapped_at_their_mirror() {
+        use std::sync::atomic::Ordering::SeqCst;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE, SEC_COMMIT};
+        let Ok(device) = Device::first() else { return };
+        let queue = device.new_queue(4).unwrap();
+        let mut chunks = Chunks::sparse(&device).unwrap();
+        queue.add_residency_set(chunks.residency());
+        chunks.mirror = Some(mirror);
+        // SAFETY: a fresh pagefile-backed section (test).
+        let section = unsafe { CreateFileMappingW(INVALID_HANDLE_VALUE, core::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, (16 * PAGE) as u32, core::ptr::null()) };
+        assert!(!section.is_null());
+        SECTION.store(section as usize, SeqCst);
+        let fill = |at: u64, byte: u8| {
+            // SAFETY: a mapped page of ours.
+            unsafe { core::ptr::write_bytes(at as *mut u8, byte, PAGE as usize) }
+        };
+        // The title shows pages 7, 2, 11 at three consecutive addresses.
+        let title = map_pages(section as usize, &[7, 2, 11]);
+        TITLE.store(title, SeqCst);
+        *SHOWN.lock().unwrap() = vec![7, 2, 11];
+        for (k, byte) in [0xA7u8, 0xA2, 0xAB].into_iter().enumerate() {
+            fill(title + k as u64 * PAGE, byte);
+        }
+        let (va, len) = (title + 0x800, 2 * PAGE + 0x1000);
+        let (old, old_off) = chunks.window_buffer(va, len).expect("mirrored");
+        let read = gpu_read(&device, &queue, &old, old_off, len);
+        // SAFETY: the title range is mapped.
+        let want = unsafe { std::slice::from_raw_parts(va as *const u8, len as usize).to_vec() };
+        assert_eq!(read, want, "the GPU reads what the title shows across its views");
+        assert!(read[..(PAGE - 0x800) as usize].iter().all(|&b| b == 0xA7));
+        assert_eq!((chunks.stats.spans, chunks.stats.mirror_spans, chunks.stats.direct_spans), (1, 1, 0));
+        // A view inside the same pages: the same span, nothing more wired.
+        let (again, _) = chunks.window_buffer(title + PAGE, 4096).expect("mirrored");
+        assert_eq!(again.gpu_address, old.gpu_address);
+        assert_eq!(chunks.stats.spans, 1);
+        // The title remaps its middle page to page 4 (a new view there).
+        let remapped = map_pages(section as usize, &[7, 4, 11]);
+        fill(remapped + PAGE, 0xB4);
+        TITLE.store(remapped, SeqCst);
+        *SHOWN.lock().unwrap() = vec![7, 4, 11];
+        let (now, now_off) = chunks.window_buffer(remapped + 0x800, len).expect("mirrored");
+        let read = gpu_read(&device, &queue, &now, now_off, len);
+        assert!(read[(PAGE - 0x800) as usize..(2 * PAGE - 0x800) as usize].iter().all(|&b| b == 0xB4), "the new page");
+        let read = gpu_read(&device, &queue, &old, old_off, len);
+        assert!(read[(PAGE - 0x800) as usize..(2 * PAGE - 0x800) as usize].iter().all(|&b| b == 0xA2), "the old span keeps the old page");
+        assert_eq!((chunks.stats.spans, chunks.stats.mirror_spans, chunks.stats.direct_spans), (2, 2, 0));
     }
 
     /// Every wrap of title memory runs inside the gate (the GPU side's

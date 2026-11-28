@@ -75,6 +75,21 @@ fn physical_alias(va: u64, len: u64) -> Option<u64> {
     PHYSICAL_ALIAS.get().and_then(|f| f(va, len))
 }
 
+/// The runtime's contiguous mapping of the physical pages behind a title
+/// range that runs across views of pages that do not follow on
+/// ([`victory_metal::chunks::Mirror`]); set once at start.
+static PHYSICAL_MIRROR: OnceLock<fn(u64, u64) -> Option<u64>> = OnceLock::new();
+
+/// Registers [`PHYSICAL_MIRROR`] (xmem). Same rules as
+/// [`set_physical_alias`]: no call back into the GPU side.
+pub fn set_physical_mirror(f: fn(u64, u64) -> Option<u64>) {
+    let _ = PHYSICAL_MIRROR.set(f);
+}
+
+fn physical_mirror(va: u64, len: u64) -> Option<u64> {
+    PHYSICAL_MIRROR.get().and_then(|f| f(va, len))
+}
+
 /// Held from a command buffer's commit to its completion, and by every
 /// residency-set wiring and commit: wiring never runs while the GPU executes
 /// work of this backend. A residency-set commit (wiring a 16 MiB span of a
@@ -672,6 +687,7 @@ impl MetalBackend {
             .unwrap_or(6144)
             << 20;
         chunks.alias = Some(physical_alias);
+        chunks.mirror = Some(physical_mirror);
         chunks.gate = Some(wiring_gate);
         let queue = device.new_queue(64)?;
         queue.add_residency_set(chunks.residency());
@@ -826,7 +842,7 @@ impl MetalBackend {
             if st.spans >= (last * 2).max(64) || st.spans >= last + 2048 || (st.capped > 0 && last != u64::MAX && st.spans == last) {
                 LOGGED.store(if st.capped > 0 && st.spans == last { u64::MAX } else { st.spans }, std::sync::atomic::Ordering::Relaxed);
                 let stale_uses = victory_metal::chunks::STALE_USES.load(std::sync::atomic::Ordering::Relaxed);
-                tracing::info!(spans = st.spans, direct_spans = st.direct_spans, span_mb = st.span_bytes >> 20, capped = st.capped, refused = st.refused, remaps_under_spans = st.remaps_under_spans, stale_spans = st.stale_spans, stale_uses, "Metal: title memory span buffers");
+                tracing::info!(spans = st.spans, direct_spans = st.direct_spans, mirror_spans = st.mirror_spans, span_mb = st.span_bytes >> 20, capped = st.capped, refused = st.refused, remaps_under_spans = st.remaps_under_spans, stale_spans = st.stale_spans, stale_uses, "Metal: title memory span buffers");
             }
         }
         use super::metal_draw::{DrawKind, STAGE_VERTEX, draw_params, stage_buffer};
