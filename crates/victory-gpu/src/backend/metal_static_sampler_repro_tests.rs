@@ -122,6 +122,7 @@ fn make_r8_texture(backend: &MetalBackend, key: usize, value: u8) -> Arc<MetalTe
         mips: 1,
         slices: 1,
         companion: Default::default(),
+        twin: None,
     });
     backend.textures.lock().unwrap().insert(key, Some(tex.clone()));
     tex
@@ -372,6 +373,7 @@ fn static_sampler_r8_draw_and_compute_repro() {
         height: 4,
         samples: 1,
         companion: None,
+        twin: None,
     };
     let mut targets = Targets::default();
     targets.colors[0] = Some(att.clone());

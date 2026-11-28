@@ -372,6 +372,7 @@ impl MetalBackend {
                 height: (companion.texture.height() as u32 >> level).max(1),
                 samples: 1,
                 companion: Some(companion),
+                twin: None,
             });
         }
         // A depth view needs a depth format and a target view a colour one
@@ -414,7 +415,7 @@ impl MetalBackend {
         };
         let width = (t.desc.width as u32 >> level).max(1);
         let height = (t.desc.height.max(1) >> level).max(1);
-        Some(Attachment { resource: resource as usize, texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8, companion: None })
+        Some(Attachment { resource: resource as usize, texture, pixel: pixel.0, level: level as u16, slice: slice as u16, width, height, samples: t.desc.sample_count.max(1) as u8, companion: None, twin: if depth { t.twin.clone() } else { None } })
     }
 }
 
@@ -433,6 +434,9 @@ pub(crate) struct Attachment {
     pub(crate) height: u32,
     pub(crate) samples: u8,
     pub(crate) companion: Option<super::metal_depth::DepthCompanion>,
+    /// The twins of a depth-stencil texture shaders write: given to the
+    /// texture before the pass, given what the pass wrote after.
+    pub(crate) twin: Option<std::sync::Arc<super::metal_depth::StencilTwin>>,
 }
 
 impl Attachment {

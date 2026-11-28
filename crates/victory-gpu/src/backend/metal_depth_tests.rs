@@ -49,6 +49,7 @@ fn check_alias(colour_format: P, depth: P, low: u32, high: u32, mid: u32) {
         mips: 2,
         slices: 2,
         companion: Default::default(),
+        twin: None,
     };
     let alias = DepthCompanion::new(&device, &colour, depth).unwrap();
     assert_eq!(

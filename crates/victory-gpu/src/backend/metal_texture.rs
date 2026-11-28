@@ -73,6 +73,9 @@ pub(crate) struct MetalTexture {
     pub(crate) mips: u32,
     pub(crate) slices: u32,
     pub(crate) companion: std::sync::OnceLock<Option<super::metal_depth::DepthCompanion>>,
+    /// The colour twins every shader view goes to, for a depth-stencil
+    /// texture shaders write.
+    pub(crate) twin: Option<Arc<super::metal_depth::StencilTwin>>,
 }
 
 impl MetalTexture {
@@ -444,6 +447,21 @@ impl MetalBackend {
         let tiled_size = texture_layout(&d)
             .and_then(|l| l.planes.first().map(|p| p.layout.size))
             .unwrap_or(0);
+        let twin = if super::metal_depth::StencilTwin::wanted(&d, pixel) {
+            match super::metal_depth::StencilTwin::new(&self.device, &texture, &d, mips, slices) {
+                Ok(twin) => {
+                    self.add_resident(&twin.handles());
+                    Some(Arc::new(twin))
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "stencil twin");
+                    fail("no stencil twin", Some(&d), None);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let t = MetalTexture {
             texture,
             pixel,
@@ -451,6 +469,7 @@ impl MetalBackend {
             mips,
             slices,
             companion: Default::default(),
+            twin,
         };
         if d.flags & (RENDER_TARGET | DEPTH | UNORDERED) == 0 && super::metal::texture_fill_on() {
             let first = self.fill(&t, memory, t.mips);
@@ -828,6 +847,10 @@ impl MetalBackend {
 }
 
 pub(in crate::backend) fn make_texture_entry(t: &MetalTexture, words: Option<&[u32]>, unordered: bool) -> Option<(victory_metal::Object, DescriptorEntry)> {
+    // Shaders see a twinned depth-stencil texture only through its twins.
+    if let Some(twin) = &t.twin {
+        return twin.entry(words, unordered);
+    }
     let (format, type_, levels, slices, swizzle, min_lod, green_stencil) = match words {
         None => (t.pixel, None, (0, t.mips), (0, t.slices), identity(), 0.0, false),
         Some(w) => {
